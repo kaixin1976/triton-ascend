@@ -30,6 +30,7 @@
 
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LogicalResult.h"
@@ -100,6 +101,53 @@ static const llvm::SmallVector<llvm::StringRef> libdeviceOps = {
     "__hmf_float_as_int_fp32",
     "__hmf_reciprocal_fp32",
 };
+
+static std::string getTritonAscendGinStem(llvm::StringRef symbol) {
+  if (!symbol.consume_front("__hmf_triton_ascend_gin_") &&
+      !symbol.consume_front("__triton_ascend_gin_")) {
+    return "";
+  }
+  symbol.consume_back(".vector");
+  symbol.consume_back(".cube");
+  symbol.consume_back("_op");
+  return symbol.str();
+}
+
+static llvm::StringRef getTritonAscendGinHivmOpName(llvm::StringRef stem) {
+  return llvm::StringSwitch<llvm::StringRef>(stem)
+      .Case("rank", "hivm.hir.gin_rank")
+      .Case("num_ranks", "hivm.hir.gin_num_ranks")
+      .Case("put", "hivm.hir.gin_put")
+      .Case("put_signal", "hivm.hir.gin_put_signal")
+      .Case("put_window", "hivm.hir.gin_put_window")
+      .Case("put_signal_window", "hivm.hir.gin_put_signal_window")
+      .Case("get", "hivm.hir.gin_get")
+      .Case("signal", "hivm.hir.gin_signal")
+      .Case("wait_signal", "hivm.hir.gin_wait_signal")
+      .Case("read_signal", "hivm.hir.gin_read_signal")
+      .Case("reset_signal", "hivm.hir.gin_reset_signal")
+      .Case("flush", "hivm.hir.gin_flush")
+      .Case("barrier", "hivm.hir.gin_barrier")
+      .Default("");
+}
+
+static int getTritonAscendGinExpectedOperands(llvm::StringRef stem) {
+  return llvm::StringSwitch<int>(stem)
+      .Case("rank", 2)
+      .Case("num_ranks", 2)
+      .Case("put", 11)
+      .Case("put_signal", 13)
+      .Case("put_window", 12)
+      .Case("put_signal_window", 14)
+      .Case("get", 11)
+      .Case("signal", 9)
+      .Case("wait_signal", 9)
+      .Case("read_signal", 7)
+      .Case("reset_signal", 6)
+      .Case("flush", 6)
+      .Case("barrier", 5)
+      .Default(-1);
+}
 
 /**
  * Retrieves a boolean environment variable.
@@ -1574,6 +1622,62 @@ LogicalResult ExternElementwiseClOpConverter::matchAndRewrite(
     triton::ExternElementwiseOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
   auto loc = op.getLoc();
+  std::string ginStem = getTritonAscendGinStem(op.getSymbol());
+  if (!ginStem.empty()) {
+    llvm::StringRef ginOpName = getTritonAscendGinHivmOpName(ginStem);
+    int expectedOperands = getTritonAscendGinExpectedOperands(ginStem);
+    if (ginOpName.empty() || expectedOperands < 0) {
+      return rewriter.notifyMatchFailure(
+          op, "unsupported triton ascend GIN extern symbol");
+    }
+
+    Type resultTy = op.getResult().getType();
+    auto resultTensorTy = dyn_cast<RankedTensorType>(resultTy);
+    bool isResultScalar = !resultTensorTy;
+    Type resultElemTy =
+        isResultScalar ? resultTy : resultTensorTy.getElementType();
+    if (resultTensorTy &&
+        (resultTensorTy.getRank() != 1 || resultTensorTy.getShape()[0] != 1)) {
+      return rewriter.notifyMatchFailure(
+          op, "triton ascend GIN externs require scalar or tensor<1xT> results");
+    }
+
+    Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    SmallVector<Value> ginOperands;
+    for (auto src : op.getSrcs()) {
+      auto tensorTy = dyn_cast<RankedTensorType>(src.getType());
+      if (tensorTy) {
+        if (tensorTy.getRank() != 1 || tensorTy.getShape()[0] != 1) {
+          return rewriter.notifyMatchFailure(
+              op, "triton ascend GIN externs require scalar or tensor<1xT> inputs");
+        }
+        src = rewriter.create<tensor::ExtractOp>(loc, src, zero);
+      }
+      ginOperands.push_back(src);
+    }
+
+    if (static_cast<int>(ginOperands.size()) != expectedOperands) {
+      return rewriter.notifyMatchFailure(
+          op, "triton ascend GIN extern has unexpected operand count");
+    }
+
+    OperationState state(loc, ginOpName);
+    state.addOperands(ginOperands);
+    state.addTypes(resultElemTy);
+    Operation *ginOp = rewriter.create(state);
+    Value ginResult = ginOp->getResult(0);
+    if (isResultScalar) {
+      rewriter.replaceOp(op, ginResult);
+      return success();
+    }
+
+    Value empty = rewriter.create<tensor::EmptyOp>(
+        loc, resultTensorTy.getShape(), resultElemTy);
+    Value inserted = rewriter.create<tensor::InsertOp>(
+        loc, ginResult, empty, zero);
+    rewriter.replaceOp(op, inserted);
+    return success();
+  }
   if (!op.getPure()) {
     op->emitWarning() << "impure elementwise op!";
     return failure();
@@ -2540,12 +2644,65 @@ PtrToIntConverter::matchAndRewrite(triton::PtrToIntOp op, OpAdaptor adaptor,
 
   auto resultType = op.getType();
 
+  auto getAddPtrElementBytes = [](Type type) -> unsigned {
+    Type ptrElementType = type;
+    if (auto shapedType = dyn_cast<ShapedType>(ptrElementType)) {
+      ptrElementType = shapedType.getElementType();
+    }
+    auto ptrType = dyn_cast<triton::PointerType>(ptrElementType);
+    if (!ptrType) {
+      return 1;
+    }
+    Type pointeeType = ptrType.getPointeeType();
+    if (auto shapedType = dyn_cast<ShapedType>(pointeeType)) {
+      pointeeType = shapedType.getElementType();
+    }
+
+    unsigned bits = 8;
+    if (pointeeType.isIndex()) {
+      bits = 64;
+    } else if (pointeeType.isIntOrFloat()) {
+      bits = pointeeType.getIntOrFloatBitWidth();
+    }
+    bits = std::max(bits, 8u);
+    return (bits + 7u) / 8u;
+  };
+
+  auto scalarizeOffset = [&](Value value) -> Value {
+    if (auto tensorType = dyn_cast<RankedTensorType>(value.getType())) {
+      if (tensorType.getRank() == 1 && tensorType.getShape()[0] == 1) {
+        Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+        value = rewriter.create<tensor::ExtractOp>(loc, value, zero);
+      }
+    }
+    if (!value.getType().isIndex()) {
+      value = rewriter.create<arith::IndexCastOp>(
+          loc, rewriter.getIndexType(), value);
+    }
+    return value;
+  };
+
   // memref.extract_aligned_pointer_as_index is used to obtain the integer representation of the base address.
   auto ptrToIndexOp = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(
       loc, ptr);
 
+  Value addrIndex = ptrToIndexOp;
+  Value originalPtr = op.getSrc();
+  while (auto addPtrOp = originalPtr.getDefiningOp<triton::AddPtrOp>()) {
+    Value elemOffset = scalarizeOffset(addPtrOp.getOffset());
+    unsigned elemBytes = getAddPtrElementBytes(addPtrOp.getResult().getType());
+    if (elemBytes != 1) {
+      Value elemBytesValue =
+          rewriter.create<arith::ConstantIndexOp>(loc, elemBytes);
+      elemOffset = rewriter.create<arith::MulIOp>(
+          loc, elemOffset, elemBytesValue);
+    }
+    addrIndex = rewriter.create<arith::AddIOp>(loc, addrIndex, elemOffset);
+    originalPtr = addPtrOp.getPtr();
+  }
+
   Value intResult = rewriter.create<arith::IndexCastOp>(
-      loc, resultType, ptrToIndexOp);
+      loc, resultType, addrIndex);
 
   rewriter.replaceOp(op, intResult);
   return success();
@@ -2728,8 +2885,6 @@ IndirectLoadConverter::matchAndRewrite(triton::ascend::IndirectLoadOp op, OpAdap
   auto libFnType = rewriter.getFunctionType(inputTypes, {resTy});
   auto funcOp = rewriter.create<func::FuncOp>(loc, funcName.str(), libFnType);
   SymbolTable::setSymbolVisibility(funcOp, SymbolTable::Visibility::Private);
-  auto isVolatileAttr = rewriter.getBoolAttr(op.getIsVolatile());
-  funcOp->setAttr("isVolatile", isVolatileAttr);
 
   rewriter.setInsertionPoint(op);
   SmallVector<Value> inputVals({src, offsets});
@@ -2738,7 +2893,6 @@ IndirectLoadConverter::matchAndRewrite(triton::ascend::IndirectLoadOp op, OpAdap
   auto callOp = rewriter.create<func::CallOp>(loc, funcOp.getSymNameAttr(),
                                               TypeRange({resTy}),
                                               inputVals);
-  callOp->setAttr("isVolatile", isVolatileAttr);
   rewriter.replaceOp(op, callOp);
   return success();
 }

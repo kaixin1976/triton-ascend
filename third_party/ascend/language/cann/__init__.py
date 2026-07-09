@@ -21,6 +21,8 @@
 from triton.language import math
 from triton.backends.ascend.utils import triton_enable_libdevice_simt
 
+from . import gin
+from . import gin_runtime
 from . import libdevice
 from . import extension
 
@@ -49,4 +51,4 @@ libdevice.fdiv = math.fdiv
 libdevice.fma = math.fma
 libdevice.abs = math.abs
 
-__all__ = ["libdevice", "extension"]
+__all__ = ["gin", "gin_runtime", "libdevice", "extension"]

@@ -11,10 +11,12 @@
 #include <chrono>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <new>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 #if defined(__linux__)
 #include <dlfcn.h>
@@ -25,6 +27,7 @@ namespace {
 constexpr uint32_t kTileXRMaxRanks = TRITON_ASCEND_GIN_MAX_RANKS;
 constexpr uint64_t kDefaultTileXRIpcDataOffset = 2ull * 1024ull * 1024ull;
 constexpr uint64_t kDefaultTileXRWindowBytes = 100ull * 1024ull * 1024ull;
+constexpr uint64_t kDefaultHcclSymWindowMinBytes = 2ull * 1024ull * 1024ull;
 constexpr uint64_t kDefaultSignalStride = sizeof(uint64_t);
 constexpr uint32_t kDefaultSignalSlots = TRITON_ASCEND_GIN_DEFAULT_SIGNAL_SLOTS;
 constexpr uint32_t kDescriptorVersion = 1;
@@ -72,17 +75,59 @@ struct TileXRSymbols {
 
 using HcclGetRankIdFn = int (*)(void *, uint32_t *);
 using HcclGetRankSizeFn = int (*)(void *, uint32_t *);
+using HcclCommSymWinRegisterFn = int (*)(void *, void *, uint64_t, void **, uint32_t);
+using HcclCommSymWinDeregisterFn = int (*)(void *);
 using HcclCommSymWinGetFn = int (*)(void *, void *, size_t, void **, size_t *);
 using HcclSymWinGetPeerPointerFn = int (*)(void *, size_t, uint32_t, void **);
+using HcclMemAllocFn = int (*)(void **, uint64_t);
+using HcclMemFreeFn = int (*)(void *);
+using RtIpcSetMemoryNameFn = int (*)(const void *, uint64_t, char *, uint32_t);
+using RtIpcOpenMemoryFn = int (*)(void **, const char *);
+using RtIpcCloseMemoryFn = int (*)(const void *);
+using RtSetIpcMemPidFn = int (*)(const char *, int32_t *, int32_t);
+using RtDeviceGetBareTgidFn = int (*)(uint32_t *);
 
 struct HcclPeerMemSymbols {
   HcclGetRankIdFn getRankId = nullptr;
   HcclGetRankSizeFn getRankSize = nullptr;
+  HcclCommSymWinRegisterFn commSymWinRegister = nullptr;
+  HcclCommSymWinDeregisterFn commSymWinDeregister = nullptr;
   HcclCommSymWinGetFn commSymWinGet = nullptr;
   HcclSymWinGetPeerPointerFn symWinGetPeerPointer = nullptr;
   void *libraries[4] = {};
   uint32_t libraryCount = 0;
 };
+
+struct HcclAllocatorSymbols {
+  HcclMemAllocFn memAlloc = nullptr;
+  HcclMemFreeFn memFree = nullptr;
+  void *libraries[4] = {};
+  uint32_t libraryCount = 0;
+  bool resolved = false;
+};
+
+struct RtsIpcSymbols {
+  RtIpcSetMemoryNameFn setMemoryName = nullptr;
+  RtIpcOpenMemoryFn openMemory = nullptr;
+  RtIpcCloseMemoryFn closeMemory = nullptr;
+  RtSetIpcMemPidFn setMemPid = nullptr;
+  RtDeviceGetBareTgidFn getBareTgid = nullptr;
+  void *library = nullptr;
+  bool resolved = false;
+};
+
+std::mutex g_hcclAllocatorMutex;
+HcclAllocatorSymbols g_hcclAllocatorSymbols;
+std::mutex g_rtsIpcMutex;
+RtsIpcSymbols g_rtsIpcSymbols;
+
+struct HcclVmmAllocation {
+  aclrtDrvMemHandle handle = nullptr;
+  uint64_t bytes = 0;
+};
+
+std::mutex g_hcclVmmAllocationMutex;
+std::unordered_map<void *, HcclVmmAllocation> g_hcclVmmAllocations;
 
 struct TritonAscendGinRuntimeHandle {
   void *tilexrComm = nullptr;
@@ -100,12 +145,17 @@ struct TritonAscendGinRuntimeHandle {
   std::string userWindowKeys[kTileXRMaxRanks];
   void *userWindowPtrs[kTileXRMaxRanks] = {};
   bool userWindowImported[kTileXRMaxRanks] = {};
+  bool userWindowRtIpc[kTileXRMaxRanks] = {};
+  void *hcclDataSymWindow = nullptr;
+  void *hcclSignalSymWindow = nullptr;
 };
 
 struct WindowRendezvousInfo {
   std::string key;
   uint64_t windowOffset = 0;
   uint64_t bytes = 0;
+  uint32_t pid = 0;
+  bool rtIpc = false;
 };
 
 #if defined(__linux__)
@@ -123,14 +173,136 @@ void ResolveOne(Fn *slot, void *library, const char *name) {
 
 bool HcclSymbolsComplete(const HcclPeerMemSymbols &symbols) {
   return symbols.getRankId != nullptr && symbols.getRankSize != nullptr &&
-         symbols.commSymWinGet != nullptr && symbols.symWinGetPeerPointer != nullptr;
+         symbols.commSymWinRegister != nullptr && symbols.commSymWinDeregister != nullptr &&
+         symbols.commSymWinGet != nullptr;
 }
 
 void ResolveHcclSymbolsFromHandle(HcclPeerMemSymbols *symbols, void *library) {
   ResolveOne(&symbols->getRankId, library, "HcclGetRankId");
   ResolveOne(&symbols->getRankSize, library, "HcclGetRankSize");
+  ResolveOne(&symbols->commSymWinRegister, library, "HcclCommSymWinRegister");
+  ResolveOne(&symbols->commSymWinDeregister, library, "HcclCommSymWinDeregister");
   ResolveOne(&symbols->commSymWinGet, library, "HcclCommSymWinGet");
   ResolveOne(&symbols->symWinGetPeerPointer, library, "HcclSymWinGetPeerPointer");
+}
+
+void ResolveHcclAllocatorSymbolsFromHandle(HcclAllocatorSymbols *symbols, void *library) {
+  ResolveOne(&symbols->memAlloc, library, "HcclMemAlloc");
+  ResolveOne(&symbols->memFree, library, "HcclMemFree");
+}
+
+bool HcclAllocatorSymbolsComplete(const HcclAllocatorSymbols &symbols) {
+  return symbols.memAlloc != nullptr && symbols.memFree != nullptr;
+}
+
+bool RtsIpcSymbolsComplete(const RtsIpcSymbols &symbols) {
+  return symbols.setMemoryName != nullptr && symbols.openMemory != nullptr &&
+         symbols.closeMemory != nullptr && symbols.setMemPid != nullptr &&
+         symbols.getBareTgid != nullptr;
+}
+
+void ResolveRtsIpcSymbolsFromHandle(RtsIpcSymbols *symbols, void *library) {
+  ResolveOne(&symbols->setMemoryName, library, "rtIpcSetMemoryName");
+  ResolveOne(&symbols->openMemory, library, "rtIpcOpenMemory");
+  ResolveOne(&symbols->closeMemory, library, "rtIpcCloseMemory");
+  ResolveOne(&symbols->setMemPid, library, "rtSetIpcMemPid");
+  ResolveOne(&symbols->getBareTgid, library, "rtDeviceGetBareTgid");
+}
+
+bool EnsureRtsIpcSymbolsLocked() {
+  RtsIpcSymbols &symbols = g_rtsIpcSymbols;
+  if (symbols.resolved && RtsIpcSymbolsComplete(symbols)) {
+    return true;
+  }
+
+  symbols.setMemoryName =
+      reinterpret_cast<RtIpcSetMemoryNameFn>(ResolveDefaultSymbol("rtIpcSetMemoryName"));
+  symbols.openMemory =
+      reinterpret_cast<RtIpcOpenMemoryFn>(ResolveDefaultSymbol("rtIpcOpenMemory"));
+  symbols.closeMemory =
+      reinterpret_cast<RtIpcCloseMemoryFn>(ResolveDefaultSymbol("rtIpcCloseMemory"));
+  symbols.setMemPid =
+      reinterpret_cast<RtSetIpcMemPidFn>(ResolveDefaultSymbol("rtSetIpcMemPid"));
+  symbols.getBareTgid =
+      reinterpret_cast<RtDeviceGetBareTgidFn>(ResolveDefaultSymbol("rtDeviceGetBareTgid"));
+  if (RtsIpcSymbolsComplete(symbols)) {
+    symbols.resolved = true;
+    return true;
+  }
+
+  void *library = dlopen("libruntime.so", RTLD_NOW | RTLD_LOCAL);
+  if (library != nullptr) {
+    symbols.library = library;
+    ResolveRtsIpcSymbolsFromHandle(&symbols, library);
+    if (RtsIpcSymbolsComplete(symbols)) {
+      symbols.resolved = true;
+      return true;
+    }
+  }
+
+  symbols.resolved = true;
+  const char *err = dlerror();
+  SetLastError(std::string("failed to resolve RTS IPC symbols") +
+               (err == nullptr ? "" : std::string(": ") + err));
+  return false;
+}
+
+bool EnsureRtsIpcSymbols() {
+  std::lock_guard<std::mutex> lock(g_rtsIpcMutex);
+  return EnsureRtsIpcSymbolsLocked();
+}
+
+bool EnsureHcclAllocatorSymbolsLocked() {
+  HcclAllocatorSymbols &symbols = g_hcclAllocatorSymbols;
+  if (symbols.resolved && HcclAllocatorSymbolsComplete(symbols)) {
+    return true;
+  }
+
+  symbols.memAlloc = reinterpret_cast<HcclMemAllocFn>(ResolveDefaultSymbol("HcclMemAlloc"));
+  symbols.memFree = reinterpret_cast<HcclMemFreeFn>(ResolveDefaultSymbol("HcclMemFree"));
+  if (HcclAllocatorSymbolsComplete(symbols)) {
+    symbols.resolved = true;
+    return true;
+  }
+
+  const char *envPath = std::getenv("TRITON_ASCEND_HCCL_LIB");
+  const char *candidates[3] = {
+      envPath,
+      "libhcomm.so",
+      "libhccl.so",
+  };
+
+  std::string dlErrors;
+  for (const char *candidate : candidates) {
+    if (candidate == nullptr || candidate[0] == '\0') {
+      continue;
+    }
+    void *library = dlopen(candidate, RTLD_NOW | RTLD_LOCAL);
+    if (library == nullptr) {
+      const char *err = dlerror();
+      if (err != nullptr) {
+        dlErrors += std::string(candidate) + ": " + err + "; ";
+      }
+      continue;
+    }
+    if (symbols.libraryCount < 4) {
+      symbols.libraries[symbols.libraryCount++] = library;
+    }
+    ResolveHcclAllocatorSymbolsFromHandle(&symbols, library);
+    if (HcclAllocatorSymbolsComplete(symbols)) {
+      symbols.resolved = true;
+      return true;
+    }
+  }
+
+  symbols.resolved = true;
+  SetLastError("failed to resolve HCCL allocator symbols (HcclMemAlloc, HcclMemFree). " + dlErrors);
+  return false;
+}
+
+bool EnsureHcclAllocatorSymbols() {
+  std::lock_guard<std::mutex> lock(g_hcclAllocatorMutex);
+  return EnsureHcclAllocatorSymbolsLocked();
 }
 
 void ResolveHcclSymbolsFromDefault(HcclPeerMemSymbols *symbols) {
@@ -139,6 +311,10 @@ void ResolveHcclSymbolsFromDefault(HcclPeerMemSymbols *symbols) {
   }
   symbols->getRankId = reinterpret_cast<HcclGetRankIdFn>(ResolveDefaultSymbol("HcclGetRankId"));
   symbols->getRankSize = reinterpret_cast<HcclGetRankSizeFn>(ResolveDefaultSymbol("HcclGetRankSize"));
+  symbols->commSymWinRegister =
+      reinterpret_cast<HcclCommSymWinRegisterFn>(ResolveDefaultSymbol("HcclCommSymWinRegister"));
+  symbols->commSymWinDeregister =
+      reinterpret_cast<HcclCommSymWinDeregisterFn>(ResolveDefaultSymbol("HcclCommSymWinDeregister"));
   symbols->commSymWinGet =
       reinterpret_cast<HcclCommSymWinGetFn>(ResolveDefaultSymbol("HcclCommSymWinGet"));
   symbols->symWinGetPeerPointer =
@@ -186,9 +362,10 @@ int LoadHcclPeerMemSymbols(const char *libraryPath, HcclPeerMemSymbols *symbols)
     }
   }
 
-  SetLastError("failed to resolve HCCL peer-memory symbols "
-               "(HcclGetRankId, HcclGetRankSize, HcclCommSymWinGet, "
-               "HcclSymWinGetPeerPointer). " +
+  SetLastError("failed to resolve required HCCL peer-memory symbols "
+               "(HcclGetRankId, HcclGetRankSize, HcclCommSymWinRegister, "
+               "HcclCommSymWinDeregister, HcclCommSymWinGet). "
+               "HcclSymWinGetPeerPointer is optional and was not required for loading. " +
                dlErrors);
   return TRITON_ASCEND_GIN_RUNTIME_NOT_FOUND;
 }
@@ -327,6 +504,12 @@ std::string WindowReadyPath(const std::string &dir, const std::string &id, uint3
   return os.str();
 }
 
+std::string WindowPidReadyPath(const std::string &dir, const std::string &id, uint32_t rank) {
+  std::ostringstream os;
+  os << dir << "/triton_ascend_gin_window_" << id << "_rank" << rank << ".pidready";
+  return os.str();
+}
+
 bool WriteTextFile(const std::string &path, const std::string &value) {
   const std::string tmpPath = path + ".tmp";
   (void)std::remove(tmpPath.c_str());
@@ -365,10 +548,19 @@ bool ParseWindowRendezvousInfo(const std::string &raw, WindowRendezvousInfo *inf
   }
   std::istringstream in(raw);
   WindowRendezvousInfo next = {};
-  if (!(in >> next.key)) {
+  std::string first;
+  if (!(in >> first)) {
     return false;
   }
-  if (next.key.size() < kAclIpcKeyBytes - 1) {
+  if (first == "rt" || first == "acl") {
+    next.rtIpc = first == "rt";
+    if (!(in >> next.key)) {
+      return false;
+    }
+  } else {
+    next.key = first;
+  }
+  if (next.key.empty()) {
     return false;
   }
   if (!(in >> next.windowOffset)) {
@@ -376,6 +568,9 @@ bool ParseWindowRendezvousInfo(const std::string &raw, WindowRendezvousInfo *inf
   }
   if (!(in >> next.bytes)) {
     next.bytes = 0;
+  }
+  if (next.rtIpc && !(in >> next.pid)) {
+    return false;
   }
   *info = next;
   return true;
@@ -456,17 +651,136 @@ aclError ExportUserWindowKey(void *localPtr, uint64_t bytes, char *key, size_t k
   return lastErr;
 }
 
+int ExportUserWindowRtIpc(void *localPtr, uint64_t bytes, char *key, size_t keyBytes,
+                          uint64_t *windowOffset, uint64_t *exportBytes, uint32_t *pid) {
+  if (localPtr == nullptr || key == nullptr || keyBytes == 0 || windowOffset == nullptr ||
+      exportBytes == nullptr || pid == nullptr) {
+    SetLastError("ExportUserWindowRtIpc received invalid input");
+    return TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE;
+  }
+  if (!EnsureRtsIpcSymbols()) {
+    return TRITON_ASCEND_GIN_RUNTIME_NOT_FOUND;
+  }
+
+  const uintptr_t ptr = reinterpret_cast<uintptr_t>(localPtr);
+  const uint64_t alignments[] = {0, 4096, 65536, 2ull * 1024ull * 1024ull};
+  uintptr_t tried[sizeof(alignments) / sizeof(alignments[0])] = {};
+  size_t triedCount = 0;
+  int lastRet = -1;
+
+  for (uint64_t alignment : alignments) {
+    uintptr_t base = ptr;
+    if (alignment != 0) {
+      base = ptr & ~(static_cast<uintptr_t>(alignment) - 1);
+    }
+    bool seen = false;
+    for (size_t i = 0; i < triedCount; ++i) {
+      if (tried[i] == base) {
+        seen = true;
+        break;
+      }
+    }
+    if (seen || base == 0 || base > ptr) {
+      continue;
+    }
+    tried[triedCount++] = base;
+
+    uint64_t offset = static_cast<uint64_t>(ptr - base);
+    if (offset > kMaxWindowBaseSearchOffset ||
+        bytes > std::numeric_limits<uint64_t>::max() - offset) {
+      continue;
+    }
+
+    uint64_t neededBytes = bytes + offset;
+    uint64_t roundedBytes = RoundUp(neededBytes, kWindowExportGranularity);
+    uint64_t byteCandidates[] = {roundedBytes, neededBytes};
+    for (uint64_t candidateBytes : byteCandidates) {
+      if (candidateBytes < neededBytes) {
+        continue;
+      }
+      char candidateKey[kAclIpcKeyBytes] = {};
+      lastRet = g_rtsIpcSymbols.setMemoryName(reinterpret_cast<void *>(base),
+                                              candidateBytes, candidateKey,
+                                              static_cast<uint32_t>(keyBytes));
+      if (DebugEnabled()) {
+        std::fprintf(stderr,
+                     "[triton_ascend_gin] rt_ipc_export try ptr=%p base=%p bytes=%llu "
+                     "offset=%llu candidate=%llu ret=%d key=%s\n",
+                     localPtr, reinterpret_cast<void *>(base),
+                     static_cast<unsigned long long>(bytes),
+                     static_cast<unsigned long long>(offset),
+                     static_cast<unsigned long long>(candidateBytes),
+                     lastRet, candidateKey);
+      }
+      if (lastRet == 0) {
+        std::memset(key, 0, keyBytes);
+        std::memcpy(key, candidateKey,
+                    keyBytes < kAclIpcKeyBytes ? keyBytes : kAclIpcKeyBytes);
+        *windowOffset = offset;
+        *exportBytes = candidateBytes;
+        int ret = g_rtsIpcSymbols.getBareTgid(pid);
+        if (ret != 0 || *pid == 0) {
+          SetLastError("rtDeviceGetBareTgid failed with rt error " + std::to_string(ret));
+          return TRITON_ASCEND_GIN_RUNTIME_ACL_ERROR;
+        }
+        return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
+      }
+      if (candidateBytes == neededBytes) {
+        break;
+      }
+    }
+  }
+
+  if (lastRet != 0) {
+    SetLastError("rtIpcSetMemoryName user window failed with rt error " +
+                 std::to_string(lastRet));
+    return TRITON_ASCEND_GIN_RUNTIME_ACL_ERROR;
+  }
+  SetLastError("rtIpcSetMemoryName user window did not produce an exportable base");
+  return TRITON_ASCEND_GIN_RUNTIME_ACL_ERROR;
+}
+
+int SetRtIpcWindowPeerPids(const char *key, const WindowRendezvousInfo *infos,
+                           uint32_t nranks, uint32_t rank) {
+  if (key == nullptr || infos == nullptr) {
+    SetLastError("SetRtIpcWindowPeerPids received invalid input");
+    return TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE;
+  }
+  if (!EnsureRtsIpcSymbols()) {
+    return TRITON_ASCEND_GIN_RUNTIME_NOT_FOUND;
+  }
+  for (uint32_t peer = 0; peer < nranks; ++peer) {
+    if (peer == rank) {
+      continue;
+    }
+    int32_t pid = static_cast<int32_t>(infos[peer].pid);
+    int ret = g_rtsIpcSymbols.setMemPid(key, &pid, 1);
+    if (ret != 0) {
+      SetLastError("rtSetIpcMemPid user window peer " + std::to_string(peer) +
+                   " failed with rt error " + std::to_string(ret));
+      return TRITON_ASCEND_GIN_RUNTIME_ACL_ERROR;
+    }
+  }
+  return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
+}
+
 void ClearRegisteredUserWindow(TritonAscendGinRuntimeHandle *handle) {
   if (handle == nullptr) {
     return;
   }
   for (uint32_t rank = 0; rank < handle->hostDesc.nranks && rank < kTileXRMaxRanks; ++rank) {
-    if (handle->userWindowImported[rank] && !handle->userWindowKeys[rank].empty()) {
+    if (handle->userWindowImported[rank] && handle->userWindowRtIpc[rank] &&
+        handle->userWindowPtrs[rank] != nullptr) {
+      if (EnsureRtsIpcSymbols()) {
+        (void)g_rtsIpcSymbols.closeMemory(handle->userWindowPtrs[rank]);
+      }
+    } else if (handle->userWindowImported[rank] && !handle->userWindowKeys[rank].empty()) {
       (void)aclrtIpcMemClose(handle->userWindowKeys[rank].c_str());
     }
     handle->userWindowKeys[rank].clear();
     handle->userWindowPtrs[rank] = nullptr;
     handle->userWindowImported[rank] = false;
+    handle->userWindowRtIpc[rank] = false;
   }
   handle->userWindowRegistered = false;
   handle->userWindowBytes = 0;
@@ -583,6 +897,32 @@ int FillDescriptorFromHcclPeerMem(TritonAscendGinRuntimeHandle *handle) {
   return CopyDescriptorToDevice(handle);
 }
 
+int DeregisterHcclSymWindow(TritonAscendGinRuntimeHandle *runtime, void **symWindow, const char *what) {
+  if (runtime == nullptr || symWindow == nullptr || *symWindow == nullptr) {
+    return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
+  }
+  if (runtime->hccl.commSymWinDeregister == nullptr) {
+    *symWindow = nullptr;
+    return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
+  }
+  int ret = runtime->hccl.commSymWinDeregister(*symWindow);
+  if (ret != 0) {
+    SetLastError(std::string("HcclCommSymWinDeregister for ") + what + " failed with code " +
+                 std::to_string(ret));
+    return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
+  }
+  *symWindow = nullptr;
+  return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
+}
+
+uint64_t HcclSymWindowRegisterBytes(uint64_t bytes) {
+  const int configuredMin =
+      GetEnvInt("TRITON_ASCEND_GIN_HCCL_SYM_WIN_MIN_BYTES",
+                static_cast<int>(kDefaultHcclSymWindowMinBytes));
+  const uint64_t minBytes = configuredMin <= 0 ? 0 : static_cast<uint64_t>(configuredMin);
+  return bytes < minBytes ? minBytes : bytes;
+}
+
 int RegisterHcclSymmetricBases(TritonAscendGinRuntimeHandle *runtime, void *localPtr, uint64_t bytes,
                                const char *what, uint64_t *bases, uint64_t *windowHandle) {
   if (runtime == nullptr || localPtr == nullptr || bases == nullptr || windowHandle == nullptr || bytes == 0) {
@@ -596,11 +936,36 @@ int RegisterHcclSymmetricBases(TritonAscendGinRuntimeHandle *runtime, void *loca
     return TRITON_ASCEND_GIN_RUNTIME_UNSUPPORTED;
   }
 
-  void *symWindow = nullptr;
+  void **storedSymWindow = bases == runtime->hostDesc.peer_signal_base ? &runtime->hcclSignalSymWindow
+                                                                       : &runtime->hcclDataSymWindow;
+  int ret = DeregisterHcclSymWindow(runtime, storedSymWindow, what);
+  if (ret != TRITON_ASCEND_GIN_RUNTIME_SUCCESS) {
+    return ret;
+  }
+
+  void *registeredSymWindow = nullptr;
+  const uint64_t registerBytes = HcclSymWindowRegisterBytes(bytes);
+  uint32_t flag = static_cast<uint32_t>(GetEnvInt("TRITON_ASCEND_GIN_HCCL_SYM_WIN_FLAG", 1));
+  ret = runtime->hccl.commSymWinRegister(runtime->hcclComm, localPtr, registerBytes,
+                                         &registeredSymWindow, flag);
+  if (ret != 0 && flag != 0) {
+    ret = runtime->hccl.commSymWinRegister(runtime->hcclComm, localPtr, registerBytes,
+                                           &registeredSymWindow, 0);
+  }
+  if (ret != 0 || registeredSymWindow == nullptr) {
+    SetLastError(std::string("HcclCommSymWinRegister for ") + what + " failed with code " +
+                 std::to_string(ret) + " ptr=" + std::to_string(PtrToU64(localPtr)) +
+                 " bytes=" + std::to_string(bytes) +
+                 " register_bytes=" + std::to_string(registerBytes));
+    return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
+  }
+
+  void *symWindow = registeredSymWindow;
   size_t offset = 0;
-  int ret = runtime->hccl.commSymWinGet(runtime->hcclComm, localPtr, static_cast<size_t>(bytes),
-                                       &symWindow, &offset);
+  ret = runtime->hccl.commSymWinGet(runtime->hcclComm, localPtr, static_cast<size_t>(registerBytes),
+                                   &symWindow, &offset);
   if (ret != 0 || symWindow == nullptr) {
+    (void)DeregisterHcclSymWindow(runtime, &registeredSymWindow, what);
     SetLastError(std::string("HcclCommSymWinGet for ") + what + " failed with code " +
                  std::to_string(ret));
     return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
@@ -613,9 +978,18 @@ int RegisterHcclSymmetricBases(TritonAscendGinRuntimeHandle *runtime, void *loca
       bases[peer] = PtrToU64(localPtr);
       continue;
     }
+    if (runtime->hccl.symWinGetPeerPointer == nullptr) {
+      // CANN 9.1.0 exposes HcclCommSymWinGet/Register in libhcomm, but some
+      // packages ship only the HcclSymWinGetPeerPointer declaration. Try the
+      // symmetric-VA contract first; the end-to-end smoke test validates
+      // whether the platform maps peer windows at the same VA.
+      bases[peer] = PtrToU64(localPtr);
+      continue;
+    }
     void *peerPtr = nullptr;
     ret = runtime->hccl.symWinGetPeerPointer(symWindow, offset, peer, &peerPtr);
     if (ret != 0 || peerPtr == nullptr) {
+      (void)DeregisterHcclSymWindow(runtime, &registeredSymWindow, what);
       SetLastError(std::string("HcclSymWinGetPeerPointer for ") + what + " peer " +
                    std::to_string(peer) + " failed with code " + std::to_string(ret));
       return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
@@ -625,11 +999,14 @@ int RegisterHcclSymmetricBases(TritonAscendGinRuntimeHandle *runtime, void *loca
 
   if (DebugEnabled()) {
     std::fprintf(stderr,
-                 "[triton_ascend_gin] hccl register_%s rank=%u nranks=%u ptr=%p bytes=%llu offset=%llu\n",
+                 "[triton_ascend_gin] hccl register_%s rank=%u nranks=%u ptr=%p bytes=%llu "
+                 "register_bytes=%llu offset=%llu\n",
                  what, rank, nranks, localPtr, static_cast<unsigned long long>(bytes),
+                 static_cast<unsigned long long>(registerBytes),
                  static_cast<unsigned long long>(offset));
   }
 
+  *storedSymWindow = registeredSymWindow;
   *windowHandle = kWindowHandleDefault;
   return CopyDescriptorToDevice(runtime);
 }
@@ -640,9 +1017,9 @@ TritonAscendGinRuntimeHandle *AsHandle(TritonAscendGinHandle handle) {
 
 }  // namespace
 
-extern "C" int TritonAscendGinCreateFromTileXR(TritonAscendGinTileXRHandle tilexrComm,
-                                                 const TritonAscendGinTileXROptions *options,
-                                                 TritonAscendGinHandle *handle) {
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinCreateFromTileXR(
+    TritonAscendGinTileXRHandle tilexrComm, const TritonAscendGinTileXROptions *options,
+    TritonAscendGinHandle *handle) {
   if (handle == nullptr || tilexrComm == nullptr) {
     SetLastError("TritonAscendGinCreateFromTileXR received null input");
     return TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE;
@@ -679,13 +1056,14 @@ extern "C" int TritonAscendGinCreateFromTileXR(TritonAscendGinTileXRHandle tilex
   return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
 }
 
-extern "C" int TritonAscendGinRefreshFromTileXR(TritonAscendGinHandle handle) {
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinRefreshFromTileXR(
+    TritonAscendGinHandle handle) {
   return FillDescriptorFromTileXR(AsHandle(handle));
 }
 
-extern "C" int TritonAscendGinCreateFromHcclPeerMem(TritonAscendGinHcclHandle hcclComm,
-                                                      const TritonAscendGinHcclPeerMemOptions *options,
-                                                      TritonAscendGinHandle *handle) {
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinCreateFromHcclPeerMem(
+    TritonAscendGinHcclHandle hcclComm, const TritonAscendGinHcclPeerMemOptions *options,
+    TritonAscendGinHandle *handle) {
   if (handle == nullptr || hcclComm == nullptr) {
     SetLastError("TritonAscendGinCreateFromHcclPeerMem received null input");
     return TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE;
@@ -721,7 +1099,8 @@ extern "C" int TritonAscendGinCreateFromHcclPeerMem(TritonAscendGinHcclHandle hc
   return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
 }
 
-extern "C" int TritonAscendGinGetDevComm(TritonAscendGinHandle handle, uint64_t *devComm) {
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinGetDevComm(TritonAscendGinHandle handle,
+                                                                        uint64_t *devComm) {
   auto *runtime = AsHandle(handle);
   if (runtime == nullptr || devComm == nullptr || runtime->devDesc == nullptr) {
     SetLastError("TritonAscendGinGetDevComm received invalid input");
@@ -731,7 +1110,8 @@ extern "C" int TritonAscendGinGetDevComm(TritonAscendGinHandle handle, uint64_t 
   return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
 }
 
-extern "C" int TritonAscendGinGetHostComm(TritonAscendGinHandle handle, TritonAscendGinDev *hostComm) {
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinGetHostComm(
+    TritonAscendGinHandle handle, TritonAscendGinDev *hostComm) {
   auto *runtime = AsHandle(handle);
   if (runtime == nullptr || hostComm == nullptr) {
     SetLastError("TritonAscendGinGetHostComm received invalid input");
@@ -741,8 +1121,9 @@ extern "C" int TritonAscendGinGetHostComm(TritonAscendGinHandle handle, TritonAs
   return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
 }
 
-extern "C" int TritonAscendGinRegisterWindow(TritonAscendGinHandle handle, void *localPtr, uint64_t bytes,
-                                               const char *rendezvousId, uint64_t *windowHandle) {
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinRegisterWindow(
+    TritonAscendGinHandle handle, void *localPtr, uint64_t bytes, const char *rendezvousId,
+    uint64_t *windowHandle) {
   auto *runtime = AsHandle(handle);
   if (runtime == nullptr || localPtr == nullptr || bytes == 0 || windowHandle == nullptr) {
     SetLastError("TritonAscendGinRegisterWindow received invalid input");
@@ -765,18 +1146,38 @@ extern "C" int TritonAscendGinRegisterWindow(TritonAscendGinHandle handle, void 
   char localKey[kAclIpcKeyBytes] = {};
   uint64_t localWindowOffset = 0;
   uint64_t localExportBytes = 0;
-  aclError err = ExportUserWindowKey(localPtr, bytes, localKey, sizeof(localKey),
-                                     &localWindowOffset, &localExportBytes);
+  uint32_t localPid = 0;
+  bool localRtIpc = false;
+  const char *tilexrIpcMode = std::getenv("TRITON_ASCEND_GIN_TILEXR_IPC_MODE");
+  const bool forceRtIpc =
+      tilexrIpcMode != nullptr &&
+      (std::strcmp(tilexrIpcMode, "rt") == 0 || std::strcmp(tilexrIpcMode, "rts") == 0);
+  aclError err = ACL_ERROR_INVALID_PARAM;
+  if (!forceRtIpc) {
+    err = ExportUserWindowKey(localPtr, bytes, localKey, sizeof(localKey),
+                              &localWindowOffset, &localExportBytes);
+  }
+  if (forceRtIpc || static_cast<int>(err) == 207000) {
+    int rtStatus = ExportUserWindowRtIpc(localPtr, bytes, localKey, sizeof(localKey),
+                                         &localWindowOffset, &localExportBytes, &localPid);
+    if (rtStatus != TRITON_ASCEND_GIN_RUNTIME_SUCCESS) {
+      return rtStatus;
+    }
+    localRtIpc = true;
+    err = ACL_SUCCESS;
+  }
   if (DebugEnabled()) {
     int32_t deviceId = -1;
     aclError devErr = aclrtGetDevice(&deviceId);
     std::fprintf(stderr,
                  "[triton_ascend_gin] rank=%u register_window ptr=%p bytes=%llu offset=%llu "
-                 "export_bytes=%llu device=%d get_device_err=%d export_err=%d key=%s\n",
+                 "export_bytes=%llu device=%d get_device_err=%d export_err=%d rt_ipc=%d "
+                 "pid=%u key=%s\n",
                  runtime->hostDesc.rank, localPtr, static_cast<unsigned long long>(bytes),
                  static_cast<unsigned long long>(localWindowOffset),
                  static_cast<unsigned long long>(localExportBytes),
-                 deviceId, static_cast<int>(devErr), static_cast<int>(err), localKey);
+                 deviceId, static_cast<int>(devErr), static_cast<int>(err),
+                 localRtIpc ? 1 : 0, localPid, localKey);
   }
   if (err != ACL_SUCCESS) {
     SetAclError("aclrtIpcMemGetExportKey user window", err);
@@ -790,10 +1191,17 @@ extern "C" int TritonAscendGinRegisterWindow(TritonAscendGinHandle handle, void 
   const uint32_t nranks = runtime->hostDesc.nranks;
   const std::string localPath = WindowKeyPath(dir, id, rank);
   const std::string localReadyPath = WindowReadyPath(dir, id, rank);
+  const std::string localPidReadyPath = WindowPidReadyPath(dir, id, rank);
   (void)std::remove(localPath.c_str());
   (void)std::remove(localReadyPath.c_str());
+  (void)std::remove(localPidReadyPath.c_str());
   std::ostringstream localInfo;
-  localInfo << localKey << " " << localWindowOffset << " " << bytes;
+  if (localRtIpc) {
+    localInfo << "rt " << localKey << " " << localWindowOffset << " " << bytes << " "
+              << localPid;
+  } else {
+    localInfo << "acl " << localKey << " " << localWindowOffset << " " << bytes;
+  }
   if (!WriteTextFile(localPath, localInfo.str())) {
     SetLastError("failed to write window rendezvous key file: " + localPath);
     return TRITON_ASCEND_GIN_RUNTIME_NOT_FOUND;
@@ -829,6 +1237,43 @@ extern "C" int TritonAscendGinRegisterWindow(TritonAscendGinHandle handle, void 
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 
+  const bool useRtIpc = windowInfos[rank].rtIpc;
+  for (uint32_t peer = 0; peer < nranks; ++peer) {
+    if (windowInfos[peer].rtIpc != useRtIpc) {
+      SetLastError("mixed TileXR user-window IPC modes are not supported for rendezvous id " + id);
+      return TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE;
+    }
+  }
+
+  if (useRtIpc) {
+    int ret = SetRtIpcWindowPeerPids(localKey, windowInfos, nranks, rank);
+    if (ret != TRITON_ASCEND_GIN_RUNTIME_SUCCESS) {
+      return ret;
+    }
+    if (!WriteTextFile(localPidReadyPath, "ready")) {
+      SetLastError("failed to write window rendezvous pid-ready file: " + localPidReadyPath);
+      return TRITON_ASCEND_GIN_RUNTIME_NOT_FOUND;
+    }
+    while (true) {
+      bool ready = true;
+      for (uint32_t peer = 0; peer < nranks; ++peer) {
+        std::string ignored;
+        if (!ReadTextFile(WindowPidReadyPath(dir, id, peer), &ignored)) {
+          ready = false;
+          break;
+        }
+      }
+      if (ready) {
+        break;
+      }
+      if (std::chrono::steady_clock::now() > deadline) {
+        SetLastError("timeout waiting for window pid rendezvous id " + id);
+        return TRITON_ASCEND_GIN_RUNTIME_NOT_FOUND;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+
   runtime->hostDesc.window_bytes = bytes;
   runtime->userWindowBytes = bytes;
   for (uint32_t peer = 0; peer < nranks; ++peer) {
@@ -839,26 +1284,44 @@ extern "C" int TritonAscendGinRegisterWindow(TritonAscendGinHandle handle, void 
       continue;
     }
     void *peerPtr = nullptr;
-    err = aclrtIpcMemImportByKey(&peerPtr, windowInfos[peer].key.c_str(),
-                                 ACL_RT_IPC_MEM_IMPORT_FLAG_ENABLE_PEER_ACCESS);
+    int importRet = 0;
+    if (useRtIpc) {
+      if (!EnsureRtsIpcSymbols()) {
+        ClearRegisteredUserWindow(runtime);
+        return TRITON_ASCEND_GIN_RUNTIME_NOT_FOUND;
+      }
+      importRet = g_rtsIpcSymbols.openMemory(&peerPtr, windowInfos[peer].key.c_str());
+      err = importRet == 0 ? ACL_SUCCESS : static_cast<aclError>(importRet);
+    } else {
+      err = aclrtIpcMemImportByKey(&peerPtr, windowInfos[peer].key.c_str(),
+                                   ACL_RT_IPC_MEM_IMPORT_FLAG_ENABLE_PEER_ACCESS);
+      importRet = static_cast<int>(err);
+    }
     if (DebugEnabled()) {
       int32_t deviceId = -1;
       aclError devErr = aclrtGetDevice(&deviceId);
       std::fprintf(stderr,
                    "[triton_ascend_gin] rank=%u import_window peer=%u device=%d get_device_err=%d "
-                   "import_err=%d peer_ptr=%p offset=%llu key=%s\n",
+                   "import_err=%d rt_ipc=%d peer_ptr=%p offset=%llu key=%s\n",
                    rank, peer, deviceId, static_cast<int>(devErr), static_cast<int>(err),
-                   peerPtr, static_cast<unsigned long long>(windowInfos[peer].windowOffset),
+                   useRtIpc ? 1 : 0, peerPtr,
+                   static_cast<unsigned long long>(windowInfos[peer].windowOffset),
                    windowInfos[peer].key.c_str());
     }
     if (err != ACL_SUCCESS || peerPtr == nullptr) {
-      SetAclError("aclrtIpcMemImportByKey user window", err);
+      if (useRtIpc) {
+        SetLastError("rtIpcOpenMemory user window peer " + std::to_string(peer) +
+                     " failed with rt error " + std::to_string(importRet));
+      } else {
+        SetAclError("aclrtIpcMemImportByKey user window", err);
+      }
       ClearRegisteredUserWindow(runtime);
       return TRITON_ASCEND_GIN_RUNTIME_ACL_ERROR;
     }
     runtime->userWindowPtrs[peer] = peerPtr;
     runtime->hostDesc.peer_window_base[peer] = PtrToU64(peerPtr) + windowInfos[peer].windowOffset;
     runtime->userWindowImported[peer] = true;
+    runtime->userWindowRtIpc[peer] = useRtIpc;
   }
 
   if (!WriteTextFile(localReadyPath, "ready")) {
@@ -898,9 +1361,9 @@ extern "C" int TritonAscendGinRegisterWindow(TritonAscendGinHandle handle, void 
   return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
 }
 
-extern "C" int TritonAscendGinRegisterSignalWindow(TritonAscendGinHandle handle, void *localPtr,
-                                                     uint64_t bytes, const char *rendezvousId,
-                                                     uint64_t *windowHandle) {
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinRegisterSignalWindow(
+    TritonAscendGinHandle handle, void *localPtr, uint64_t bytes, const char *rendezvousId,
+    uint64_t *windowHandle) {
   auto *runtime = AsHandle(handle);
   if (runtime == nullptr || localPtr == nullptr || bytes == 0 || windowHandle == nullptr) {
     SetLastError("TritonAscendGinRegisterSignalWindow received invalid input");
@@ -920,11 +1383,134 @@ extern "C" int TritonAscendGinRegisterSignalWindow(TritonAscendGinHandle handle,
                                     runtime->hostDesc.peer_signal_base, windowHandle);
 }
 
-extern "C" const char *TritonAscendGinGetLastError(void) {
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API void *TritonAscendGinHcclAllocatorAlloc(
+    int64_t size, int device, void *stream) {
+  (void)stream;
+  if (size <= 0) {
+    return nullptr;
+  }
+
+  aclError setDeviceErr = aclrtSetDevice(device);
+  if (setDeviceErr != ACL_SUCCESS) {
+    SetAclError("aclrtSetDevice", setDeviceErr);
+    if (DebugEnabled()) {
+      std::fprintf(stderr, "TritonAscendGinHcclAllocatorAlloc: %s\n", g_lastError.c_str());
+    }
+    return nullptr;
+  }
+
+  aclrtPhysicalMemProp prop = {};
+  prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
+  prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
+  prop.memAttr = ACL_HBM_MEM_HUGE;
+  prop.location.id = static_cast<uint32_t>(device);
+  prop.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+  prop.reserve = 0;
+
+  size_t granularity = 0;
+  aclError granularityErr =
+      aclrtMemGetAllocationGranularity(&prop, ACL_RT_MEM_ALLOC_GRANULARITY_RECOMMENDED, &granularity);
+  if (granularityErr != ACL_SUCCESS || granularity == 0) {
+    SetAclError("aclrtMemGetAllocationGranularity", granularityErr);
+    if (DebugEnabled()) {
+      std::fprintf(stderr, "TritonAscendGinHcclAllocatorAlloc: %s\n", g_lastError.c_str());
+    }
+    return nullptr;
+  }
+
+  uint64_t allocSize = HcclSymWindowRegisterBytes(static_cast<uint64_t>(size));
+  allocSize = ((allocSize + granularity - 1) / granularity) * granularity;
+  void *ptr = nullptr;
+  aclError reserveErr = aclrtReserveMemAddress(&ptr, static_cast<size_t>(allocSize), 0, nullptr, 1);
+  if (reserveErr != ACL_SUCCESS || ptr == nullptr) {
+    SetAclError("aclrtReserveMemAddress", reserveErr);
+    if (DebugEnabled()) {
+      std::fprintf(stderr, "TritonAscendGinHcclAllocatorAlloc: %s\n", g_lastError.c_str());
+    }
+    return nullptr;
+  }
+
+  aclrtDrvMemHandle handle = nullptr;
+  aclError mallocErr = aclrtMallocPhysical(&handle, static_cast<size_t>(allocSize), &prop, 0);
+  if (mallocErr != ACL_SUCCESS || handle == nullptr) {
+    SetAclError("aclrtMallocPhysical", mallocErr);
+    (void)aclrtReleaseMemAddress(ptr);
+    if (DebugEnabled()) {
+      std::fprintf(stderr, "TritonAscendGinHcclAllocatorAlloc: %s\n", g_lastError.c_str());
+    }
+    return nullptr;
+  }
+
+  aclError mapErr = aclrtMapMem(ptr, static_cast<size_t>(allocSize), 0, handle, 0);
+  if (mapErr != ACL_SUCCESS) {
+    SetAclError("aclrtMapMem", mapErr);
+    (void)aclrtFreePhysical(handle);
+    (void)aclrtReleaseMemAddress(ptr);
+    if (DebugEnabled()) {
+      std::fprintf(stderr, "TritonAscendGinHcclAllocatorAlloc: %s\n", g_lastError.c_str());
+    }
+    return nullptr;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(g_hcclVmmAllocationMutex);
+    g_hcclVmmAllocations[ptr] = HcclVmmAllocation{handle, allocSize};
+  }
+  if (DebugEnabled()) {
+    std::fprintf(stderr,
+                 "[triton_ascend_gin] hccl allocator alloc ptr=%p requested=%lld alloc_size=%llu "
+                 "granularity=%zu device=%d\n",
+                 ptr, static_cast<long long>(size), static_cast<unsigned long long>(allocSize),
+                 granularity, device);
+  }
+  return ptr;
+}
+
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API void TritonAscendGinHcclAllocatorFree(
+    void *ptr, uint64_t size, void *stream) {
+  (void)size;
+  (void)stream;
+  if (ptr == nullptr) {
+    return;
+  }
+
+  HcclVmmAllocation allocation;
+  {
+    std::lock_guard<std::mutex> lock(g_hcclVmmAllocationMutex);
+    auto it = g_hcclVmmAllocations.find(ptr);
+    if (it == g_hcclVmmAllocations.end()) {
+      if (DebugEnabled()) {
+        std::fprintf(stderr, "TritonAscendGinHcclAllocatorFree: unknown ptr=%p\n", ptr);
+      }
+      return;
+    }
+    allocation = it->second;
+    g_hcclVmmAllocations.erase(it);
+  }
+
+  aclError unmapErr = aclrtUnmapMem(ptr);
+  aclError freeErr = aclrtFreePhysical(allocation.handle);
+  aclError releaseErr = aclrtReleaseMemAddress(ptr);
+  if (unmapErr != ACL_SUCCESS || freeErr != ACL_SUCCESS || releaseErr != ACL_SUCCESS) {
+    SetLastError("HCCL VMM free failed unmap=" + std::to_string(static_cast<int>(unmapErr)) +
+                 " free=" + std::to_string(static_cast<int>(freeErr)) +
+                 " release=" + std::to_string(static_cast<int>(releaseErr)));
+    if (DebugEnabled()) {
+      std::fprintf(stderr, "TritonAscendGinHcclAllocatorFree: %s\n", g_lastError.c_str());
+    }
+    return;
+  }
+  if (DebugEnabled()) {
+    std::fprintf(stderr, "[triton_ascend_gin] hccl allocator free ptr=%p alloc_size=%llu\n",
+                 ptr, static_cast<unsigned long long>(allocation.bytes));
+  }
+}
+
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API const char *TritonAscendGinGetLastError(void) {
   return g_lastError.c_str();
 }
 
-extern "C" void TritonAscendGinDestroy(TritonAscendGinHandle handle) {
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API void TritonAscendGinDestroy(TritonAscendGinHandle handle) {
   auto *runtime = AsHandle(handle);
   if (runtime == nullptr) {
     return;
@@ -934,6 +1520,8 @@ extern "C" void TritonAscendGinDestroy(TritonAscendGinHandle handle) {
     aclrtFree(runtime->devDesc);
     runtime->devDesc = nullptr;
   }
+  (void)DeregisterHcclSymWindow(runtime, &runtime->hcclDataSymWindow, "window");
+  (void)DeregisterHcclSymWindow(runtime, &runtime->hcclSignalSymWindow, "signal_window");
   CloseTileXRSymbols(&runtime->tilexr);
   CloseHcclPeerMemSymbols(&runtime->hccl);
   delete runtime;

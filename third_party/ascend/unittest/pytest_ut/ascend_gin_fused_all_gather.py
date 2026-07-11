@@ -6,9 +6,9 @@ import triton.language.extra.cann.gin as tgin
 @triton.jit
 def fused_all_gather_scale_kernel(x, y, comm_h, win_h, n_elements: tl.constexpr,
                                   MAX_RANKS: tl.constexpr, BLOCK: tl.constexpr,
-                                  BLOCKS: tl.constexpr):
+                                  BLOCKS: tl.constexpr, BACKEND_MASK: tl.constexpr):
     comm = tgin.dev_comm(comm_h)
-    gin = tgin.gin(comm, backend_mask=tgin.GIN_BACKEND_TILEXR_IPC_PEER_MEM)
+    gin = tgin.gin(comm, backend_mask=BACKEND_MASK)
     win = tgin.window(win_h, ptr=y)
 
     rank = tgin.rank(comm)

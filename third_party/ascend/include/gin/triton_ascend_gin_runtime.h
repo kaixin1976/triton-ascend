@@ -5,6 +5,18 @@
 
 #include "triton_ascend_gin_abi.h"
 
+#if defined(_WIN32)
+#if defined(TRITON_ASCEND_GIN_RUNTIME_BUILD)
+#define TRITON_ASCEND_GIN_RUNTIME_API __declspec(dllexport)
+#else
+#define TRITON_ASCEND_GIN_RUNTIME_API __declspec(dllimport)
+#endif
+#elif defined(__GNUC__)
+#define TRITON_ASCEND_GIN_RUNTIME_API __attribute__((visibility("default")))
+#else
+#define TRITON_ASCEND_GIN_RUNTIME_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -40,29 +52,39 @@ struct TritonAscendGinHcclPeerMemOptions {
   const char *hccl_library_path;
 };
 
-int TritonAscendGinCreateFromTileXR(TritonAscendGinTileXRHandle tilexr_comm,
-                                     const TritonAscendGinTileXROptions *options,
-                                     TritonAscendGinHandle *handle);
+TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinCreateFromTileXR(
+    TritonAscendGinTileXRHandle tilexr_comm, const TritonAscendGinTileXROptions *options,
+    TritonAscendGinHandle *handle);
 
-int TritonAscendGinRefreshFromTileXR(TritonAscendGinHandle handle);
+TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinRefreshFromTileXR(TritonAscendGinHandle handle);
 
-int TritonAscendGinCreateFromHcclPeerMem(TritonAscendGinHcclHandle hccl_comm,
-                                          const TritonAscendGinHcclPeerMemOptions *options,
-                                          TritonAscendGinHandle *handle);
+TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinCreateFromHcclPeerMem(
+    TritonAscendGinHcclHandle hccl_comm, const TritonAscendGinHcclPeerMemOptions *options,
+    TritonAscendGinHandle *handle);
 
-int TritonAscendGinGetDevComm(TritonAscendGinHandle handle, uint64_t *dev_comm);
+TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinGetDevComm(TritonAscendGinHandle handle,
+                                                            uint64_t *dev_comm);
 
-int TritonAscendGinGetHostComm(TritonAscendGinHandle handle, TritonAscendGinDev *host_comm);
+TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinGetHostComm(TritonAscendGinHandle handle,
+                                                             TritonAscendGinDev *host_comm);
 
-int TritonAscendGinRegisterWindow(TritonAscendGinHandle handle, void *local_ptr, uint64_t bytes,
-                                   const char *rendezvous_id, uint64_t *window_handle);
+TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinRegisterWindow(
+    TritonAscendGinHandle handle, void *local_ptr, uint64_t bytes, const char *rendezvous_id,
+    uint64_t *window_handle);
 
-int TritonAscendGinRegisterSignalWindow(TritonAscendGinHandle handle, void *local_ptr, uint64_t bytes,
-                                         const char *rendezvous_id, uint64_t *window_handle);
+TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinRegisterSignalWindow(
+    TritonAscendGinHandle handle, void *local_ptr, uint64_t bytes, const char *rendezvous_id,
+    uint64_t *window_handle);
 
-const char *TritonAscendGinGetLastError(void);
+TRITON_ASCEND_GIN_RUNTIME_API void *TritonAscendGinHcclAllocatorAlloc(
+    int64_t size, int device, void *stream);
 
-void TritonAscendGinDestroy(TritonAscendGinHandle handle);
+TRITON_ASCEND_GIN_RUNTIME_API void TritonAscendGinHcclAllocatorFree(
+    void *ptr, uint64_t size, void *stream);
+
+TRITON_ASCEND_GIN_RUNTIME_API const char *TritonAscendGinGetLastError(void);
+
+TRITON_ASCEND_GIN_RUNTIME_API void TritonAscendGinDestroy(TritonAscendGinHandle handle);
 
 #ifdef __cplusplus
 }

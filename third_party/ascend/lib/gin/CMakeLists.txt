@@ -1,5 +1,5 @@
 option(TRITON_ASCEND_BUILD_GIN_RUNTIME
-  "Build the experimental Triton-Ascend GIN host runtime bridge" OFF)
+  "Build the experimental Triton-Ascend GIN host runtime bridge" ON)
 
 if(TRITON_ASCEND_BUILD_GIN_RUNTIME)
   set(ASCEND_CANN_ROOT "" CACHE PATH "CANN toolkit root for Triton-Ascend GIN runtime")
@@ -51,4 +51,12 @@ if(TRITON_ASCEND_BUILD_GIN_RUNTIME)
   set_target_properties(triton_ascend_gin_runtime PROPERTIES
     OUTPUT_NAME triton_ascend_gin_runtime
   )
+  if(CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+    set(_triton_ascend_gin_runtime_output_dir
+      "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/../backends/ascend/lib/gin")
+    file(MAKE_DIRECTORY "${_triton_ascend_gin_runtime_output_dir}")
+    set_target_properties(triton_ascend_gin_runtime PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY "${_triton_ascend_gin_runtime_output_dir}"
+    )
+  endif()
 endif()

@@ -104,6 +104,17 @@ def wait_files(prefix, rank_size, rank, phase, timeout_s=180):
     raise TimeoutError(f"barrier {phase} timeout, missing={missing}")
 
 
+def hccl_signal_bytes(rank_size):
+    return rank_size * SIGNAL_SLOTS * 8
+
+
+def hccl_window_numel(rank_size, data_numel):
+    data_bytes = data_numel * 4
+    signal_offset = ((data_bytes + 7) // 8) * 8
+    total_bytes = signal_offset + hccl_signal_bytes(rank_size)
+    return (total_bytes + 3) // 4
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rank", type=int, required=True)
@@ -121,6 +132,10 @@ def main():
     if args.n % args.block != 0:
         raise ValueError("n must be a multiple of block for the current byte-copy smoke")
 
+    gin_runtime.install_hccl_memory_allocator(
+        runtime_library=RUNTIME_LIB,
+        hccl_library=HCCL_LIB,
+    )
     torch.npu.set_device(args.device)
     dist.init_process_group(
         backend="hccl",
@@ -148,10 +163,14 @@ def main():
         )
         comm_h = gin.dev_comm
         x = torch.arange(args.n, dtype=torch.float32, device="npu") + args.rank * 100.0
-        y = torch.full((args.rank_size * args.n,), -777.0, dtype=torch.float32, device="npu")
-        signal_window = torch.zeros((args.rank_size * SIGNAL_SLOTS,), dtype=torch.int64, device="npu")
-        win_h = gin.window_handle(y, rendezvous_id=args.tag)
-        sig_h = gin.signal_window_handle(signal_window, rendezvous_id=args.tag + "_signal")
+        y_numel = args.rank_size * args.n
+        y = torch.full(
+            (hccl_window_numel(args.rank_size, y_numel),),
+            -777.0,
+            dtype=torch.float32,
+            device="npu",
+        )
+        win_h = gin.window_handle(y, nbytes=y_numel * 4, rendezvous_id=args.tag)
 
         blocks = triton.cdiv(args.n, args.block)
         grid = (1,)
@@ -180,13 +199,13 @@ def main():
                 for source_rank in range(args.rank_size)
             ]
         )
-        got = y.cpu()
+        got = y[:y_numel].cpu()
         diff = (got - expected).abs()
         maxerr = float(diff.max())
         bad_idx = int(diff.argmax()) if diff.numel() else -1
         print(
             f"rank={args.rank} device={args.device} comm_h=0x{comm_h:x} "
-            f"win_h={win_h} sig_h={sig_h} maxerr={maxerr}"
+            f"win_h={win_h} maxerr={maxerr}"
         )
         print("got_head=", got[: min(8, got.numel())].tolist())
         print("got_peer_head=", got[args.n: args.n + min(8, args.n)].tolist())

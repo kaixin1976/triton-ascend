@@ -70,6 +70,8 @@ def backend_mask(backend):
         return tgin.GIN_BACKEND_TILEXR_IPC_PEER_MEM
     if backend == "hccl_peer_mem":
         return tgin.GIN_BACKEND_HCCL_PEER_MEM
+    if backend == "hccl_channel":
+        return tgin.GIN_BACKEND_HCCL_CHANNEL
     raise ValueError(f"unsupported backend {backend!r}")
 
 
@@ -88,22 +90,79 @@ def create_tilexr_gin(args):
 
 
 def create_hccl_gin(args):
+    mode_value = gin_runtime.hccl_op_expansion_mode_value(args.hccl_op_expansion_mode)
+    channel_engine_value = gin_runtime.hccl_channel_engine_value(args.hccl_channel_engine)
+    capability = gin_runtime.hccl_comm_config_capability(hccl_library=args.hccl_lib)
+    capability_text = "none" if capability is None else f"0x{capability:x}"
+    print(
+        f"HCCL GIN root-info config: rank={args.rank} "
+        f"op_expansion_mode={args.hccl_op_expansion_mode or 'default'} "
+        f"value={mode_value} channel_engine={args.hccl_channel_engine} "
+        f"channel_engine_value={channel_engine_value} capability={capability_text}",
+        flush=True,
+    )
+    if args.backend == "hccl_channel":
+        os.environ.setdefault("HCCL_INDEPENDENT_OP", "1")
     hccl_comm = gin_runtime.create_hccl_root_info_comm(
         rank=args.rank,
         rank_size=args.rank_size,
         rendezvous_id=args.tag,
         hccl_library=args.hccl_lib,
-        use_config=False,
+        use_config=True,
+        op_expansion_mode=args.hccl_op_expansion_mode,
     )
-    gin = gin_runtime.create_from_hccl_peer_mem(
-        hccl_comm,
-        runtime_library=RUNTIME_LIB,
-        hccl_library=args.hccl_lib,
-        signal_slots=SIGNAL_SLOTS,
+    if args.backend == "hccl_channel":
+        gin = gin_runtime.create_from_hccl_channel(
+            hccl_comm,
+            runtime_library=RUNTIME_LIB,
+            hccl_library=args.hccl_lib,
+            signal_slots=SIGNAL_SLOTS,
+            engine=args.hccl_channel_engine,
+        )
+    else:
+        gin = gin_runtime.create_from_hccl_peer_mem(
+            hccl_comm,
+            runtime_library=RUNTIME_LIB,
+            hccl_library=args.hccl_lib,
+            signal_slots=SIGNAL_SLOTS,
+        )
+    return gin, None, ctypes.c_void_p(hccl_comm), None
+
+
+def hccl_signal_bytes(args):
+    return args.rank_size * SIGNAL_SLOTS * 8
+
+
+def hccl_window_numel(args, data_numel):
+    if args.backend not in ("hccl_peer_mem", "hccl_channel"):
+        return data_numel
+    data_bytes = data_numel * 4
+    signal_offset = ((data_bytes + 7) // 8) * 8
+    total_bytes = signal_offset + hccl_signal_bytes(args)
+    return (total_bytes + 3) // 4
+
+
+def allocate_window_tensor(args, gin, data_numel, fill_value):
+    if args.backend == "hccl_channel":
+        tensor = gin.hccl_buffer_tensor(
+            (hccl_window_numel(args, data_numel),),
+            torch.float32,
+            device=f"npu:{args.device}",
+        )
+        tensor.fill_(fill_value)
+        return tensor
+    return torch.full(
+        (hccl_window_numel(args, data_numel),),
+        fill_value,
+        dtype=torch.float32,
+        device="npu",
     )
-    signal_window = torch.zeros((args.rank_size * SIGNAL_SLOTS,), dtype=torch.int64, device="npu")
-    gin.signal_window_handle(signal_window, rendezvous_id=args.tag + "_signal")
-    return gin, None, ctypes.c_void_p(hccl_comm), signal_window
+
+
+def register_window(gin, args, tensor, data_numel, rendezvous_id):
+    if args.backend in ("hccl_peer_mem", "hccl_channel"):
+        return gin.window_handle(tensor, nbytes=data_numel * 4, rendezvous_id=rendezvous_id)
+    return gin.window_handle(tensor, rendezvous_id=rendezvous_id)
 
 
 def main():
@@ -112,11 +171,13 @@ def main():
     parser.add_argument("--rank-size", type=int, default=2)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--tag", required=True)
-    parser.add_argument("--backend", choices=("tilexr", "hccl_peer_mem"), default="tilexr")
+    parser.add_argument("--backend", choices=("tilexr", "hccl_peer_mem", "hccl_channel"), default="tilexr")
     parser.add_argument("--master-addr", default="127.0.0.1")
     parser.add_argument("--master-port")
     parser.add_argument("--tilexr-lib", default=TILEXR_LIB)
     parser.add_argument("--hccl-lib", default=HCCL_LIB)
+    parser.add_argument("--hccl-op-expansion-mode")
+    parser.add_argument("--hccl-channel-engine", default="aiv")
     parser.add_argument("--n", type=int, default=128)
     parser.add_argument("--block", type=int, default=32)
     args = parser.parse_args()
@@ -147,8 +208,9 @@ def main():
 
         comm_h = gin.dev_comm
         x = torch.arange(args.n, dtype=torch.float32, device="npu") + args.rank * 100.0
-        y = torch.full((args.rank_size * args.n,), -777.0, dtype=torch.float32, device="npu")
-        win_h = gin.window_handle(y, rendezvous_id=args.tag)
+        y_numel = args.rank_size * args.n
+        y = allocate_window_tensor(args, gin, y_numel, -777.0)
+        win_h = register_window(gin, args, y, y_numel, args.tag)
 
         blocks = triton.cdiv(args.n, args.block)
         grid = (1,)
@@ -176,7 +238,7 @@ def main():
         for source_rank in range(args.rank_size):
             expected_chunks.append((torch.arange(args.n, dtype=torch.float32) + source_rank * 100.0) * 0.5)
         expected = torch.cat(expected_chunks)
-        got = y.cpu()
+        got = y[:y_numel].cpu()
         diff = (got - expected).abs()
         maxerr = float(diff.max())
         bad_idx = int(diff.argmax()) if diff.numel() else -1
@@ -198,7 +260,7 @@ def main():
             gin.close()
         if dist.is_initialized():
             dist.destroy_process_group()
-        if args.backend == "hccl_peer_mem" and tile_comm.value:
+        if args.backend in ("hccl_peer_mem", "hccl_channel") and tile_comm.value:
             gin_runtime.destroy_hccl_comm(tile_comm, hccl_library=args.hccl_lib)
         if tile is not None and tile_comm.value:
             tile.TileXRCommDestroy(tile_comm)

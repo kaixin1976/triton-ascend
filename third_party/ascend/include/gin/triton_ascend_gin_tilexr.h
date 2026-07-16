@@ -31,6 +31,9 @@
 extern "C" {
 #endif
 
+int32_t HcommWriteOnThread(uint64_t thread, uint64_t channel, void *dst, const void *src, uint64_t len);
+int32_t HcommReadOnThread(uint64_t thread, uint64_t channel, void *dst, const void *src, uint64_t len);
+
 TRITON_ASCEND_GIN_DEVICE inline const TRITON_ASCEND_GIN_GM TritonAscendGinDev *
 __triton_ascend_gin_as_dev(uint64_t dev_comm) {
   return reinterpret_cast<const TRITON_ASCEND_GIN_GM TritonAscendGinDev *>(dev_comm);
@@ -65,6 +68,14 @@ __triton_ascend_gin_use_peer_mem(const TRITON_ASCEND_GIN_GM TritonAscendGinDev *
   }
   return (backend_mask & TRITON_ASCEND_GIN_BACKEND_HCCL_PEER_MEM) != 0 &&
          comm->backend_kind == TRITON_ASCEND_GIN_BACKEND_KIND_HCCL_PEER_MEM;
+}
+
+TRITON_ASCEND_GIN_DEVICE inline bool
+__triton_ascend_gin_use_hccl_channel(const TRITON_ASCEND_GIN_GM TritonAscendGinDev *comm,
+                                      uint32_t backend_mask) {
+  return comm != nullptr &&
+         (backend_mask & TRITON_ASCEND_GIN_BACKEND_HCCL_CHANNEL) != 0 &&
+         comm->backend_kind == TRITON_ASCEND_GIN_BACKEND_KIND_HCCL_CHANNEL;
 }
 
 TRITON_ASCEND_GIN_DEVICE inline uint64_t
@@ -194,6 +205,16 @@ TRITON_ASCEND_GIN_DEVICE int32_t __triton_ascend_gin_put(
     __triton_ascend_gin_copy_bytes(dst_addr, src_ptr, nbytes);
     return token + 1;
   }
+  if (__triton_ascend_gin_use_hccl_channel(comm, backend_mask)) {
+    if (peer < 0 || peer >= static_cast<int32_t>(comm->nranks)) {
+      return token;
+    }
+    uint64_t dst_addr = __triton_ascend_gin_peer_window_addr(comm, peer, dst_offset);
+    if (dst_addr != 0 && src_ptr != 0 && nbytes != 0) {
+      __triton_ascend_gin_copy_bytes(dst_addr, src_ptr, nbytes);
+    }
+    return token + 1;
+  }
 #if defined(TRITON_ASCEND_GIN_ENABLE_TILEXR)
   if ((backend_mask & TRITON_ASCEND_GIN_BACKEND_TILEXR_UDMA) != 0 &&
       comm->backend_kind == TRITON_ASCEND_GIN_BACKEND_KIND_TILEXR_UDMA) {
@@ -229,6 +250,21 @@ TRITON_ASCEND_GIN_DEVICE int32_t __triton_ascend_gin_put_signal(
         comm, peer, static_cast<int32_t>(comm->rank), signal_id);
     __triton_ascend_gin_copy_bytes(dst_addr, src_ptr, nbytes);
     __triton_ascend_gin_store_u64(signal_addr, signal_value);
+    return token + 1;
+  }
+  if (__triton_ascend_gin_use_hccl_channel(comm, backend_mask)) {
+    if (peer < 0 || peer >= static_cast<int32_t>(comm->nranks)) {
+      return token;
+    }
+    uint64_t dst_addr = __triton_ascend_gin_peer_window_addr(comm, peer, dst_offset);
+    uint64_t remote_signal_addr = __triton_ascend_gin_peer_signal_addr(
+        comm, peer, static_cast<int32_t>(comm->rank), signal_id);
+    if (dst_addr != 0 && src_ptr != 0 && nbytes != 0) {
+      __triton_ascend_gin_copy_bytes(dst_addr, src_ptr, nbytes);
+    }
+    if (remote_signal_addr != 0) {
+      __triton_ascend_gin_store_u64(remote_signal_addr, signal_value);
+    }
     return token + 1;
   }
 #if defined(TRITON_ASCEND_GIN_ENABLE_TILEXR)
@@ -300,6 +336,16 @@ TRITON_ASCEND_GIN_DEVICE int32_t __triton_ascend_gin_get(
     __triton_ascend_gin_copy_bytes(dst_ptr, src_addr, nbytes);
     return token + 1;
   }
+  if (__triton_ascend_gin_use_hccl_channel(comm, backend_mask)) {
+    if (peer < 0 || peer >= static_cast<int32_t>(comm->nranks)) {
+      return token;
+    }
+    uint64_t src_addr = __triton_ascend_gin_peer_window_addr(comm, peer, src_offset);
+    if (dst_ptr != 0 && src_addr != 0 && nbytes != 0) {
+      __triton_ascend_gin_copy_bytes(dst_ptr, src_addr, nbytes);
+    }
+    return token + 1;
+  }
 #if defined(TRITON_ASCEND_GIN_ENABLE_TILEXR)
   if ((backend_mask & TRITON_ASCEND_GIN_BACKEND_TILEXR_UDMA) != 0 &&
       comm->backend_kind == TRITON_ASCEND_GIN_BACKEND_KIND_TILEXR_UDMA) {
@@ -331,6 +377,17 @@ TRITON_ASCEND_GIN_DEVICE int32_t __triton_ascend_gin_signal(
     uint64_t signal_addr = __triton_ascend_gin_peer_signal_addr(
         comm, peer, static_cast<int32_t>(comm->rank), signal_id);
     __triton_ascend_gin_store_u64(signal_addr, signal_value);
+    return token + 1;
+  }
+  if (__triton_ascend_gin_use_hccl_channel(comm, backend_mask)) {
+    if (peer < 0 || peer >= static_cast<int32_t>(comm->nranks)) {
+      return token;
+    }
+    uint64_t remote_signal_addr = __triton_ascend_gin_peer_signal_addr(
+        comm, peer, static_cast<int32_t>(comm->rank), signal_id);
+    if (remote_signal_addr != 0) {
+      __triton_ascend_gin_store_u64(remote_signal_addr, signal_value);
+    }
     return token + 1;
   }
 #if defined(TRITON_ASCEND_GIN_ENABLE_TILEXR)
@@ -417,6 +474,12 @@ TRITON_ASCEND_GIN_DEVICE int32_t __triton_ascend_gin_flush(
     return token;
   }
   if (__triton_ascend_gin_use_peer_mem(comm, backend_mask)) {
+#if defined(__NPU_ARCH__) || defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__CCE_IS_AICORE__) || defined(__CCE__)
+    pipe_barrier(PIPE_ALL);
+#endif
+    return token + 1;
+  }
+  if (__triton_ascend_gin_use_hccl_channel(comm, backend_mask)) {
 #if defined(__NPU_ARCH__) || defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__CCE_IS_AICORE__) || defined(__CCE__)
     pipe_barrier(PIPE_ALL);
 #endif

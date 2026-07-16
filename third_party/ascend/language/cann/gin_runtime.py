@@ -26,11 +26,44 @@ _HCCL_COMM_CONFIG_VERSION = 10
 _HCCL_COMM_BUFFSIZE_CONFIG_NOT_SET = 0xFFFFFFFF
 _HCCL_COMM_DETERMINISTIC_CONFIG_NOT_SET = 0xFFFFFFFF
 _HCCL_COMM_DEFAULT_OP_EXPANSION_MODE = 0
+_HCCL_DATA_TYPE_FP32 = 4
 _HCCL_COMM_TRAFFIC_CLASS_CONFIG_NOT_SET = 0xFFFFFFFF
 _HCCL_COMM_SERVICE_LEVEL_CONFIG_NOT_SET = 0xFFFFFFFF
 _HCCL_COMM_QOS_CONFIG_NOT_SET = 0xFFFFFFFF
 _HCCL_COMM_EXECTIMEOUT_CONFIG_NOT_SET = -1
 _HCCL_DEFAULT_SYMMETRIC_MEMORY_STRIDE_GB = 16
+
+_HCCL_OP_EXPANSION_MODES = {
+    "default": _HCCL_COMM_DEFAULT_OP_EXPANSION_MODE,
+    "host": 1,
+    "ai_cpu": 2,
+    "aicpu": 2,
+    "aiv": 3,
+}
+
+_HCCL_CHANNEL_ENGINES = {
+    "cpu": 0,
+    "host": 0,
+    "cpu_ts": 1,
+    "host_ts": 1,
+    "aicpu": 2,
+    "ai_cpu": 2,
+    "aicpu_ts": 3,
+    "ai_cpu_ts": 3,
+    "aiv": 4,
+    "ccu": 5,
+}
+
+_HCCL_CHANNEL_PROTOCOLS = {
+    0: "hccs",
+    1: "roce",
+    2: "pcie",
+    3: "sio",
+    4: "ubc_ctp",
+    5: "ubc_tp",
+    6: "ub_mem",
+    7: "uboe",
+}
 
 
 class TileXROptions(ctypes.Structure):
@@ -51,6 +84,109 @@ class HcclPeerMemOptions(ctypes.Structure):
         ("signal_slots", ctypes.c_uint32),
         ("reserved0", ctypes.c_uint32),
         ("hccl_library_path", ctypes.c_char_p),
+    ]
+
+
+class HcclChannelOptions(ctypes.Structure):
+    _fields_ = [
+        ("window_bytes", ctypes.c_uint64),
+        ("signal_stride", ctypes.c_uint64),
+        ("signal_slots", ctypes.c_uint32),
+        ("engine", ctypes.c_uint32),
+        ("hccl_library_path", ctypes.c_char_p),
+    ]
+
+
+class HcclChannelProbe(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("rank", ctypes.c_uint32),
+        ("nranks", ctypes.c_uint32),
+        ("engine", ctypes.c_uint32),
+        ("layer_count", ctypes.c_uint32),
+        ("first_error_peer", ctypes.c_uint32),
+        ("peer_mask", ctypes.c_uint64),
+        ("protocol_mask", ctypes.c_uint64),
+        ("hccs_peer_mask", ctypes.c_uint64),
+        ("roce_peer_mask", ctypes.c_uint64),
+        ("pcie_peer_mask", ctypes.c_uint64),
+        ("ubc_ctp_peer_mask", ctypes.c_uint64),
+        ("ubc_tp_peer_mask", ctypes.c_uint64),
+        ("ub_mem_peer_mask", ctypes.c_uint64),
+        ("acquire_peer_mask", ctypes.c_uint64),
+        ("ccl_buffer_ptr", ctypes.c_uint64),
+        ("ccl_buffer_bytes", ctypes.c_uint64),
+        ("aiv_comm_info_ptr", ctypes.c_uint64),
+        ("aiv_comm_info_bytes", ctypes.c_uint64),
+        ("aiv_comm_info_mem_handle", ctypes.c_uint64),
+        ("ccl_buffer_status", ctypes.c_int32),
+        ("aiv_comm_info_status", ctypes.c_int32),
+        ("first_error_status", ctypes.c_int32),
+        ("reserved0", ctypes.c_uint32),
+        ("first_acquire_ret", ctypes.c_int32),
+        ("first_acquire_peer", ctypes.c_uint32),
+        ("first_acquire_engine", ctypes.c_uint32),
+        ("first_acquire_protocol", ctypes.c_uint32),
+        ("first_acquire_channel_count", ctypes.c_uint32),
+        ("first_acquire_mem_handle_count", ctypes.c_uint32),
+        ("first_acquire_channel", ctypes.c_uint64),
+        ("exchange_info_enabled", ctypes.c_uint32),
+        ("exchange_info_symbol_available", ctypes.c_uint32),
+        ("exchange_info_status", ctypes.c_int32),
+        ("exchange_info_op_execute_config", ctypes.c_uint32),
+        ("exchange_info_ccl_buffer_bytes", ctypes.c_uint64),
+        ("exchange_info_count", ctypes.c_uint64),
+        ("exchange_info_data_type", ctypes.c_uint32),
+        ("exchange_info_aiv_core_limit", ctypes.c_uint32),
+        ("aiv_comm_info_layout_status", ctypes.c_int32),
+        ("reserved1", ctypes.c_uint32),
+        ("aiv_comm_info_gm_in_offset", ctypes.c_uint64),
+        ("aiv_comm_info_gm_out_offset", ctypes.c_uint64),
+        ("aiv_comm_info_local_gm_in", ctypes.c_uint64),
+        ("aiv_comm_info_local_gm_out", ctypes.c_uint64),
+        ("aiv_comm_info_local_flag_base", ctypes.c_uint64),
+        ("aiv_descriptor_via_cpu_enabled", ctypes.c_uint32),
+        ("aiv_descriptor_via_cpu_status", ctypes.c_int32),
+        ("aiv_descriptor_via_cpu_first_ret", ctypes.c_int32),
+        ("aiv_descriptor_via_cpu_first_peer", ctypes.c_uint32),
+        ("aiv_descriptor_via_cpu_first_protocol", ctypes.c_uint32),
+        ("reserved2", ctypes.c_uint32),
+        ("aiv_descriptor_via_cpu_first_channel", ctypes.c_uint64),
+        ("aiv_descriptor_via_cpu_acquire_peer_mask", ctypes.c_uint64),
+        ("aiv_descriptor_via_cpu_hccl_buffer_peer_mask", ctypes.c_uint64),
+        ("aiv_descriptor_via_cpu_remote_mem_peer_mask", ctypes.c_uint64),
+        ("aiv_descriptor_via_cpu_readback_gm_in_mask", ctypes.c_uint64),
+        ("aiv_descriptor_via_cpu_readback_gm_out_mask", ctypes.c_uint64),
+        ("aiv_descriptor_via_cpu_symmetric_gm_out_peer_mask", ctypes.c_uint64),
+    ]
+
+
+class HcclAlgBufferProbe(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("device", ctypes.c_uint32),
+        ("manager_storage_bytes", ctypes.c_uint64),
+        ("ccl_buffer_ptr_before", ctypes.c_uint64),
+        ("ccl_buffer_bytes_before", ctypes.c_uint64),
+        ("ccl_buffer_ptr_after", ctypes.c_uint64),
+        ("ccl_buffer_bytes_after", ctypes.c_uint64),
+        ("in_aiv_opbase_devmem_ptr", ctypes.c_uint64),
+        ("in_aiv_opbase_ptr", ctypes.c_uint64),
+        ("in_aiv_opbase_bytes", ctypes.c_uint64),
+        ("out_aiv_opbase_devmem_ptr", ctypes.c_uint64),
+        ("out_aiv_opbase_ptr", ctypes.c_uint64),
+        ("out_aiv_opbase_bytes", ctypes.c_uint64),
+        ("aiv_comm_info_devmem_ptr", ctypes.c_uint64),
+        ("aiv_comm_info_ptr", ctypes.c_uint64),
+        ("aiv_comm_info_bytes", ctypes.c_uint64),
+        ("acl_set_device_status", ctypes.c_int32),
+        ("get_independent_ccl_before_status", ctypes.c_int32),
+        ("create_comm_aiv_buffer_status", ctypes.c_int32),
+        ("create_comm_info_aiv_buffer_status", ctypes.c_int32),
+        ("get_independent_ccl_after_status", ctypes.c_int32),
+        ("clear_comm_aiv_buffer_status", ctypes.c_int32),
+        ("release_comm_aiv_buffer_status", ctypes.c_int32),
+        ("first_error_status", ctypes.c_int32),
     ]
 
 
@@ -105,6 +241,146 @@ class GinComm:
         out = ctypes.c_uint64()
         _check(self._library, self._library.TritonAscendGinGetDevComm(self._handle, ctypes.byref(out)))
         return int(out.value)
+
+    def hccl_buffer_info(self):
+        ptr = ctypes.c_uint64()
+        nbytes = ctypes.c_uint64()
+        _check(
+            self._library,
+            self._library.TritonAscendGinGetHcclBuffer(
+                self._handle,
+                ctypes.byref(ptr),
+                ctypes.byref(nbytes),
+            ),
+        )
+        return int(ptr.value), int(nbytes.value)
+
+    def hccl_aiv_opbase_buffer_info(self, which="out"):
+        if isinstance(which, str):
+            text = which.strip().lower()
+            if text == "in":
+                which_value = 0
+            elif text == "out":
+                which_value = 1
+            else:
+                raise ValueError("which must be 'in', 'out', 0, or 1")
+        else:
+            which_value = int(which)
+        ptr = ctypes.c_uint64()
+        nbytes = ctypes.c_uint64()
+        _check(
+            self._library,
+            self._library.TritonAscendGinGetHcclAivOpbaseBuffer(
+                self._handle,
+                ctypes.c_uint32(which_value),
+                ctypes.byref(ptr),
+                ctypes.byref(nbytes),
+            ),
+        )
+        return int(ptr.value), int(nbytes.value)
+
+    def hccl_buffer_tensor(self, shape, dtype, device=None, *, nbytes=None):
+        import torch
+        import torch_npu
+
+        if device is None:
+            device = f"npu:{torch_npu.npu.current_device()}"
+        device = torch.device(device)
+        if isinstance(shape, int):
+            shape = (shape,)
+        else:
+            shape = tuple(shape)
+        if not isinstance(dtype, torch.dtype):
+            raise TypeError(f"dtype must be torch.dtype, got {type(dtype)}")
+
+        needed = _shape_nbytes(shape, dtype)
+        ptr, available = self.hccl_buffer_info()
+        if nbytes is not None:
+            needed = int(nbytes)
+        if needed > available:
+            raise ValueError(
+                f"HCCL buffer has {available} bytes, but tensor requires {needed} bytes"
+            )
+        stride = _contiguous_stride(shape)
+        metadata = {
+            "data_ptr": ptr,
+            "device": device,
+            "nbytes": needed,
+            "dtype": dtype,
+            "size": shape,
+            "stride": stride,
+            "storage_offset": 0,
+        }
+        storage = torch_npu._C._construct_storage_from_data_pointer(
+            metadata["data_ptr"], metadata["device"], metadata["nbytes"]
+        )
+        return torch_npu._C._construct_NPU_Tensor_From_Storage_And_Metadata(metadata, storage)
+
+    def hccl_aiv_opbase_tensor(self, shape, dtype, device=None, *, which="out", nbytes=None):
+        import torch
+        import torch_npu
+
+        if device is None:
+            device = f"npu:{torch_npu.npu.current_device()}"
+        device = torch.device(device)
+        if isinstance(shape, int):
+            shape = (shape,)
+        else:
+            shape = tuple(shape)
+        if not isinstance(dtype, torch.dtype):
+            raise TypeError(f"dtype must be torch.dtype, got {type(dtype)}")
+
+        needed = _shape_nbytes(shape, dtype)
+        ptr, available = self.hccl_aiv_opbase_buffer_info(which=which)
+        if nbytes is not None:
+            needed = int(nbytes)
+        if needed > available:
+            raise ValueError(
+                f"HCCL AIV opbase buffer has {available} bytes, but tensor requires {needed} bytes"
+            )
+        stride = _contiguous_stride(shape)
+        metadata = {
+            "data_ptr": ptr,
+            "device": device,
+            "nbytes": needed,
+            "dtype": dtype,
+            "size": shape,
+            "stride": stride,
+            "storage_offset": 0,
+        }
+        storage = torch_npu._C._construct_storage_from_data_pointer(
+            metadata["data_ptr"], metadata["device"], metadata["nbytes"]
+        )
+        return torch_npu._C._construct_NPU_Tensor_From_Storage_And_Metadata(metadata, storage)
+
+    def hccl_aiv_allgather(self, send, recv, *, count=None, stream=None, rendezvous_id=None):
+        import torch
+
+        if not hasattr(send, "data_ptr") or not hasattr(recv, "data_ptr"):
+            raise TypeError("send and recv must be tensor-like objects with data_ptr()")
+        if send.dtype is not torch.float32 or recv.dtype is not torch.float32:
+            raise TypeError("hccl_aiv_allgather currently supports torch.float32 tensors")
+        if count is None:
+            count = int(send.numel())
+        if rendezvous_id is None:
+            rendezvous_id = os.getenv("TRITON_ASCEND_GIN_HCCL_AIV_DIRECT_ID", "default")
+        if stream is None:
+            device_index = send.device.index
+            if device_index is None:
+                device_index = torch.npu.current_device()
+            stream = torch.npu.current_stream(device_index).npu_stream
+        _check(
+            self._library,
+            self._library.TritonAscendGinHcclAivAllGather(
+                self._handle,
+                ctypes.c_void_p(int(send.data_ptr())),
+                ctypes.c_void_p(int(recv.data_ptr())),
+                ctypes.c_uint64(int(count)),
+                ctypes.c_uint32(_HCCL_DATA_TYPE_FP32),
+                ctypes.c_void_p(int(stream)),
+                _encode_path(rendezvous_id),
+            ),
+        )
 
     def refresh(self):
         if self._backend == "tilexr":
@@ -224,6 +500,95 @@ def create_from_hccl_peer_mem(
     return GinComm(library, handle.value, backend="hccl_peer_mem")
 
 
+def create_from_hccl_channel(
+    hccl_comm,
+    *,
+    runtime_library=None,
+    hccl_library=None,
+    window_bytes=_DEFAULT_WINDOW_BYTES,
+    signal_stride=_DEFAULT_SIGNAL_STRIDE,
+    signal_slots=_DEFAULT_SIGNAL_SLOTS,
+    engine="aiv",
+):
+    os.environ.setdefault("HCCL_INDEPENDENT_OP", "1")
+    library = _load_runtime_library(runtime_library)
+    options = HcclChannelOptions(
+        int(window_bytes),
+        int(signal_stride),
+        int(signal_slots),
+        int(hccl_channel_engine_value(engine)),
+        _encode_path(hccl_library),
+    )
+    handle = ctypes.c_void_p()
+    ret = library.TritonAscendGinCreateFromHcclChannel(
+        ctypes.c_void_p(_as_pointer_value(hccl_comm)),
+        ctypes.byref(options),
+        ctypes.byref(handle),
+    )
+    _check(library, ret)
+    return GinComm(library, handle.value, backend="hccl_channel")
+
+
+def probe_hccl_channel(
+    hccl_comm,
+    *,
+    runtime_library=None,
+    hccl_library=None,
+    window_bytes=_DEFAULT_WINDOW_BYTES,
+    signal_stride=_DEFAULT_SIGNAL_STRIDE,
+    signal_slots=_DEFAULT_SIGNAL_SLOTS,
+    engine="aiv",
+):
+    os.environ.setdefault("HCCL_INDEPENDENT_OP", "1")
+    library = _load_runtime_library(runtime_library)
+    options = HcclChannelOptions(
+        int(window_bytes),
+        int(signal_stride),
+        int(signal_slots),
+        int(hccl_channel_engine_value(engine)),
+        _encode_path(hccl_library),
+    )
+    probe = HcclChannelProbe()
+    ret = library.TritonAscendGinProbeHcclChannel(
+        ctypes.c_void_p(_as_pointer_value(hccl_comm)),
+        ctypes.byref(options),
+        ctypes.byref(probe),
+    )
+    _check(library, ret)
+    result = {name: getattr(probe, name) for name, _ctype in probe._fields_}
+    result["protocols"] = [
+        name for value, name in _HCCL_CHANNEL_PROTOCOLS.items()
+        if result["protocol_mask"] & (1 << value)
+    ]
+    result["engine_name"] = _hccl_channel_engine_name(result["engine"])
+    return result
+
+
+def probe_hccl_alg_buffers(
+    *,
+    runtime_library=None,
+    hccl_alg_library=None,
+    hccl_library=None,
+    device=None,
+):
+    if hccl_alg_library is None:
+        hccl_alg_library = _derive_hccl_alg_library(hccl_library)
+    if device is None:
+        import torch_npu
+
+        device = torch_npu.npu.current_device()
+
+    library = _load_runtime_library(runtime_library)
+    probe = HcclAlgBufferProbe()
+    ret = library.TritonAscendGinProbeHcclAlgBuffers(
+        _encode_path(hccl_alg_library),
+        ctypes.c_uint32(int(device)),
+        ctypes.byref(probe),
+    )
+    _check(library, ret)
+    return {name: getattr(probe, name) for name, _ctype in probe._fields_}
+
+
 def hccl_comm_handle_from_name(comm_name, *, hccl_library=None):
     """Resolve a torch/HCCL communication-domain name to an HcclComm handle."""
 
@@ -306,6 +671,7 @@ def create_hccl_root_info_comm(
     hccl_library=None,
     use_config=True,
     sym_win_max_mem_gb=_HCCL_DEFAULT_SYMMETRIC_MEMORY_STRIDE_GB,
+    op_expansion_mode=None,
     timeout_s=180,
 ):
     """Create an HcclComm with the same root-info path used by HCCL tests."""
@@ -347,7 +713,12 @@ def create_hccl_root_info_comm(
 
     comm = ctypes.c_void_p()
     if use_config:
-        config = _make_hccl_comm_config(rank, rendezvous_id, sym_win_max_mem_gb)
+        config = _make_hccl_comm_config(
+            rank,
+            rendezvous_id,
+            sym_win_max_mem_gb,
+            op_expansion_mode=op_expansion_mode,
+        )
         ret = library.HcclCommInitRootInfoConfig(
             ctypes.c_uint32(rank_size),
             ctypes.byref(root_info),
@@ -379,6 +750,65 @@ def destroy_hccl_comm(hccl_comm, *, hccl_library=None):
         raise RuntimeError(f"HcclCommDestroy failed with status {ret}")
 
 
+def hccl_op_expansion_mode_value(op_expansion_mode=None):
+    if op_expansion_mode is None:
+        op_expansion_mode = os.getenv("TRITON_ASCEND_GIN_HCCL_OP_EXPANSION_MODE")
+    if op_expansion_mode is None or op_expansion_mode == "":
+        return _HCCL_COMM_DEFAULT_OP_EXPANSION_MODE
+    if isinstance(op_expansion_mode, int):
+        return int(op_expansion_mode)
+    text = str(op_expansion_mode).strip().lower().replace("-", "_")
+    if text.startswith("raw:"):
+        return int(text[4:], 0)
+    try:
+        return int(text, 0)
+    except ValueError:
+        pass
+    if text not in _HCCL_OP_EXPANSION_MODES:
+        supported = ", ".join(sorted(_HCCL_OP_EXPANSION_MODES))
+        raise ValueError(f"unsupported HCCL op expansion mode {op_expansion_mode!r}; supported: {supported}")
+    return _HCCL_OP_EXPANSION_MODES[text]
+
+
+def hccl_channel_engine_value(engine=None):
+    if engine is None:
+        engine = os.getenv("TRITON_ASCEND_GIN_HCCL_CHANNEL_ENGINE", "aiv")
+    if engine is None or engine == "":
+        engine = "aiv"
+    if isinstance(engine, int):
+        return int(engine)
+    text = str(engine).strip().lower().replace("-", "_")
+    if text.startswith("raw:"):
+        return int(text[4:], 0)
+    try:
+        return int(text, 0)
+    except ValueError:
+        pass
+    if text not in _HCCL_CHANNEL_ENGINES:
+        supported = ", ".join(sorted(_HCCL_CHANNEL_ENGINES))
+        raise ValueError(f"unsupported HCCL channel engine {engine!r}; supported: {supported}")
+    return _HCCL_CHANNEL_ENGINES[text]
+
+
+def _hccl_channel_engine_name(value):
+    value = int(value)
+    for name, engine_value in _HCCL_CHANNEL_ENGINES.items():
+        if engine_value == value and name not in ("host", "host_ts", "ai_cpu", "ai_cpu_ts"):
+            return name
+    return f"raw:{value}"
+
+
+def hccl_comm_config_capability(*, hccl_library=None):
+    library = _load_hccl_library(hccl_library)
+    try:
+        func = library.HcclGetCommConfigCapability
+    except AttributeError:
+        return None
+    func.argtypes = []
+    func.restype = ctypes.c_uint32
+    return int(func())
+
+
 def install_hccl_memory_allocator(*, runtime_library=None, hccl_library=None):
     """Use HCCL's VMM allocator for subsequent torch NPU tensor allocations."""
 
@@ -408,6 +838,19 @@ def _encode_path(path):
     if path is None:
         return None
     return os.fsencode(path)
+
+
+def _derive_hccl_alg_library(hccl_library=None):
+    env_alg = os.getenv("TRITON_ASCEND_HCCL_ALG_LIB")
+    if env_alg:
+        return env_alg
+
+    base = hccl_library or os.getenv("TRITON_ASCEND_HCCL_LIB")
+    if base:
+        base_path = Path(base)
+        if base_path.name in ("libhcomm.so", "libhccl.so"):
+            return str(base_path.with_name("libhccl_alg.so"))
+    return None
 
 
 def _as_pointer_value(value):
@@ -520,7 +963,7 @@ def _bind_hccl_root_info_apis(library):
     library.HcclCommDestroy.restype = ctypes.c_int
 
 
-def _make_hccl_comm_config(rank, comm_name, sym_win_max_mem_gb):
+def _make_hccl_comm_config(rank, comm_name, sym_win_max_mem_gb, *, op_expansion_mode=None):
     config = HcclCommConfig()
     info = HcclCommConfigInfo.from_buffer(config)
     info.size = ctypes.sizeof(HcclCommConfig)
@@ -531,7 +974,7 @@ def _make_hccl_comm_config(rank, comm_name, sym_win_max_mem_gb):
     config.hcclDeterministic = _HCCL_COMM_DETERMINISTIC_CONFIG_NOT_SET
     config.hcclCommName = os.fsencode(comm_name)[: _HCCL_COMM_NAME_MAX_LENGTH - 1]
     config.hcclUdi = b""
-    config.hcclOpExpansionMode = _HCCL_COMM_DEFAULT_OP_EXPANSION_MODE
+    config.hcclOpExpansionMode = hccl_op_expansion_mode_value(op_expansion_mode)
     config.hcclRdmaTrafficClass = _HCCL_COMM_TRAFFIC_CLASS_CONFIG_NOT_SET
     config.hcclRdmaServiceLevel = _HCCL_COMM_SERVICE_LEVEL_CONFIG_NOT_SET
     config.hcclWorldRankID = int(rank)
@@ -560,10 +1003,51 @@ def _bind_runtime_library(library):
         ctypes.POINTER(ctypes.c_void_p),
     ]
     library.TritonAscendGinCreateFromHcclPeerMem.restype = ctypes.c_int
+    library.TritonAscendGinCreateFromHcclChannel.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(HcclChannelOptions),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    library.TritonAscendGinCreateFromHcclChannel.restype = ctypes.c_int
+    library.TritonAscendGinProbeHcclChannel.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(HcclChannelOptions),
+        ctypes.POINTER(HcclChannelProbe),
+    ]
+    library.TritonAscendGinProbeHcclChannel.restype = ctypes.c_int
+    library.TritonAscendGinProbeHcclAlgBuffers.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(HcclAlgBufferProbe),
+    ]
+    library.TritonAscendGinProbeHcclAlgBuffers.restype = ctypes.c_int
     library.TritonAscendGinRefreshFromTileXR.argtypes = [ctypes.c_void_p]
     library.TritonAscendGinRefreshFromTileXR.restype = ctypes.c_int
     library.TritonAscendGinGetDevComm.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
     library.TritonAscendGinGetDevComm.restype = ctypes.c_int
+    library.TritonAscendGinGetHcclBuffer.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    library.TritonAscendGinGetHcclBuffer.restype = ctypes.c_int
+    library.TritonAscendGinGetHcclAivOpbaseBuffer.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    library.TritonAscendGinGetHcclAivOpbaseBuffer.restype = ctypes.c_int
+    library.TritonAscendGinHcclAivAllGather.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+    ]
+    library.TritonAscendGinHcclAivAllGather.restype = ctypes.c_int
     library.TritonAscendGinRegisterWindow.argtypes = [
         ctypes.c_void_p,
         ctypes.c_void_p,
@@ -584,6 +1068,8 @@ def _bind_runtime_library(library):
     library.TritonAscendGinGetLastError.restype = ctypes.c_char_p
     library.TritonAscendGinDestroy.argtypes = [ctypes.c_void_p]
     library.TritonAscendGinDestroy.restype = None
+
+
 def _check(library, status):
     if status == 0:
         return
@@ -603,16 +1089,47 @@ def _tensor_nbytes(tensor):
     raise TypeError("window_handle requires nbytes=... for tensors without nbytes/numel/element_size")
 
 
+def _shape_nbytes(shape, dtype):
+    import torch
+
+    if isinstance(shape, int):
+        shape = (shape,)
+    numel = 1
+    for dim in shape:
+        if dim < 0:
+            raise ValueError(f"shape dimensions must be non-negative, got {shape}")
+        numel *= int(dim)
+    return numel * torch.empty((), dtype=dtype).element_size()
+
+
+def _contiguous_stride(shape):
+    if len(shape) == 0:
+        return ()
+    stride = [1]
+    for dim in reversed(shape[1:]):
+        stride.insert(0, stride[0] * int(dim))
+    return tuple(stride)
+
+
 __all__ = [
     "GinComm",
     "TileXROptions",
     "HcclPeerMemOptions",
+    "HcclChannelOptions",
+    "HcclChannelProbe",
+    "HcclAlgBufferProbe",
     "create_from_tilexr",
     "create_from_hccl_peer_mem",
+    "create_from_hccl_channel",
+    "probe_hccl_channel",
+    "probe_hccl_alg_buffers",
     "hccl_comm_handle_from_name",
     "hccl_comm_handle_from_process_group",
     "create_from_torch_hccl_process_group",
     "create_hccl_root_info_comm",
     "destroy_hccl_comm",
+    "hccl_comm_config_capability",
+    "hccl_channel_engine_value",
+    "hccl_op_expansion_mode_value",
     "install_hccl_memory_allocator",
 ]

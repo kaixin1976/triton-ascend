@@ -21,7 +21,7 @@ HCCL_LIB = os.getenv(
 )
 RUNTIME_LIB = os.getenv("TRITON_ASCEND_GIN_RUNTIME_LIB")
 SIGNAL_BASE_ALLREDUCE = 0
-SIGNAL_BASE_ALL2ALL = 64
+SIGNAL_BASE_ALL2ALL = 16
 SIGNAL_SLOTS = 128
 
 
@@ -76,12 +76,13 @@ def gin_allreduce_sum_kernel(
         for peer in tl.static_range(0, MAX_RANKS):
             if peer < nranks and peer != rank:
                 dst_byte_off = (local_base + pid * BLOCK) * 4
-                token = tgin.put_signal(
+                token = tgin.put_signal_window(
                     gin,
                     peer,
                     win,
                     dst_byte_off,
-                    x + pid * BLOCK,
+                    win,
+                    dst_byte_off,
                     tile_bytes,
                     signal_id=SIGNAL_BASE + pid,
                     signal_value=tile_bytes,
@@ -142,12 +143,17 @@ def gin_all2all_kernel(
         for peer in tl.static_range(0, MAX_RANKS):
             if peer < nranks and peer != rank:
                 src_base = peer * n_elements
-                token = tgin.put_signal(
+                scratch_base = (nranks + peer) * n_elements
+                send_vals = tl.load(x + src_base + offs)
+                tl.store(y + scratch_base + offs, send_vals)
+                token = tgin.flush(gin, token=token)
+                token = tgin.put_signal_window(
                     gin,
                     peer,
                     win,
                     dst_byte_off,
-                    x + src_base + pid * BLOCK,
+                    win,
+                    (scratch_base + pid * BLOCK) * 4,
                     tile_bytes,
                     signal_id=SIGNAL_BASE + pid,
                     signal_value=tile_bytes,
@@ -195,6 +201,8 @@ def backend_mask(backend):
         return tgin.GIN_BACKEND_TILEXR_IPC_PEER_MEM
     if backend == "hccl_peer_mem":
         return tgin.GIN_BACKEND_HCCL_PEER_MEM
+    if backend == "hccl_channel":
+        return tgin.GIN_BACKEND_HCCL_CHANNEL
     raise ValueError(f"unsupported backend {backend!r}")
 
 
@@ -213,22 +221,79 @@ def create_tilexr_gin(args):
 
 
 def create_hccl_gin(args):
+    mode_value = gin_runtime.hccl_op_expansion_mode_value(args.hccl_op_expansion_mode)
+    channel_engine_value = gin_runtime.hccl_channel_engine_value(args.hccl_channel_engine)
+    capability = gin_runtime.hccl_comm_config_capability(hccl_library=args.hccl_lib)
+    capability_text = "none" if capability is None else f"0x{capability:x}"
+    print(
+        f"HCCL GIN root-info config: rank={args.rank} "
+        f"op_expansion_mode={args.hccl_op_expansion_mode or 'default'} "
+        f"value={mode_value} channel_engine={args.hccl_channel_engine} "
+        f"channel_engine_value={channel_engine_value} capability={capability_text}",
+        flush=True,
+    )
+    if args.backend == "hccl_channel":
+        os.environ.setdefault("HCCL_INDEPENDENT_OP", "1")
     hccl_comm = gin_runtime.create_hccl_root_info_comm(
         rank=args.rank,
         rank_size=args.rank_size,
         rendezvous_id=args.tag,
         hccl_library=args.hccl_lib,
-        use_config=False,
+        use_config=True,
+        op_expansion_mode=args.hccl_op_expansion_mode,
     )
-    gin = gin_runtime.create_from_hccl_peer_mem(
-        hccl_comm,
-        runtime_library=RUNTIME_LIB,
-        hccl_library=args.hccl_lib,
-        signal_slots=SIGNAL_SLOTS,
+    if args.backend == "hccl_channel":
+        gin = gin_runtime.create_from_hccl_channel(
+            hccl_comm,
+            runtime_library=RUNTIME_LIB,
+            hccl_library=args.hccl_lib,
+            signal_slots=SIGNAL_SLOTS,
+            engine=args.hccl_channel_engine,
+        )
+    else:
+        gin = gin_runtime.create_from_hccl_peer_mem(
+            hccl_comm,
+            runtime_library=RUNTIME_LIB,
+            hccl_library=args.hccl_lib,
+            signal_slots=SIGNAL_SLOTS,
+        )
+    return gin, None, ctypes.c_void_p(hccl_comm), None
+
+
+def hccl_signal_bytes(args):
+    return args.rank_size * SIGNAL_SLOTS * 8
+
+
+def hccl_window_numel(args, data_numel):
+    if args.backend not in ("hccl_peer_mem", "hccl_channel"):
+        return data_numel
+    data_bytes = data_numel * 4
+    signal_offset = ((data_bytes + 7) // 8) * 8
+    total_bytes = signal_offset + hccl_signal_bytes(args)
+    return (total_bytes + 3) // 4
+
+
+def allocate_window_tensor(args, gin, data_numel, fill_value):
+    if args.backend == "hccl_channel":
+        tensor = gin.hccl_buffer_tensor(
+            (hccl_window_numel(args, data_numel),),
+            torch.float32,
+            device=f"npu:{args.device}",
+        )
+        tensor.fill_(fill_value)
+        return tensor
+    return torch.full(
+        (hccl_window_numel(args, data_numel),),
+        fill_value,
+        dtype=torch.float32,
+        device="npu",
     )
-    signal_window = torch.zeros((args.rank_size * SIGNAL_SLOTS,), dtype=torch.int64, device="npu")
-    gin.signal_window_handle(signal_window, rendezvous_id=args.tag + "_signal")
-    return gin, None, ctypes.c_void_p(hccl_comm), signal_window
+
+
+def register_window(gin, args, tensor, data_numel, rendezvous_id):
+    if args.backend in ("hccl_peer_mem", "hccl_channel"):
+        return gin.window_handle(tensor, nbytes=data_numel * 4, rendezvous_id=rendezvous_id)
+    return gin.window_handle(tensor, rendezvous_id=rendezvous_id)
 
 
 def check_exact(name, got, expected):
@@ -247,12 +312,28 @@ def check_exact(name, got, expected):
     print(f"{name}: PASS maxerr=0.0")
 
 
+def reset_case_signals(args, comm_h, mask, signal_base, blocks, phase):
+    grid = (1,)
+    reset_gin_signals_kernel[grid](
+        comm_h,
+        args.rank_size,
+        signal_base,
+        blocks,
+        BACKEND_MASK=mask,
+    )
+    torch.npu.synchronize()
+    prefix = f"/tmp/triton_gin_{args.backend}_collective_{args.tag}"
+    wait_files(prefix, args.rank_size, args.rank, phase)
+
+
 def run_allreduce(args, gin, comm_h, mask):
     x = torch.arange(args.n, dtype=torch.float32, device="npu") + args.rank * 1000.0
-    staging = torch.full((args.rank_size * args.n,), -777.0, dtype=torch.float32, device="npu")
+    staging_numel = args.rank_size * args.n
+    staging = allocate_window_tensor(args, gin, staging_numel, -777.0)
     out = torch.full((args.n,), -777.0, dtype=torch.float32, device="npu")
-    win_h = gin.window_handle(staging, rendezvous_id=f"{args.tag}_allreduce")
+    win_h = register_window(gin, args, staging, staging_numel, f"{args.tag}_allreduce")
     blocks = triton.cdiv(args.n, args.block)
+    reset_case_signals(args, comm_h, mask, SIGNAL_BASE_ALLREDUCE, blocks, "allreduce_reset")
     grid = (1,)
 
     gin_allreduce_sum_kernel[grid](
@@ -281,9 +362,12 @@ def run_all2all(args, gin, comm_h, mask):
     for dst_rank in range(args.rank_size):
         x_chunks.append(torch.arange(args.n, dtype=torch.float32) + args.rank * 1000.0 + dst_rank * 100.0)
     x = torch.cat(x_chunks).to("npu")
-    y = torch.full((args.rank_size * args.n,), -777.0, dtype=torch.float32, device="npu")
-    win_h = gin.window_handle(y, rendezvous_id=f"{args.tag}_all2all")
+    y_data_numel = args.rank_size * args.n
+    y_window_numel = y_data_numel + args.rank_size * args.n
+    y = allocate_window_tensor(args, gin, y_window_numel, -777.0)
+    win_h = register_window(gin, args, y, y_window_numel, f"{args.tag}_all2all")
     blocks = triton.cdiv(args.n, args.block)
+    reset_case_signals(args, comm_h, mask, SIGNAL_BASE_ALL2ALL, blocks, "all2all_reset")
     grid = (1,)
 
     gin_all2all_kernel[grid](
@@ -304,7 +388,7 @@ def run_all2all(args, gin, comm_h, mask):
     for source_rank in range(args.rank_size):
         expected_chunks.append(torch.arange(args.n, dtype=torch.float32) + source_rank * 1000.0 + args.rank * 100.0)
     expected = torch.cat(expected_chunks)
-    check_exact("gin_all2all", y.cpu(), expected)
+    check_exact("gin_all2all", y[:y_data_numel].cpu(), expected)
 
 
 def main():
@@ -313,11 +397,13 @@ def main():
     parser.add_argument("--rank-size", type=int, default=2)
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument("--tag", required=True)
-    parser.add_argument("--backend", choices=("tilexr", "hccl_peer_mem"), default="tilexr")
+    parser.add_argument("--backend", choices=("tilexr", "hccl_peer_mem", "hccl_channel"), default="tilexr")
     parser.add_argument("--master-addr", default="127.0.0.1")
     parser.add_argument("--master-port")
     parser.add_argument("--tilexr-lib", default=TILEXR_LIB)
     parser.add_argument("--hccl-lib", default=HCCL_LIB)
+    parser.add_argument("--hccl-op-expansion-mode")
+    parser.add_argument("--hccl-channel-engine", default="aiv")
     parser.add_argument("--n", type=int, default=128)
     parser.add_argument("--block", type=int, default=32)
     parser.add_argument("--case", choices=("allreduce", "all2all", "both"), default="both")
@@ -351,27 +437,7 @@ def main():
             gin, tile, tile_comm, _signal_window = create_hccl_gin(args)
 
         comm_h = gin.dev_comm
-        grid = (1,)
-        if args.case in ("allreduce", "both"):
-            reset_gin_signals_kernel[grid](
-                comm_h,
-                args.rank_size,
-                SIGNAL_BASE_ALLREDUCE,
-                blocks,
-                BACKEND_MASK=mask,
-            )
-        if args.case in ("all2all", "both"):
-            reset_gin_signals_kernel[grid](
-                comm_h,
-                args.rank_size,
-                SIGNAL_BASE_ALL2ALL,
-                blocks,
-                BACKEND_MASK=mask,
-            )
-        torch.npu.synchronize()
-
         prefix = f"/tmp/triton_gin_{args.backend}_collective_{args.tag}"
-        wait_files(prefix, args.rank_size, args.rank, "reset")
 
         if args.case in ("allreduce", "both"):
             run_allreduce(args, gin, comm_h, mask)
@@ -387,7 +453,7 @@ def main():
             gin.close()
         if dist.is_initialized():
             dist.destroy_process_group()
-        if args.backend == "hccl_peer_mem" and tile_comm.value:
+        if args.backend in ("hccl_peer_mem", "hccl_channel") and tile_comm.value:
             gin_runtime.destroy_hccl_comm(tile_comm, hccl_library=args.hccl_lib)
         if tile is not None and tile_comm.value:
             tile.TileXRCommDestroy(tile_comm)

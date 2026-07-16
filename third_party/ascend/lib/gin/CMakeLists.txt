@@ -43,6 +43,10 @@ if(TRITON_ASCEND_BUILD_GIN_RUNTIME)
       ${CMAKE_CURRENT_SOURCE_DIR}/../../include
       ${TRITON_ASCEND_ACL_INCLUDE_DIR}
   )
+  target_compile_definitions(triton_ascend_gin_runtime
+    PRIVATE
+      _GLIBCXX_USE_CXX11_ABI=0
+  )
   target_link_libraries(triton_ascend_gin_runtime
     PRIVATE
       ${TRITON_ASCEND_ASCENDCL_LIBRARY}

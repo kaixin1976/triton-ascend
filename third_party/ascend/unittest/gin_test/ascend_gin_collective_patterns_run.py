@@ -22,6 +22,7 @@ HCCL_LIB = os.getenv(
 RUNTIME_LIB = os.getenv("TRITON_ASCEND_GIN_RUNTIME_LIB")
 SIGNAL_BASE_ALLREDUCE = 0
 SIGNAL_BASE_ALL2ALL = 16
+SIGNAL_BASE_REDUCE_SCATTER = 32
 SIGNAL_SLOTS = 128
 
 
@@ -172,6 +173,75 @@ def gin_all2all_kernel(
                     least_value=tile_bytes,
                     token=token,
                 )
+
+
+@triton.jit
+def gin_reduce_scatter_sum_kernel(
+    x,
+    staging,
+    out,
+    comm_h,
+    win_h,
+    n_elements: tl.constexpr,
+    MAX_RANKS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    SIGNAL_BASE: tl.constexpr,
+    BACKEND_MASK: tl.constexpr,
+):
+    dev = tgin.dev_comm(comm_h)
+    gin = tgin.gin(dev, backend_mask=BACKEND_MASK)
+    win = tgin.window(win_h, ptr=staging)
+    rank = tgin.rank(dev)
+    nranks = tgin.num_ranks(dev)
+    token = tgin.token()
+    tile_bytes = BLOCK * 4
+
+    for pid in tl.static_range(0, BLOCKS):
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+
+        local_vals = tl.load(x + rank * n_elements + offs)
+        tl.store(staging + rank * n_elements + offs, local_vals)
+
+        for peer in tl.static_range(0, MAX_RANKS):
+            if peer < nranks and peer != rank:
+                scratch_base = (nranks + peer) * n_elements
+                send_vals = tl.load(x + peer * n_elements + offs)
+                tl.store(staging + scratch_base + offs, send_vals)
+                token = tgin.flush(gin, token=token)
+                token = tgin.put_signal_window(
+                    gin,
+                    peer,
+                    win,
+                    (rank * n_elements + pid * BLOCK) * 4,
+                    win,
+                    (scratch_base + pid * BLOCK) * 4,
+                    tile_bytes,
+                    signal_id=SIGNAL_BASE + pid,
+                    signal_value=tile_bytes,
+                    token=token,
+                )
+
+    token = tgin.flush(gin, token=token)
+
+    for pid in tl.static_range(0, BLOCKS):
+        for peer in tl.static_range(0, MAX_RANKS):
+            if peer < nranks and peer != rank:
+                token = tgin.wait_signal(
+                    gin,
+                    peer,
+                    signal_id=SIGNAL_BASE + pid,
+                    least_value=tile_bytes,
+                    token=token,
+                )
+
+    for pid in tl.static_range(0, BLOCKS):
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        acc = tl.full((BLOCK,), 0.0, tl.float32)
+        for peer in tl.static_range(0, MAX_RANKS):
+            if peer < nranks:
+                acc += tl.load(staging + peer * n_elements + offs)
+        tl.store(out + offs, acc)
 
 
 def bind_tilexr(tilexr_lib):
@@ -391,6 +461,41 @@ def run_all2all(args, gin, comm_h, mask):
     check_exact("gin_all2all", y[:y_data_numel].cpu(), expected)
 
 
+def run_reduce_scatter(args, gin, comm_h, mask):
+    x_chunks = []
+    for dst_rank in range(args.rank_size):
+        x_chunks.append(torch.arange(args.n, dtype=torch.float32) + args.rank * 1000.0 + dst_rank * 100.0)
+    x = torch.cat(x_chunks).to("npu")
+    staging_data_numel = args.rank_size * args.n
+    staging_window_numel = staging_data_numel + args.rank_size * args.n
+    staging = allocate_window_tensor(args, gin, staging_window_numel, -777.0)
+    out = torch.full((args.n,), -777.0, dtype=torch.float32, device="npu")
+    win_h = register_window(gin, args, staging, staging_window_numel, f"{args.tag}_reduce_scatter")
+    blocks = triton.cdiv(args.n, args.block)
+    reset_case_signals(args, comm_h, mask, SIGNAL_BASE_REDUCE_SCATTER, blocks, "reduce_scatter_reset")
+    grid = (1,)
+
+    gin_reduce_scatter_sum_kernel[grid](
+        x,
+        staging,
+        out,
+        comm_h,
+        win_h,
+        args.n,
+        MAX_RANKS=args.rank_size,
+        BLOCK=args.block,
+        BLOCKS=blocks,
+        SIGNAL_BASE=SIGNAL_BASE_REDUCE_SCATTER,
+        BACKEND_MASK=mask,
+    )
+    torch.npu.synchronize()
+
+    expected = torch.zeros((args.n,), dtype=torch.float32)
+    for source_rank in range(args.rank_size):
+        expected += torch.arange(args.n, dtype=torch.float32) + source_rank * 1000.0 + args.rank * 100.0
+    check_exact("gin_reduce_scatter_sum", out.cpu(), expected)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rank", type=int, required=True)
@@ -406,7 +511,11 @@ def main():
     parser.add_argument("--hccl-channel-engine", default="aiv")
     parser.add_argument("--n", type=int, default=128)
     parser.add_argument("--block", type=int, default=32)
-    parser.add_argument("--case", choices=("allreduce", "all2all", "both"), default="both")
+    parser.add_argument(
+        "--case",
+        choices=("allreduce", "reduce_scatter", "all2all", "both", "all"),
+        default="all",
+    )
     args = parser.parse_args()
 
     if args.rank_size < 2:
@@ -416,7 +525,7 @@ def main():
     if args.n % args.block != 0:
         raise ValueError("n must be a multiple of block")
     blocks = triton.cdiv(args.n, args.block)
-    if SIGNAL_BASE_ALL2ALL + blocks > SIGNAL_SLOTS:
+    if SIGNAL_BASE_REDUCE_SCATTER + blocks > SIGNAL_SLOTS:
         raise ValueError("not enough signal slots for the selected n/block")
 
     if args.backend == "hccl_peer_mem":
@@ -439,11 +548,15 @@ def main():
         comm_h = gin.dev_comm
         prefix = f"/tmp/triton_gin_{args.backend}_collective_{args.tag}"
 
-        if args.case in ("allreduce", "both"):
+        if args.case in ("allreduce", "both", "all"):
             run_allreduce(args, gin, comm_h, mask)
             wait_files(prefix, args.rank_size, args.rank, "allreduce_done")
 
-        if args.case in ("all2all", "both"):
+        if args.case in ("reduce_scatter", "all"):
+            run_reduce_scatter(args, gin, comm_h, mask)
+            wait_files(prefix, args.rank_size, args.rank, "reduce_scatter_done")
+
+        if args.case in ("all2all", "both", "all"):
             run_all2all(args, gin, comm_h, mask)
             wait_files(prefix, args.rank_size, args.rank, "all2all_done")
 

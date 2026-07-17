@@ -22,6 +22,7 @@
 #include <dlfcn.h>
 #include <hccl/hccl_rank_graph.h>
 #include <hccl/hccl_res.h>
+#include <strings.h>
 #include <unistd.h>
 #endif
 
@@ -1506,6 +1507,17 @@ uint64_t HcclSignalWindowBytes(const TritonAscendGinRuntimeHandle *runtime) {
 }
 
 #if defined(__linux__)
+bool HcclChannelEngineUsesHcommThread(CommEngine engine) {
+  return engine == COMM_ENGINE_AICPU || engine == COMM_ENGINE_AICPU_TS;
+}
+
+CommEngine HcclChannelThreadEngine(CommEngine engine) {
+  if (engine == COMM_ENGINE_AICPU || engine == COMM_ENGINE_AICPU_TS) {
+    return COMM_ENGINE_AICPU_TS;
+  }
+  return engine;
+}
+
 int FillDescriptorFromHcclChannel(TritonAscendGinRuntimeHandle *handle) {
   if (handle == nullptr || handle->hcclComm == nullptr) {
     SetLastError("HCCL channel runtime handle is null");
@@ -1533,6 +1545,29 @@ int FillDescriptorFromHcclChannel(TritonAscendGinRuntimeHandle *handle) {
     return TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE;
   }
 
+  ThreadHandle thread = handle->hostDesc.hccl_thread_handle;
+  if (thread == 0 && HcclChannelEngineUsesHcommThread(handle->hcclChannelEngine)) {
+    if (handle->hcclChannel.threadAcquire == nullptr) {
+      SetLastError("HcclThreadAcquire symbol was not found");
+      return TRITON_ASCEND_GIN_RUNTIME_NOT_FOUND;
+    }
+    const CommEngine threadEngine = HcclChannelThreadEngine(handle->hcclChannelEngine);
+    ret = handle->hcclChannel.threadAcquire(handle->hcclComm, threadEngine, 1, 1, &thread);
+    if (ret != 0 || thread == 0) {
+      SetLastError("HcclThreadAcquire failed with code " + std::to_string(ret) +
+                   " engine=" + std::to_string(static_cast<int>(threadEngine)) +
+                   " thread=" + std::to_string(static_cast<unsigned long long>(thread)));
+      return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
+    }
+    if (DebugEnabled()) {
+      std::fprintf(stderr,
+                   "[triton_ascend_gin] HcclThreadAcquire rank=%u engine=%d "
+                   "thread=0x%llx\n",
+                   rank, static_cast<int>(threadEngine),
+                   static_cast<unsigned long long>(thread));
+    }
+  }
+
   TritonAscendGinDev next = handle->hostDesc;
   next.version = kDescriptorVersion;
   next.backend_kind = TRITON_ASCEND_GIN_BACKEND_KIND_HCCL_CHANNEL;
@@ -1541,6 +1576,7 @@ int FillDescriptorFromHcclChannel(TritonAscendGinRuntimeHandle *handle) {
   next.window_bytes = handle->windowBytes;
   next.signal_stride = handle->signalStride;
   next.signal_slots = handle->signalSlots;
+  next.hccl_thread_handle = thread;
   handle->hostDesc = next;
   return CopyDescriptorToDevice(handle);
 }
@@ -1819,6 +1855,8 @@ struct HcclAivIpcRecord {
   uint64_t offset = 0;
 };
 
+bool HcclAivIpcHccsEnabled();
+
 std::string HcclAivDirectFilePath(const std::string &dir, const std::string &id,
                                   uint32_t rank, const char *suffix) {
   return dir + "/triton_gin_hccl_aiv_direct_" + id + ".rank" +
@@ -1905,13 +1943,15 @@ int ExportHcclAivIpcRecordForPeers(TritonAscendGinRuntimeHandle *runtime,
   uint8_t key[kAclIpcKeyBytes] = {};
   unsigned long long offset = 0;
   bool exported = false;
+  const bool useHccsIpc = HcclAivIpcHccsEnabled();
   for (uint32_t peer = 0; peer < runtime->hostDesc.nranks; ++peer) {
     if (peer == runtime->hostDesc.rank) {
       continue;
     }
     ret = runtime->hcclPlfIpc.memNameSetIpcMem(
         repo, ptr, static_cast<unsigned long long>(bytes), key,
-        static_cast<uint32_t>(sizeof(key)), offset, peerPids[peer], -1, false);
+        static_cast<uint32_t>(sizeof(key)), offset, peerPids[peer], -1,
+        useHccsIpc);
     if (ret != 0) {
       SetLastError(std::string("MemNameRepository::SetIpcMem failed for ") +
                    what + " peer=" + std::to_string(peer) +
@@ -1943,8 +1983,8 @@ int ExportHcclAivIpcRecordForPeers(TritonAscendGinRuntimeHandle *runtime,
 }
 
 int ImportHcclAivIpcRecord(TritonAscendGinRuntimeHandle *runtime,
-                           const HcclAivIpcRecord &record, const char *what,
-                           void **ptr) {
+                            const HcclAivIpcRecord &record, const char *what,
+                            void **ptr) {
   if (runtime == nullptr || record.key.empty() || record.bytes == 0 || ptr == nullptr) {
     SetLastError("ImportHcclAivIpcRecord received invalid input");
     return TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE;
@@ -1970,7 +2010,7 @@ int ImportHcclAivIpcRecord(TritonAscendGinRuntimeHandle *runtime,
       repo, ptr, static_cast<unsigned long long>(record.bytes),
       reinterpret_cast<const uint8_t *>(record.key.c_str()),
       kAclIpcKeyBytes, static_cast<unsigned long long>(record.offset),
-      firstOpened, false);
+      firstOpened, HcclAivIpcHccsEnabled());
   if (ret != 0 || *ptr == nullptr) {
     SetLastError(std::string("MemNameRepository::OpenIpcMem failed for ") +
                  what + " ret=" + std::to_string(ret) +
@@ -1989,6 +2029,15 @@ int ImportHcclAivIpcRecord(TritonAscendGinRuntimeHandle *runtime,
                  firstOpened ? 1 : 0, record.key.c_str());
   }
   return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
+}
+
+bool HcclAivIpcHccsEnabled() {
+  const char *value = std::getenv("TRITON_ASCEND_GIN_HCCL_AIV_IPC_HCCS");
+  if (value == nullptr) {
+    return false;
+  }
+  return std::strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
+         strcasecmp(value, "yes") == 0 || strcasecmp(value, "on") == 0;
 }
 
 int ExchangeHcclAivDirectBuffers(TritonAscendGinRuntimeHandle *runtime,

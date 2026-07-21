@@ -1,13 +1,14 @@
 import ctypes
 import ctypes.util
 import os
+import socket
 import time
 from pathlib import Path
 
 
 _DEFAULT_IPC_DATA_OFFSET = 2 * 1024 * 1024
 _DEFAULT_WINDOW_BYTES = 100 * 1024 * 1024
-_DEFAULT_SIGNAL_STRIDE = 8
+_DEFAULT_SIGNAL_STRIDE = 32
 _DEFAULT_SIGNAL_SLOTS = 2048
 
 _HCCL_LIBRARIES = []
@@ -186,6 +187,41 @@ class HcclAlgBufferProbe(ctypes.Structure):
         ("get_independent_ccl_after_status", ctypes.c_int32),
         ("clear_comm_aiv_buffer_status", ctypes.c_int32),
         ("release_comm_aiv_buffer_status", ctypes.c_int32),
+        ("first_error_status", ctypes.c_int32),
+    ]
+
+
+class HcclRdmaP2pProbe(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("rank", ctypes.c_uint32),
+        ("nranks", ctypes.c_uint32),
+        ("src_rank", ctypes.c_uint32),
+        ("dst_rank", ctypes.c_uint32),
+        ("peer", ctypes.c_uint32),
+        ("engine", ctypes.c_uint32),
+        ("thread_engine", ctypes.c_uint32),
+        ("protocol", ctypes.c_uint32),
+        ("reserved0", ctypes.c_uint32),
+        ("bytes", ctypes.c_uint64),
+        ("channel", ctypes.c_uint64),
+        ("thread", ctypes.c_uint64),
+        ("local_ccl_buffer_ptr", ctypes.c_uint64),
+        ("local_ccl_buffer_bytes", ctypes.c_uint64),
+        ("remote_ccl_buffer_ptr", ctypes.c_uint64),
+        ("remote_ccl_buffer_bytes", ctypes.c_uint64),
+        ("get_hccl_buffer_ret", ctypes.c_int32),
+        ("channel_acquire_ret", ctypes.c_int32),
+        ("channel_get_hccl_buffer_ret", ctypes.c_int32),
+        ("thread_acquire_ret", ctypes.c_int32),
+        ("local_copy_ret", ctypes.c_int32),
+        ("write_ret", ctypes.c_int32),
+        ("notify_ready_ret", ctypes.c_int32),
+        ("wait_ready_ret", ctypes.c_int32),
+        ("read_ret", ctypes.c_int32),
+        ("notify_done_ret", ctypes.c_int32),
+        ("wait_done_ret", ctypes.c_int32),
+        ("thread_sync_ret", ctypes.c_int32),
         ("first_error_status", ctypes.c_int32),
     ]
 
@@ -564,6 +600,57 @@ def probe_hccl_channel(
     return result
 
 
+def probe_hccl_rdma_p2p(
+    hccl_comm,
+    send_tensor=None,
+    recv_tensor=None,
+    *,
+    runtime_library=None,
+    hccl_library=None,
+    engine="cpu_ts",
+    src_rank=0,
+    dst_rank=1,
+    nbytes=None,
+):
+    os.environ.setdefault("HCCL_INDEPENDENT_OP", "1")
+    if nbytes is None:
+        sizes = []
+        if send_tensor is not None:
+            sizes.append(_tensor_nbytes(send_tensor))
+        if recv_tensor is not None:
+            sizes.append(_tensor_nbytes(recv_tensor))
+        if not sizes:
+            raise ValueError("nbytes is required when neither send_tensor nor recv_tensor is provided")
+        nbytes = min(sizes)
+    library = _load_runtime_library(runtime_library)
+    options = HcclChannelOptions(
+        0,
+        0,
+        0,
+        int(hccl_channel_engine_value(engine)),
+        _encode_path(hccl_library),
+    )
+    probe = HcclRdmaP2pProbe()
+    send_ptr = 0 if send_tensor is None else int(send_tensor.data_ptr())
+    recv_ptr = 0 if recv_tensor is None else int(recv_tensor.data_ptr())
+    ret = library.TritonAscendGinProbeHcclRdmaP2p(
+        ctypes.c_void_p(_as_pointer_value(hccl_comm)),
+        ctypes.byref(options),
+        ctypes.c_void_p(send_ptr),
+        ctypes.c_void_p(recv_ptr),
+        ctypes.c_uint64(int(nbytes)),
+        ctypes.c_uint32(int(src_rank)),
+        ctypes.c_uint32(int(dst_rank)),
+        ctypes.byref(probe),
+    )
+    _check(library, ret)
+    result = {name: getattr(probe, name) for name, _ctype in probe._fields_}
+    result["engine_name"] = _hccl_channel_engine_name(result["engine"])
+    result["thread_engine_name"] = _hccl_channel_engine_name(result["thread_engine"])
+    result["protocol_name"] = _HCCL_CHANNEL_PROTOCOLS.get(result["protocol"], f"raw:{result['protocol']}")
+    return result
+
+
 def probe_hccl_alg_buffers(
     *,
     runtime_library=None,
@@ -672,6 +759,8 @@ def create_hccl_root_info_comm(
     use_config=True,
     sym_win_max_mem_gb=_HCCL_DEFAULT_SYMMETRIC_MEMORY_STRIDE_GB,
     op_expansion_mode=None,
+    rendezvous_host=None,
+    rendezvous_port=None,
     timeout_s=180,
 ):
     """Create an HcclComm with the same root-info path used by HCCL tests."""
@@ -682,34 +771,30 @@ def create_hccl_root_info_comm(
     rank = int(rank)
     rank_size = int(rank_size)
     root_info = HcclRootInfo()
-    rendezvous_dir = Path("/tmp") / f"triton_gin_hccl_root_{rendezvous_id}"
-    root_path = rendezvous_dir / "hccl_root_info.bin"
-    ready_path = rendezvous_dir / "hccl_root_info.ready"
-    rendezvous_dir.mkdir(parents=True, exist_ok=True)
 
-    if rank == 0:
-        for path in (root_path, ready_path):
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
-        ret = library.HcclGetRootInfo(ctypes.byref(root_info))
-        if ret != 0:
-            raise RuntimeError(f"HcclGetRootInfo failed with status {ret}")
-        root_path.write_bytes(ctypes.string_at(ctypes.byref(root_info), _HCCL_ROOT_INFO_BYTES))
-        ready_path.write_text("ready")
+    if rendezvous_host is None:
+        rendezvous_host = os.getenv("TRITON_ASCEND_GIN_HCCL_ROOT_HOST")
+    if rendezvous_port is None:
+        rendezvous_port = os.getenv("TRITON_ASCEND_GIN_HCCL_ROOT_PORT")
+
+    if rendezvous_host and rendezvous_port:
+        _exchange_hccl_root_info_tcp(
+            library,
+            root_info,
+            rank=rank,
+            rank_size=rank_size,
+            host=rendezvous_host,
+            port=int(rendezvous_port),
+            timeout_s=timeout_s,
+        )
     else:
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            if ready_path.exists() and root_path.exists():
-                break
-            time.sleep(0.05)
-        else:
-            raise TimeoutError(f"timeout waiting for HCCL root info at {root_path}")
-        payload = root_path.read_bytes()
-        if len(payload) != _HCCL_ROOT_INFO_BYTES:
-            raise RuntimeError(f"unexpected HCCL root info size {len(payload)}")
-        ctypes.memmove(ctypes.byref(root_info), payload, len(payload))
+        _exchange_hccl_root_info_file(
+            library,
+            root_info,
+            rank=rank,
+            rendezvous_id=rendezvous_id,
+            timeout_s=timeout_s,
+        )
 
     comm = ctypes.c_void_p()
     if use_config:
@@ -738,6 +823,177 @@ def create_hccl_root_info_comm(
     if ret != 0 or not comm.value:
         raise RuntimeError(f"{api} failed with status {ret}")
     return int(comm.value)
+
+
+def _exchange_hccl_root_info_file(library, root_info, *, rank, rendezvous_id, timeout_s):
+    rendezvous_dir = Path("/tmp") / f"triton_gin_hccl_root_{rendezvous_id}"
+    root_path = rendezvous_dir / "hccl_root_info.bin"
+    ready_path = rendezvous_dir / "hccl_root_info.ready"
+    rendezvous_dir.mkdir(parents=True, exist_ok=True)
+
+    if rank == 0:
+        for path in (root_path, ready_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        ret = library.HcclGetRootInfo(ctypes.byref(root_info))
+        if ret != 0:
+            raise RuntimeError(f"HcclGetRootInfo failed with status {ret}")
+        root_path.write_bytes(ctypes.string_at(ctypes.byref(root_info), _HCCL_ROOT_INFO_BYTES))
+        ready_path.write_text("ready")
+        return
+
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if ready_path.exists() and root_path.exists():
+            break
+        time.sleep(0.05)
+    else:
+        raise TimeoutError(f"timeout waiting for HCCL root info at {root_path}")
+    payload = root_path.read_bytes()
+    if len(payload) != _HCCL_ROOT_INFO_BYTES:
+        raise RuntimeError(f"unexpected HCCL root info size {len(payload)}")
+    ctypes.memmove(ctypes.byref(root_info), payload, len(payload))
+
+
+def _exchange_hccl_root_info_tcp(library, root_info, *, rank, rank_size, host, port, timeout_s):
+    if rank == 0:
+        ret = library.HcclGetRootInfo(ctypes.byref(root_info))
+        if ret != 0:
+            raise RuntimeError(f"HcclGetRootInfo failed with status {ret}")
+        payload = ctypes.string_at(ctypes.byref(root_info), _HCCL_ROOT_INFO_BYTES)
+        bind_host = os.getenv("TRITON_ASCEND_GIN_HCCL_ROOT_BIND_HOST", "0.0.0.0")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((bind_host, int(port)))
+            server.listen(max(1, rank_size - 1))
+            server.settimeout(timeout_s)
+            accepted = 0
+            while accepted < rank_size - 1:
+                conn, _addr = server.accept()
+                with conn:
+                    conn.sendall(payload)
+                accepted += 1
+        return
+
+    deadline = time.time() + timeout_s
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, int(port)), timeout=5.0) as conn:
+                payload = _recv_exact(conn, _HCCL_ROOT_INFO_BYTES)
+            ctypes.memmove(ctypes.byref(root_info), payload, len(payload))
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.2)
+    raise TimeoutError(
+        f"timeout waiting for HCCL root info from {host}:{port}; last_error={last_error}"
+    )
+
+
+def _recv_exact(conn, size):
+    chunks = []
+    remaining = int(size)
+    while remaining > 0:
+        chunk = conn.recv(remaining)
+        if not chunk:
+            raise RuntimeError(f"socket closed while reading {size} bytes")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def rendezvous_barrier(rendezvous_id, rank_size, rank, phase, timeout_s=180):
+    host = os.getenv("TRITON_ASCEND_GIN_BARRIER_HOST") or os.getenv("TRITON_ASCEND_GIN_HCCL_ROOT_HOST")
+    port = os.getenv("TRITON_ASCEND_GIN_BARRIER_PORT")
+    if port is None:
+        root_port = os.getenv("TRITON_ASCEND_GIN_HCCL_ROOT_PORT")
+        port = str(int(root_port) + 1) if root_port else None
+    if host and port:
+        _tcp_barrier(
+            str(rendezvous_id),
+            int(rank_size),
+            int(rank),
+            str(phase),
+            host,
+            int(port),
+            timeout_s,
+        )
+    else:
+        _file_barrier(str(rendezvous_id), int(rank_size), int(rank), str(phase), timeout_s)
+
+
+def _file_barrier(prefix, rank_size, rank, phase, timeout_s):
+    marker = Path(f"{prefix}.{phase}.{rank}")
+    marker.write_text("ready")
+    deadline = time.time() + timeout_s
+    expected = [Path(f"{prefix}.{phase}.{i}") for i in range(rank_size)]
+    while time.time() < deadline:
+        if all(p.exists() for p in expected):
+            return
+        time.sleep(0.05)
+    missing = [str(p) for p in expected if not p.exists()]
+    raise TimeoutError(f"barrier {phase} timeout, missing={missing}")
+
+
+def _tcp_barrier(rendezvous_id, rank_size, rank, phase, host, port, timeout_s):
+    key = f"{rendezvous_id}:{phase}"
+    if rank == 0:
+        bind_host = os.getenv("TRITON_ASCEND_GIN_BARRIER_BIND_HOST", "0.0.0.0")
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((bind_host, int(port)))
+            server.listen(max(1, rank_size - 1))
+            server.settimeout(timeout_s)
+            conns = []
+            seen = {0}
+            try:
+                while len(seen) < rank_size:
+                    conn, _addr = server.accept()
+                    line = _recv_line(conn, timeout_s)
+                    parts = line.decode("utf-8").rstrip("\n").split("\t")
+                    if len(parts) != 3 or parts[0] != key:
+                        conn.close()
+                        raise RuntimeError(f"unexpected barrier payload {line!r}, expected key {key!r}")
+                    peer = int(parts[1])
+                    seen.add(peer)
+                    conns.append(conn)
+                for conn in conns:
+                    conn.sendall(b"ok\n")
+            finally:
+                for conn in conns:
+                    conn.close()
+        return
+
+    payload = f"{key}\t{rank}\t{rank_size}\n".encode("utf-8")
+    deadline = time.time() + timeout_s
+    last_error = None
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, int(port)), timeout=5.0) as conn:
+                conn.sendall(payload)
+                reply = _recv_line(conn, timeout_s)
+            if reply != b"ok\n":
+                raise RuntimeError(f"unexpected barrier reply {reply!r}")
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.2)
+    raise TimeoutError(f"timeout waiting for barrier {key} at {host}:{port}; last_error={last_error}")
+
+
+def _recv_line(conn, timeout_s):
+    conn.settimeout(timeout_s)
+    chunks = []
+    while True:
+        chunk = conn.recv(1)
+        if not chunk:
+            raise RuntimeError("socket closed while reading line")
+        chunks.append(chunk)
+        if chunk == b"\n":
+            return b"".join(chunks)
 
 
 def destroy_hccl_comm(hccl_comm, *, hccl_library=None):
@@ -1021,6 +1277,17 @@ def _bind_runtime_library(library):
         ctypes.POINTER(HcclAlgBufferProbe),
     ]
     library.TritonAscendGinProbeHcclAlgBuffers.restype = ctypes.c_int
+    library.TritonAscendGinProbeHcclRdmaP2p.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(HcclChannelOptions),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.POINTER(HcclRdmaP2pProbe),
+    ]
+    library.TritonAscendGinProbeHcclRdmaP2p.restype = ctypes.c_int
     library.TritonAscendGinRefreshFromTileXR.argtypes = [ctypes.c_void_p]
     library.TritonAscendGinRefreshFromTileXR.restype = ctypes.c_int
     library.TritonAscendGinGetDevComm.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint64)]
@@ -1118,16 +1385,19 @@ __all__ = [
     "HcclChannelOptions",
     "HcclChannelProbe",
     "HcclAlgBufferProbe",
+    "HcclRdmaP2pProbe",
     "create_from_tilexr",
     "create_from_hccl_peer_mem",
     "create_from_hccl_channel",
     "probe_hccl_channel",
+    "probe_hccl_rdma_p2p",
     "probe_hccl_alg_buffers",
     "hccl_comm_handle_from_name",
     "hccl_comm_handle_from_process_group",
     "create_from_torch_hccl_process_group",
     "create_hccl_root_info_comm",
     "destroy_hccl_comm",
+    "rendezvous_barrier",
     "hccl_comm_config_capability",
     "hccl_channel_engine_value",
     "hccl_op_expansion_mode_value",

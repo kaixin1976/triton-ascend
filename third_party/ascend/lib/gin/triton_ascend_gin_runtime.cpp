@@ -32,7 +32,7 @@ constexpr uint32_t kTileXRMaxRanks = TRITON_ASCEND_GIN_MAX_RANKS;
 constexpr uint64_t kDefaultTileXRIpcDataOffset = 2ull * 1024ull * 1024ull;
 constexpr uint64_t kDefaultTileXRWindowBytes = 100ull * 1024ull * 1024ull;
 constexpr uint64_t kDefaultHcclSymWindowMinBytes = 2ull * 1024ull * 1024ull;
-constexpr uint64_t kDefaultSignalStride = sizeof(uint64_t);
+constexpr uint64_t kDefaultSignalStride = 32;
 constexpr uint32_t kDefaultSignalSlots = TRITON_ASCEND_GIN_DEFAULT_SIGNAL_SLOTS;
 constexpr uint32_t kDescriptorVersion = 1;
 constexpr size_t kAclIpcKeyBytes = 65;
@@ -61,6 +61,10 @@ constexpr uint32_t kHcclAivDevType910B = 2;
 constexpr uint32_t kHcclAivDevIdDefault = 16;
 constexpr int32_t kHcclAivExecTimeout = 1091;
 constexpr uint32_t kHcclAivDirectMaxRanks = 16;
+constexpr uint32_t kHcclGinNotifyReady = 0;
+constexpr uint32_t kHcclGinNotifyData = 1;
+constexpr uint32_t kHcclGinNotifyDone = 2;
+constexpr uint32_t kHcclGinNotifyTimeout = 1836;
 #endif
 
 thread_local std::string g_lastError;
@@ -129,6 +133,12 @@ using HcclEngineCtxGetFn = int (*)(void *, const char *, CommEngine, void **, ui
 using HcclEngineCtxCreateFn = int (*)(void *, const char *, CommEngine, uint64_t, void **);
 using HcclCommAddExchangeInfoFn = int (*)(void *, const void *, uint32_t);
 using HcclGetCommNameFn = int (*)(void *, char *);
+using HcommLocalCopyOnThreadFn = int32_t (*)(ThreadHandle, void *, const void *, uint64_t);
+using HcommReadOnThreadFn = int32_t (*)(ThreadHandle, ChannelHandle, void *, const void *, uint64_t);
+using HcommWriteOnThreadFn = int32_t (*)(ThreadHandle, ChannelHandle, void *, const void *, uint64_t);
+using HcommChannelNotifyRecordOnThreadFn = int32_t (*)(ThreadHandle, ChannelHandle, uint32_t);
+using HcommChannelNotifyWaitOnThreadFn = int32_t (*)(ThreadHandle, ChannelHandle, uint32_t, uint32_t);
+using HcommThreadSynchronizeFn = int32_t (*)(ThreadHandle);
 #endif
 using RtIpcSetMemoryNameFn = int (*)(const void *, uint64_t, char *, uint32_t);
 using RtIpcOpenMemoryFn = int (*)(void **, const char *);
@@ -163,6 +173,12 @@ struct HcclChannelSymbols {
   HcclEngineCtxCreateFn engineCtxCreate = nullptr;
   HcclCommAddExchangeInfoFn commAddExchangeInfo = nullptr;
   HcclGetCommNameFn getCommName = nullptr;
+  HcommLocalCopyOnThreadFn hcommLocalCopyOnThread = nullptr;
+  HcommReadOnThreadFn hcommReadOnThread = nullptr;
+  HcommWriteOnThreadFn hcommWriteOnThread = nullptr;
+  HcommChannelNotifyRecordOnThreadFn hcommChannelNotifyRecordOnThread = nullptr;
+  HcommChannelNotifyWaitOnThreadFn hcommChannelNotifyWaitOnThread = nullptr;
+  HcommThreadSynchronizeFn hcommThreadSynchronize = nullptr;
   void *libraries[4] = {};
   uint32_t libraryCount = 0;
 };
@@ -436,6 +452,14 @@ void ResolveHcclChannelSymbolsFromHandle(HcclChannelSymbols *symbols, void *libr
   ResolveOne(&symbols->engineCtxCreate, library, "HcclEngineCtxCreate");
   ResolveOne(&symbols->commAddExchangeInfo, library, "HcclCommAddExchangeInfo");
   ResolveOne(&symbols->getCommName, library, "HcclGetCommName");
+  ResolveOne(&symbols->hcommLocalCopyOnThread, library, "HcommLocalCopyOnThread");
+  ResolveOne(&symbols->hcommReadOnThread, library, "HcommReadOnThread");
+  ResolveOne(&symbols->hcommWriteOnThread, library, "HcommWriteOnThread");
+  ResolveOne(&symbols->hcommChannelNotifyRecordOnThread, library,
+             "HcommChannelNotifyRecordOnThread");
+  ResolveOne(&symbols->hcommChannelNotifyWaitOnThread, library,
+             "HcommChannelNotifyWaitOnThread");
+  ResolveOne(&symbols->hcommThreadSynchronize, library, "HcommThreadSynchronize");
 }
 
 bool HcclAlgBufferSymbolsComplete(const HcclAlgBufferSymbols &symbols) {
@@ -661,6 +685,20 @@ void ResolveHcclChannelSymbolsFromDefault(HcclChannelSymbols *symbols) {
   symbols->commAddExchangeInfo =
       reinterpret_cast<HcclCommAddExchangeInfoFn>(ResolveDefaultSymbol("HcclCommAddExchangeInfo"));
   symbols->getCommName = reinterpret_cast<HcclGetCommNameFn>(ResolveDefaultSymbol("HcclGetCommName"));
+  symbols->hcommLocalCopyOnThread =
+      reinterpret_cast<HcommLocalCopyOnThreadFn>(ResolveDefaultSymbol("HcommLocalCopyOnThread"));
+  symbols->hcommReadOnThread =
+      reinterpret_cast<HcommReadOnThreadFn>(ResolveDefaultSymbol("HcommReadOnThread"));
+  symbols->hcommWriteOnThread =
+      reinterpret_cast<HcommWriteOnThreadFn>(ResolveDefaultSymbol("HcommWriteOnThread"));
+  symbols->hcommChannelNotifyRecordOnThread =
+      reinterpret_cast<HcommChannelNotifyRecordOnThreadFn>(
+          ResolveDefaultSymbol("HcommChannelNotifyRecordOnThread"));
+  symbols->hcommChannelNotifyWaitOnThread =
+      reinterpret_cast<HcommChannelNotifyWaitOnThreadFn>(
+          ResolveDefaultSymbol("HcommChannelNotifyWaitOnThread"));
+  symbols->hcommThreadSynchronize =
+      reinterpret_cast<HcommThreadSynchronizeFn>(ResolveDefaultSymbol("HcommThreadSynchronize"));
 }
 
 int LoadHcclChannelSymbols(const char *libraryPath, HcclChannelSymbols *symbols) {
@@ -1577,6 +1615,7 @@ int FillDescriptorFromHcclChannel(TritonAscendGinRuntimeHandle *handle) {
   next.signal_stride = handle->signalStride;
   next.signal_slots = handle->signalSlots;
   next.hccl_thread_handle = thread;
+  std::memset(next.hccl_channel_protocol, 0, sizeof(next.hccl_channel_protocol));
   handle->hostDesc = next;
   return CopyDescriptorToDevice(handle);
 }
@@ -1598,9 +1637,10 @@ bool HcclLinkProtocolAllowedForEngine(CommEngine engine, CommProtocol protocol) 
     return false;
   }
   if (engine == COMM_ENGINE_AIV) {
-    // Match HCCL 9.1 GetProtocolByEngine(COMM_ENGINE_AIV): UB_MEM first,
-    // PCIE fallback. Some environments do not expose UB_MEM in rank graph.
+    // Prefer local AIV links when present. Cross-node RDMA exposes ROCE; keep
+    // it selectable so HcclChannelAcquire(AIV, ROCE) is actually exercised.
     return protocol == COMM_PROTOCOL_UB_MEM || protocol == COMM_PROTOCOL_PCIE ||
+           protocol == COMM_PROTOCOL_ROCE ||
            (HcclAivAllowExperimentalHccs() && protocol == COMM_PROTOCOL_HCCS);
   }
   return true;
@@ -1613,6 +1653,8 @@ int HcclLinkProtocolScore(CommEngine engine, CommProtocol protocol) {
       return 0;
     case COMM_PROTOCOL_PCIE:
       return 1;
+    case COMM_PROTOCOL_ROCE:
+      return 2;
     case COMM_PROTOCOL_HCCS:
       return 10;
     default:
@@ -1716,6 +1758,23 @@ void HcclAlgBufferProbeRecordFirstError(TritonAscendGinHcclAlgBufferProbe *probe
   if (probe != nullptr && probe->first_error_status == 0 && status != 0) {
     probe->first_error_status = status;
   }
+}
+
+void HcclRdmaP2pProbeRecordFirstError(TritonAscendGinHcclRdmaP2pProbe *probe,
+                                      int status) {
+  if (probe != nullptr && probe->first_error_status == 0 && status != 0) {
+    probe->first_error_status = status;
+  }
+}
+
+bool HcclRdmaP2pHcommSymbolsComplete(const HcclChannelSymbols &symbols) {
+  return symbols.threadAcquire != nullptr &&
+         symbols.hcommLocalCopyOnThread != nullptr &&
+         symbols.hcommReadOnThread != nullptr &&
+         symbols.hcommWriteOnThread != nullptr &&
+         symbols.hcommChannelNotifyRecordOnThread != nullptr &&
+         symbols.hcommChannelNotifyWaitOnThread != nullptr &&
+         symbols.hcommThreadSynchronize != nullptr;
 }
 
 uint64_t HcclAlgDeviceMemBase(void *deviceMem) {
@@ -2187,6 +2246,33 @@ CommEngine HcclRegisterAcquireEngine(CommEngine requestedEngine) {
     return COMM_ENGINE_CPU;
   }
   return requestedEngine;
+}
+
+const char *HcclChannelEngineName(CommEngine engine);
+
+bool HcclRdmaAivDataPathSupported(CommEngine acquireEngine,
+                                  CommProtocol protocol) {
+  return protocol != COMM_PROTOCOL_ROCE || acquireEngine == COMM_ENGINE_AIV;
+}
+
+int RejectUnsupportedHcclRdmaAivDataPath(CommEngine requestedEngine,
+                                         CommEngine acquireEngine,
+                                         CommProtocol protocol,
+                                         uint32_t peer,
+                                         const char *what) {
+  SetLastError(std::string("HCCL channel RDMA data path for GIN AIV requires "
+                           "an AIV-acquired ROCE channel for ") +
+               (what == nullptr ? "window" : what) + " peer " +
+               std::to_string(peer) + "; requested_engine=" +
+               HcclChannelEngineName(requestedEngine) + "(" +
+               std::to_string(static_cast<int>(requestedEngine)) +
+               ") acquire_engine=" + HcclChannelEngineName(acquireEngine) +
+               "(" + std::to_string(static_cast<int>(acquireEngine)) +
+               ") protocol=" + std::to_string(static_cast<int>(protocol)) +
+               ". CPU/AICPU ROCE channels can be acquired, but their channel "
+               "handles cannot be used by AscendC::Hcomm<AIV, ROCE> inside "
+               "the Triton GIN AIV kernel.");
+  return TRITON_ASCEND_GIN_RUNTIME_UNSUPPORTED;
 }
 
 const char *HcclChannelEngineName(CommEngine engine) {
@@ -2939,6 +3025,7 @@ int RegisterHcclChannelLegacyCclBufferBases(TritonAscendGinRuntimeHandle *runtim
     if (peer == rank) {
       bases[peer] = PtrToU64(localBuffer);
       runtime->hostDesc.hccl_channel_handle[peer] = 0;
+      runtime->hostDesc.hccl_channel_protocol[peer] = 0;
       continue;
     }
 
@@ -2950,6 +3037,11 @@ int RegisterHcclChannelLegacyCclBufferBases(TritonAscendGinRuntimeHandle *runtim
         useAcquireMemHandle ? &acquireMemHandle : nullptr, &desc);
     if (ret != TRITON_ASCEND_GIN_RUNTIME_SUCCESS) {
       return ret;
+    }
+    if (!HcclRdmaAivDataPathSupported(acquireEngine, desc.channelProtocol)) {
+      return RejectUnsupportedHcclRdmaAivDataPath(
+          runtime->hcclChannelEngine, acquireEngine, desc.channelProtocol, peer,
+          what);
     }
 
     ChannelHandle channel = 0;
@@ -2971,6 +3063,8 @@ int RegisterHcclChannelLegacyCclBufferBases(TritonAscendGinRuntimeHandle *runtim
     }
     runtime->hcclWindowChannels[peer] = channel;
     runtime->hostDesc.hccl_channel_handle[peer] = static_cast<uint64_t>(channel);
+    runtime->hostDesc.hccl_channel_protocol[peer] =
+        static_cast<uint32_t>(desc.channelProtocol);
 
     void *remoteBuffer = nullptr;
     uint64_t remoteBufferBytes = 0;
@@ -3107,6 +3201,10 @@ int RegisterHcclChannelBases(TritonAscendGinRuntimeHandle *runtime, void *localP
   for (uint32_t peer = 0; peer < nranks; ++peer) {
     if (peer == rank) {
       bases[peer] = PtrToU64(localPtr);
+      if (!isSignalWindow) {
+        runtime->hostDesc.hccl_channel_handle[peer] = 0;
+        runtime->hostDesc.hccl_channel_protocol[peer] = 0;
+      }
       continue;
     }
 
@@ -3117,6 +3215,11 @@ int RegisterHcclChannelBases(TritonAscendGinRuntimeHandle *runtime, void *localP
                                         &desc);
     if (ret != TRITON_ASCEND_GIN_RUNTIME_SUCCESS) {
       return ret;
+    }
+    if (!HcclRdmaAivDataPathSupported(acquireEngine, desc.channelProtocol)) {
+      return RejectUnsupportedHcclRdmaAivDataPath(
+          runtime->hcclChannelEngine, acquireEngine, desc.channelProtocol, peer,
+          what);
     }
 
     ChannelHandle channel = 0;
@@ -3137,6 +3240,12 @@ int RegisterHcclChannelBases(TritonAscendGinRuntimeHandle *runtime, void *localP
       return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
     }
     channels[peer] = channel;
+    if (!isSignalWindow) {
+      runtime->hostDesc.hccl_channel_handle[peer] =
+          static_cast<uint64_t>(channel);
+      runtime->hostDesc.hccl_channel_protocol[peer] =
+          static_cast<uint32_t>(desc.channelProtocol);
+    }
 
     uint32_t memNum = 0;
     CommMem *remoteMems = nullptr;
@@ -3534,7 +3643,7 @@ extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinProbeHcclChannel(
         }
       }
       acquireMemHandle = runtime.hcclAivCommInfoMemHandle;
-      acquireMemHandlePtr = &acquireMemHandle;
+      acquireMemHandlePtr = acquireMemHandle == nullptr ? nullptr : &acquireMemHandle;
     } else {
       HcclChannelProbeRecordFirstError(probe, ret, rank);
     }
@@ -3584,7 +3693,8 @@ extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinProbeHcclChannel(
       if (peer == rank) {
         continue;
       }
-      uint64_t aivPeerMask = probe->ub_mem_peer_mask | probe->pcie_peer_mask;
+      uint64_t aivPeerMask =
+          probe->ub_mem_peer_mask | probe->pcie_peer_mask | probe->roce_peer_mask;
       if (HcclAivAllowExperimentalHccs()) {
         aivPeerMask |= probe->hccs_peer_mask;
       }
@@ -3618,7 +3728,8 @@ extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinProbeHcclChannel(
     }
   }
 
-  uint64_t aivReachablePeerMask = probe->ub_mem_peer_mask | probe->pcie_peer_mask;
+  uint64_t aivReachablePeerMask =
+      probe->ub_mem_peer_mask | probe->pcie_peer_mask | probe->roce_peer_mask;
   if (HcclAivAllowExperimentalHccs()) {
     aivReachablePeerMask |= probe->hccs_peer_mask;
   }
@@ -3633,6 +3744,365 @@ extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinProbeHcclChannel(
   (void)options;
   (void)probe;
   SetLastError("Triton Ascend HCCL channel probe is only implemented for Linux hosts");
+  return TRITON_ASCEND_GIN_RUNTIME_UNSUPPORTED;
+#endif
+}
+
+extern "C" TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinProbeHcclRdmaP2p(
+    TritonAscendGinHcclHandle hcclComm, const TritonAscendGinHcclChannelOptions *options,
+    void *sendBuf, void *recvBuf, uint64_t bytes, uint32_t srcRank, uint32_t dstRank,
+    TritonAscendGinHcclRdmaP2pProbe *probe) {
+#if defined(__linux__)
+  if (hcclComm == nullptr || probe == nullptr || bytes == 0 || srcRank == dstRank) {
+    SetLastError("TritonAscendGinProbeHcclRdmaP2p received invalid input");
+    return TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE;
+  }
+
+  std::memset(probe, 0, sizeof(*probe));
+  probe->struct_size = sizeof(*probe);
+  probe->src_rank = srcRank;
+  probe->dst_rank = dstRank;
+  probe->bytes = bytes;
+  probe->engine = options == nullptr ? static_cast<uint32_t>(COMM_ENGINE_AICPU)
+                                     : options->engine;
+
+  TritonAscendGinRuntimeHandle runtime;
+  runtime.hcclComm = hcclComm;
+  runtime.hcclChannelEngine = static_cast<CommEngine>(probe->engine);
+  if (options != nullptr) {
+    runtime.windowBytes = options->window_bytes == 0 ? kDefaultTileXRWindowBytes : options->window_bytes;
+    runtime.signalStride = options->signal_stride == 0 ? kDefaultSignalStride : options->signal_stride;
+    runtime.signalSlots = options->signal_slots == 0 ? kDefaultSignalSlots : options->signal_slots;
+  }
+
+  if (runtime.hcclChannelEngine == COMM_ENGINE_AIV ||
+      runtime.hcclChannelEngine == COMM_ENGINE_CCU) {
+    SetLastError("HCCL RDMA P2P probe requires a CPU/AICPU-style Hcomm thread engine, got " +
+                 std::string(HcclChannelEngineName(runtime.hcclChannelEngine)));
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_UNSUPPORTED);
+    return TRITON_ASCEND_GIN_RUNTIME_UNSUPPORTED;
+  }
+
+  int ret = LoadHcclChannelSymbols(options == nullptr ? nullptr : options->hccl_library_path,
+                                   &runtime.hcclChannel);
+  if (ret != TRITON_ASCEND_GIN_RUNTIME_SUCCESS) {
+    HcclRdmaP2pProbeRecordFirstError(probe, ret);
+    return ret;
+  }
+  if (!HcclRdmaP2pHcommSymbolsComplete(runtime.hcclChannel)) {
+    SetLastError("required Hcomm primitive symbols were not found "
+                 "(HcommLocalCopyOnThread, HcommReadOnThread, HcommWriteOnThread, "
+                 "HcommChannelNotifyRecordOnThread, HcommChannelNotifyWaitOnThread, "
+                 "HcommThreadSynchronize)");
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_NOT_FOUND);
+    return TRITON_ASCEND_GIN_RUNTIME_NOT_FOUND;
+  }
+
+  uint32_t rank = 0;
+  uint32_t nranks = 0;
+  ret = runtime.hcclChannel.getRankId(runtime.hcclComm, &rank);
+  if (ret != 0) {
+    SetLastError("HcclGetRankId failed with code " + std::to_string(ret));
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR);
+    return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
+  }
+  ret = runtime.hcclChannel.getRankSize(runtime.hcclComm, &nranks);
+  if (ret != 0) {
+    SetLastError("HcclGetRankSize failed with code " + std::to_string(ret));
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR);
+    return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
+  }
+  if (nranks == 0 || nranks > kTileXRMaxRanks || rank >= nranks ||
+      srcRank >= nranks || dstRank >= nranks) {
+    SetLastError("HCCL RDMA P2P probe rank metadata is invalid");
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE);
+    return TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE;
+  }
+  runtime.hostDesc.rank = rank;
+  runtime.hostDesc.nranks = nranks;
+  probe->rank = rank;
+  probe->nranks = nranks;
+
+  const bool isSender = rank == srcRank;
+  const bool isReceiver = rank == dstRank;
+  if (!isSender && !isReceiver) {
+    return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
+  }
+  if ((isSender && sendBuf == nullptr) || (isReceiver && recvBuf == nullptr)) {
+    SetLastError("HCCL RDMA P2P probe received null send/recv tensor pointer");
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE);
+    return TRITON_ASCEND_GIN_RUNTIME_INVALID_VALUE;
+  }
+
+  const uint32_t peer = isSender ? dstRank : srcRank;
+  probe->peer = peer;
+
+  void *localBuffer = nullptr;
+  uint64_t localBufferBytes = 0;
+  ret = runtime.hcclChannel.getHcclBuffer(runtime.hcclComm, &localBuffer, &localBufferBytes);
+  probe->get_hccl_buffer_ret = ret;
+  probe->local_ccl_buffer_ptr = PtrToU64(localBuffer);
+  probe->local_ccl_buffer_bytes = localBufferBytes;
+  if (ret != 0 || localBuffer == nullptr || localBufferBytes < bytes) {
+    SetLastError("HcclGetHcclBuffer failed or returned too small a buffer, code " +
+                 std::to_string(ret) + " ptr=" + std::to_string(PtrToU64(localBuffer)) +
+                 " bytes=" + std::to_string(localBufferBytes) +
+                 " required=" + std::to_string(bytes));
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR);
+    return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
+  }
+
+  HcclChannelDesc desc = {};
+  ret = BuildHcclChannelDescForEngine(&runtime, runtime.hcclChannelEngine, peer, nullptr, &desc);
+  if (ret != TRITON_ASCEND_GIN_RUNTIME_SUCCESS) {
+    HcclRdmaP2pProbeRecordFirstError(probe, ret);
+    return ret;
+  }
+  probe->protocol = static_cast<uint32_t>(desc.channelProtocol);
+  if (desc.channelProtocol != COMM_PROTOCOL_ROCE) {
+    SetLastError("HCCL RDMA P2P probe expected COMM_PROTOCOL_ROCE, got protocol " +
+                 std::to_string(static_cast<int>(desc.channelProtocol)) +
+                 " between rank " + std::to_string(rank) +
+                 " and peer " + std::to_string(peer));
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_UNSUPPORTED);
+    return TRITON_ASCEND_GIN_RUNTIME_UNSUPPORTED;
+  }
+
+  if (DebugEnabled()) {
+    std::fprintf(stderr,
+                 "[triton_ascend_gin] RDMA P2P before exchange-info rank=%u peer=%u "
+                 "engine=%s(%d) protocol=%u local_ccl=%p local_ccl_bytes=%llu\n",
+                 rank, peer, HcclChannelEngineName(runtime.hcclChannelEngine),
+                 static_cast<int>(runtime.hcclChannelEngine),
+                 static_cast<uint32_t>(desc.channelProtocol), localBuffer,
+                 static_cast<unsigned long long>(localBufferBytes));
+  }
+  ret = HcclMaybeAddChannelExchangeInfo(&runtime, localBufferBytes, nullptr);
+  if (ret != TRITON_ASCEND_GIN_RUNTIME_SUCCESS) {
+    HcclRdmaP2pProbeRecordFirstError(probe, ret);
+    return ret;
+  }
+
+  ChannelHandle channel = 0;
+  if (DebugEnabled()) {
+    std::fprintf(stderr,
+                 "[triton_ascend_gin] RDMA P2P before channelAcquire rank=%u peer=%u "
+                 "engine=%s(%d) protocol=%u notify=%u mem_handles=%u\n",
+                 rank, peer, HcclChannelEngineName(runtime.hcclChannelEngine),
+                 static_cast<int>(runtime.hcclChannelEngine),
+                 static_cast<uint32_t>(desc.channelProtocol), desc.notifyNum,
+                 desc.memHandleNum);
+  }
+  ret = runtime.hcclChannel.channelAcquire(runtime.hcclComm, runtime.hcclChannelEngine,
+                                          &desc, 1, &channel);
+  probe->channel_acquire_ret = ret;
+  probe->channel = static_cast<uint64_t>(channel);
+  if (DebugEnabled()) {
+    std::fprintf(stderr,
+                 "[triton_ascend_gin] RDMA P2P after channelAcquire rank=%u peer=%u "
+                 "ret=%d channel=0x%llx\n",
+                 rank, peer, ret, static_cast<unsigned long long>(channel));
+  }
+  if (ret != 0 || channel == 0) {
+    SetLastError("HcclChannelAcquire for RDMA P2P peer " + std::to_string(peer) +
+                 " failed with code " + std::to_string(ret) +
+                 " engine=" + HcclChannelEngineName(runtime.hcclChannelEngine) +
+                 "(" + std::to_string(static_cast<int>(runtime.hcclChannelEngine)) +
+                 ") protocol=" + std::to_string(static_cast<int>(desc.channelProtocol)));
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR);
+    return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
+  }
+
+  void *remoteBuffer = nullptr;
+  uint64_t remoteBufferBytes = 0;
+  if (DebugEnabled()) {
+    std::fprintf(stderr,
+                 "[triton_ascend_gin] RDMA P2P before channelGetHcclBuffer "
+                 "rank=%u peer=%u channel=0x%llx\n",
+                 rank, peer, static_cast<unsigned long long>(channel));
+  }
+  ret = runtime.hcclChannel.channelGetHcclBuffer(runtime.hcclComm, channel,
+                                                &remoteBuffer, &remoteBufferBytes);
+  probe->channel_get_hccl_buffer_ret = ret;
+  probe->remote_ccl_buffer_ptr = PtrToU64(remoteBuffer);
+  probe->remote_ccl_buffer_bytes = remoteBufferBytes;
+  if (DebugEnabled()) {
+    std::fprintf(stderr,
+                 "[triton_ascend_gin] RDMA P2P after channelGetHcclBuffer "
+                 "rank=%u peer=%u ret=%d remote_ccl=%p remote_ccl_bytes=%llu\n",
+                 rank, peer, ret, remoteBuffer,
+                 static_cast<unsigned long long>(remoteBufferBytes));
+  }
+  if (ret != 0 || remoteBuffer == nullptr || remoteBufferBytes < bytes) {
+    SetLastError("HcclChannelGetHcclBuffer for RDMA P2P peer " + std::to_string(peer) +
+                 " failed with code " + std::to_string(ret) +
+                 " ptr=" + std::to_string(PtrToU64(remoteBuffer)) +
+                 " bytes=" + std::to_string(remoteBufferBytes) +
+                 " required=" + std::to_string(bytes));
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR);
+    return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
+  }
+
+  const CommEngine threadEngine = HcclChannelThreadEngine(runtime.hcclChannelEngine);
+  probe->thread_engine = static_cast<uint32_t>(threadEngine);
+  ThreadHandle thread = 0;
+  if (DebugEnabled()) {
+    std::fprintf(stderr,
+                 "[triton_ascend_gin] RDMA P2P before threadAcquire rank=%u "
+                 "thread_engine=%s(%d)\n",
+                 rank, HcclChannelEngineName(threadEngine),
+                 static_cast<int>(threadEngine));
+  }
+  ret = runtime.hcclChannel.threadAcquire(runtime.hcclComm, threadEngine, 1, 1, &thread);
+  probe->thread_acquire_ret = ret;
+  probe->thread = static_cast<uint64_t>(thread);
+  if (DebugEnabled()) {
+    std::fprintf(stderr,
+                 "[triton_ascend_gin] RDMA P2P after threadAcquire rank=%u "
+                 "ret=%d thread=0x%llx\n",
+                 rank, ret, static_cast<unsigned long long>(thread));
+  }
+  if (ret != 0 || thread == 0) {
+    SetLastError("HcclThreadAcquire for RDMA P2P failed with code " + std::to_string(ret) +
+                 " thread_engine=" + HcclChannelEngineName(threadEngine) +
+                 "(" + std::to_string(static_cast<int>(threadEngine)) + ")");
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR);
+    return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
+  }
+
+  if (isSender) {
+    if (DebugEnabled()) {
+      std::fprintf(stderr, "[triton_ascend_gin] RDMA P2P sender wait_ready rank=%u\n", rank);
+    }
+    ret = runtime.hcclChannel.hcommChannelNotifyWaitOnThread(
+        thread, channel, kHcclGinNotifyReady, kHcclGinNotifyTimeout);
+    probe->wait_ready_ret = ret;
+    if (ret == 0) {
+      if (DebugEnabled()) {
+        std::fprintf(stderr,
+                     "[triton_ascend_gin] RDMA P2P sender local_copy rank=%u "
+                     "dst=%p src=%p bytes=%llu\n",
+                     rank, localBuffer, sendBuf,
+                     static_cast<unsigned long long>(bytes));
+      }
+      ret = runtime.hcclChannel.hcommLocalCopyOnThread(thread, localBuffer,
+                                                      sendBuf, bytes);
+      probe->local_copy_ret = ret;
+    }
+    if (ret == 0) {
+      if (DebugEnabled()) {
+        std::fprintf(stderr,
+                     "[triton_ascend_gin] RDMA P2P sender write rank=%u "
+                     "dst=%p src=%p bytes=%llu\n",
+                     rank, remoteBuffer, localBuffer,
+                     static_cast<unsigned long long>(bytes));
+      }
+      ret = runtime.hcclChannel.hcommWriteOnThread(thread, channel, remoteBuffer,
+                                                  localBuffer, bytes);
+      probe->write_ret = ret;
+    }
+    if (ret == 0) {
+      if (DebugEnabled()) {
+        std::fprintf(stderr, "[triton_ascend_gin] RDMA P2P sender notify_data rank=%u\n", rank);
+      }
+      ret = runtime.hcclChannel.hcommChannelNotifyRecordOnThread(
+          thread, channel, kHcclGinNotifyData);
+      probe->notify_done_ret = ret;
+    }
+    if (ret == 0) {
+      if (DebugEnabled()) {
+        std::fprintf(stderr,
+                     "[triton_ascend_gin] RDMA P2P sender wait_receiver_done rank=%u\n",
+                     rank);
+      }
+      ret = runtime.hcclChannel.hcommChannelNotifyWaitOnThread(
+          thread, channel, kHcclGinNotifyDone, kHcclGinNotifyTimeout);
+      probe->wait_done_ret = ret;
+    }
+  } else {
+    if (DebugEnabled()) {
+      std::fprintf(stderr, "[triton_ascend_gin] RDMA P2P receiver notify_ready rank=%u\n", rank);
+    }
+    ret = runtime.hcclChannel.hcommChannelNotifyRecordOnThread(
+        thread, channel, kHcclGinNotifyReady);
+    probe->notify_ready_ret = ret;
+    if (ret == 0) {
+      if (DebugEnabled()) {
+        std::fprintf(stderr, "[triton_ascend_gin] RDMA P2P receiver wait_data rank=%u\n", rank);
+      }
+      ret = runtime.hcclChannel.hcommChannelNotifyWaitOnThread(
+          thread, channel, kHcclGinNotifyData, kHcclGinNotifyTimeout);
+      probe->wait_ready_ret = ret;
+    }
+    if (ret == 0) {
+      if (DebugEnabled()) {
+        std::fprintf(stderr,
+                     "[triton_ascend_gin] RDMA P2P receiver local_copy rank=%u "
+                     "dst=%p src=%p bytes=%llu\n",
+                     rank, recvBuf, localBuffer,
+                     static_cast<unsigned long long>(bytes));
+      }
+      ret = runtime.hcclChannel.hcommLocalCopyOnThread(thread, recvBuf,
+                                                      localBuffer, bytes);
+      probe->local_copy_ret = ret;
+    }
+    if (ret == 0) {
+      if (DebugEnabled()) {
+        std::fprintf(stderr, "[triton_ascend_gin] RDMA P2P receiver notify_done rank=%u\n", rank);
+      }
+      ret = runtime.hcclChannel.hcommChannelNotifyRecordOnThread(
+          thread, channel, kHcclGinNotifyDone);
+      probe->notify_done_ret = ret;
+    }
+  }
+  if (ret == 0) {
+    if (DebugEnabled()) {
+      std::fprintf(stderr, "[triton_ascend_gin] RDMA P2P thread_sync rank=%u\n", rank);
+    }
+    ret = runtime.hcclChannel.hcommThreadSynchronize(thread);
+    probe->thread_sync_ret = ret;
+  }
+  if (ret != 0) {
+    SetLastError("Hcomm RDMA P2P primitive failed on rank " + std::to_string(rank) +
+                 " peer " + std::to_string(peer) + " ret=" + std::to_string(ret) +
+                 " local_copy=" + std::to_string(probe->local_copy_ret) +
+                 " write=" + std::to_string(probe->write_ret) +
+                 " wait_ready=" + std::to_string(probe->wait_ready_ret) +
+                 " read=" + std::to_string(probe->read_ret) +
+                 " notify_ready=" + std::to_string(probe->notify_ready_ret) +
+                 " notify_done=" + std::to_string(probe->notify_done_ret) +
+                 " wait_done=" + std::to_string(probe->wait_done_ret) +
+                 " thread_sync=" + std::to_string(probe->thread_sync_ret));
+    HcclRdmaP2pProbeRecordFirstError(probe, TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR);
+    return TRITON_ASCEND_GIN_RUNTIME_HCCL_ERROR;
+  }
+
+  if (DebugEnabled()) {
+    std::fprintf(stderr,
+                 "[triton_ascend_gin] RDMA P2P probe rank=%u peer=%u src=%u dst=%u "
+                 "bytes=%llu engine=%s(%d) thread_engine=%s(%d) protocol=%u "
+                 "channel=0x%llx thread=0x%llx local_ccl=%p remote_ccl=%p\n",
+                 rank, peer, srcRank, dstRank,
+                 static_cast<unsigned long long>(bytes),
+                 HcclChannelEngineName(runtime.hcclChannelEngine),
+                 static_cast<int>(runtime.hcclChannelEngine),
+                 HcclChannelEngineName(threadEngine), static_cast<int>(threadEngine),
+                 static_cast<uint32_t>(desc.channelProtocol),
+                 static_cast<unsigned long long>(channel),
+                 static_cast<unsigned long long>(thread),
+                 localBuffer, remoteBuffer);
+  }
+  return TRITON_ASCEND_GIN_RUNTIME_SUCCESS;
+#else
+  (void)hcclComm;
+  (void)options;
+  (void)sendBuf;
+  (void)recvBuf;
+  (void)bytes;
+  (void)srcRank;
+  (void)dstRank;
+  (void)probe;
+  SetLastError("Triton Ascend HCCL RDMA P2P probe is only implemented for Linux hosts");
   return TRITON_ASCEND_GIN_RUNTIME_UNSUPPORTED;
 #endif
 }
@@ -4475,4 +4945,3 @@ extern "C" TRITON_ASCEND_GIN_RUNTIME_API void TritonAscendGinDestroy(TritonAscen
 #endif
   delete runtime;
 }
-

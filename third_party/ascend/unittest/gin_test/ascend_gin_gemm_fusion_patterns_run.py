@@ -264,16 +264,7 @@ def bind_tilexr(tilexr_lib):
 
 
 def wait_files(prefix, rank_size, rank, phase, timeout_s=180):
-    marker = pathlib.Path(f"{prefix}.{phase}.{rank}")
-    marker.write_text("ready")
-    deadline = time.time() + timeout_s
-    expected = [pathlib.Path(f"{prefix}.{phase}.{i}") for i in range(rank_size)]
-    while time.time() < deadline:
-        if all(p.exists() for p in expected):
-            return
-        time.sleep(0.05)
-    missing = [str(p) for p in expected if not p.exists()]
-    raise TimeoutError(f"barrier {phase} timeout, missing={missing}")
+    gin_runtime.rendezvous_barrier(prefix, rank_size, rank, phase, timeout_s)
 
 
 def check_close(name, got, expected, atol=2e-2, rtol=1e-3):

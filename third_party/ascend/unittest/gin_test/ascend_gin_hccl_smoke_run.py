@@ -92,25 +92,16 @@ def hccl_fused_all_gather_scale_kernel(
 
 
 def wait_files(prefix, rank_size, rank, phase, timeout_s=180):
-    marker = pathlib.Path(f"{prefix}.{phase}.{rank}")
-    marker.write_text("ready")
-    deadline = time.time() + timeout_s
-    expected = [pathlib.Path(f"{prefix}.{phase}.{i}") for i in range(rank_size)]
-    while time.time() < deadline:
-        if all(p.exists() for p in expected):
-            return
-        time.sleep(0.05)
-    missing = [str(p) for p in expected if not p.exists()]
-    raise TimeoutError(f"barrier {phase} timeout, missing={missing}")
+    gin_runtime.rendezvous_barrier(prefix, rank_size, rank, phase, timeout_s)
 
 
 def hccl_signal_bytes(rank_size):
-    return rank_size * SIGNAL_SLOTS * 8
+    return rank_size * SIGNAL_SLOTS * 32
 
 
 def hccl_window_numel(rank_size, data_numel):
     data_bytes = data_numel * 4
-    signal_offset = ((data_bytes + 7) // 8) * 8
+    signal_offset = ((data_bytes + 31) // 32) * 32
     total_bytes = signal_offset + hccl_signal_bytes(rank_size)
     return (total_bytes + 3) // 4
 

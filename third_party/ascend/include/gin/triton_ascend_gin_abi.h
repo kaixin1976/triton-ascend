@@ -86,6 +86,7 @@ struct TritonAscendGinDev {
 
   uint64_t hccl_channel_handle[TRITON_ASCEND_GIN_MAX_RANKS];
   uint64_t hccl_thread_handle;
+  uint32_t hccl_channel_protocol[TRITON_ASCEND_GIN_MAX_RANKS];
 };
 
 #ifdef __cplusplus

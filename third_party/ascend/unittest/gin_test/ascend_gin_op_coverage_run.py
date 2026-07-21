@@ -1,4 +1,4 @@
-﻿import argparse
+import argparse
 import ctypes
 import os
 import pathlib
@@ -27,6 +27,15 @@ SLOT_PUT_SIGNAL_WINDOW = 4
 SLOT_DIRECT_PUT_OFFSET = 5
 SLOT_PUT_WINDOW_INLINE = 6
 SLOTS = 7
+
+
+def skip_hccl_destroy():
+    value = os.getenv("TRITON_ASCEND_GIN_SKIP_HCCL_DESTROY", "")
+    return value and value != "0"
+
+
+def log_stage(args, message):
+    print(f"GIN OP stage: rank={args.rank} {message}", flush=True)
 
 
 @triton.jit
@@ -347,6 +356,7 @@ def create_hccl_gin(args):
     )
     if args.backend == "hccl_channel":
         os.environ.setdefault("HCCL_INDEPENDENT_OP", "1")
+    print(f"HCCL GIN init: rank={args.rank} before create_hccl_root_info_comm", flush=True)
     hccl_comm = gin_runtime.create_hccl_root_info_comm(
         rank=args.rank,
         rank_size=args.rank_size,
@@ -355,7 +365,9 @@ def create_hccl_gin(args):
         use_config=True,
         op_expansion_mode=args.hccl_op_expansion_mode,
     )
+    print(f"HCCL GIN init: rank={args.rank} after create_hccl_root_info_comm", flush=True)
     if args.backend == "hccl_channel":
+        print(f"HCCL GIN init: rank={args.rank} before create_from_hccl_channel", flush=True)
         gin = gin_runtime.create_from_hccl_channel(
             hccl_comm,
             runtime_library=RUNTIME_LIB,
@@ -363,25 +375,28 @@ def create_hccl_gin(args):
             signal_slots=SIGNAL_SLOTS,
             engine=args.hccl_channel_engine,
         )
+        print(f"HCCL GIN init: rank={args.rank} after create_from_hccl_channel", flush=True)
     else:
+        print(f"HCCL GIN init: rank={args.rank} before create_from_hccl_peer_mem", flush=True)
         gin = gin_runtime.create_from_hccl_peer_mem(
             hccl_comm,
             runtime_library=RUNTIME_LIB,
             hccl_library=args.hccl_lib,
             signal_slots=SIGNAL_SLOTS,
         )
+        print(f"HCCL GIN init: rank={args.rank} after create_from_hccl_peer_mem", flush=True)
     return gin, None, ctypes.c_void_p(hccl_comm), None
 
 
 def hccl_signal_bytes(args):
-    return args.rank_size * SIGNAL_SLOTS * 8
+    return args.rank_size * SIGNAL_SLOTS * 32
 
 
 def hccl_window_numel(args, data_numel):
     if args.backend not in ("hccl_peer_mem", "hccl_channel"):
         return data_numel
     data_bytes = data_numel * 4
-    signal_offset = ((data_bytes + 7) // 8) * 8
+    signal_offset = ((data_bytes + 31) // 32) * 32
     total_bytes = signal_offset + hccl_signal_bytes(args)
     return (total_bytes + 3) // 4
 
@@ -410,16 +425,7 @@ def register_window(gin, args, tensor, data_numel, rendezvous_id):
 
 
 def wait_files(prefix, rank_size, rank, phase, timeout_s=180):
-    marker = pathlib.Path(f"{prefix}.{phase}.{rank}")
-    marker.write_text("ready")
-    deadline = time.time() + timeout_s
-    expected = [pathlib.Path(f"{prefix}.{phase}.{i}") for i in range(rank_size)]
-    while time.time() < deadline:
-        if all(p.exists() for p in expected):
-            return
-        time.sleep(0.05)
-    missing = [str(p) for p in expected if not p.exists()]
-    raise TimeoutError(f"barrier {phase} timeout, missing={missing}")
+    gin_runtime.rendezvous_barrier(prefix, rank_size, rank, phase, timeout_s)
 
 
 def expected_slot(n_elements, rank_size, scale):
@@ -503,45 +509,62 @@ def main():
         else:
             gin, tile, tile_comm, _signal_window = create_hccl_gin(args)
         comm_h = gin.dev_comm
+        log_stage(args, "allocating input tensors")
         x = torch.arange(args.n, dtype=torch.float32, device="npu") + args.rank * 1000.0
         x_offset = torch.arange(args.n * 2, dtype=torch.float32, device="npu") + args.rank * 5000.0
         y_numel = SLOTS * args.rank_size * args.n
+        log_stage(args, "allocating/registering data window tensor")
         y = allocate_window_tensor(args, gin, y_numel, -777.0)
+        log_stage(args, "allocated data window tensor")
         z = torch.full((args.n,), -777.0, dtype=torch.float32, device="npu")
         z_offset = torch.full((args.n * 2,), -777.0, dtype=torch.float32, device="npu")
         meta = torch.full((4,), -1, dtype=torch.int64, device="npu")
+        log_stage(args, "before register_window")
         win_h = register_window(gin, args, y, y_numel, args.tag)
+        log_stage(args, f"after register_window win_h={win_h}")
 
         blocks = triton.cdiv(args.n, args.block)
         grid = (1,)
         prefix = f"/tmp/triton_gin_{args.backend}_op_cov_{args.tag}"
 
+        log_stage(args, "launch reset_gin_signals_kernel")
         reset_gin_signals_kernel[grid](
             comm_h, args.rank_size, blocks, BACKEND_MASK=mask
         )
+        log_stage(args, "sync reset_gin_signals_kernel")
         torch.npu.synchronize()
+        log_stage(args, "done reset_gin_signals_kernel")
         wait_files(prefix, args.rank_size, args.rank, "reset")
 
+        log_stage(args, "launch direct_put_kernel")
         direct_put_kernel[grid](
             x, y, comm_h, win_h, args.n, BLOCK=args.block, BLOCKS=blocks,
             RANK_SIZE_C=args.rank_size, BACKEND_MASK=mask,
         )
+        log_stage(args, "sync direct_put_kernel")
         torch.npu.synchronize()
+        log_stage(args, "done direct_put_kernel")
         wait_files(prefix, args.rank_size, args.rank, "direct_put")
 
+        log_stage(args, "launch direct_put_offset_kernel")
         direct_put_offset_kernel[grid](x_offset, y, comm_h, win_h, args.n,
                                        BLOCK=args.block, BLOCKS=blocks,
                                        SLOT=SLOT_DIRECT_PUT_OFFSET,
                                        RANK_SIZE_C=args.rank_size,
                                        BACKEND_MASK=mask)
+        log_stage(args, "sync direct_put_offset_kernel")
         torch.npu.synchronize()
+        log_stage(args, "done direct_put_offset_kernel")
         wait_files(prefix, args.rank_size, args.rank, "direct_put_offset")
 
+        log_stage(args, "launch put_signal_kernel")
         put_signal_kernel[grid](x, y, comm_h, win_h, args.n, BLOCK=args.block,
                                 BLOCKS=blocks, SLOT=SLOT_PUT_SIGNAL,
                                 RANK_SIZE_C=args.rank_size, SIGNAL_BASE=8,
                                 BACKEND_MASK=mask)
+        log_stage(args, "sync put_signal_kernel")
         torch.npu.synchronize()
+        log_stage(args, "done put_signal_kernel")
         wait_files(prefix, args.rank_size, args.rank, "put_signal")
 
         prepare_put_window_source_kernel[grid](
@@ -655,7 +678,8 @@ def main():
     finally:
         if gin is not None:
             gin.close()
-        if args.backend in ("hccl_peer_mem", "hccl_channel") and tile_comm.value:
+        if (args.backend in ("hccl_peer_mem", "hccl_channel") and tile_comm.value
+                and not skip_hccl_destroy()):
             gin_runtime.destroy_hccl_comm(tile_comm, hccl_library=args.hccl_lib)
         if tile is not None and tile_comm.value:
             tile.TileXRCommDestroy(tile_comm)
@@ -663,6 +687,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

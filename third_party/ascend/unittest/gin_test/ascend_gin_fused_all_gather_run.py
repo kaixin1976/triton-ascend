@@ -25,6 +25,11 @@ RUNTIME_LIB = os.getenv("TRITON_ASCEND_GIN_RUNTIME_LIB")
 SIGNAL_SLOTS = 128
 
 
+def skip_hccl_destroy():
+    value = os.getenv("TRITON_ASCEND_GIN_SKIP_HCCL_DESTROY", "")
+    return value and value != "0"
+
+
 @triton.jit
 def reset_gin_signals_kernel(
     comm_h,
@@ -53,16 +58,7 @@ def bind_tilexr(tilexr_lib):
 
 
 def wait_files(prefix, rank_size, rank, phase, timeout_s=180):
-    marker = pathlib.Path(f"{prefix}.{phase}.{rank}")
-    marker.write_text("ready")
-    deadline = time.time() + timeout_s
-    expected = [pathlib.Path(f"{prefix}.{phase}.{i}") for i in range(rank_size)]
-    while time.time() < deadline:
-        if all(p.exists() for p in expected):
-            return
-        time.sleep(0.05)
-    missing = [str(p) for p in expected if not p.exists()]
-    raise TimeoutError(f"barrier {phase} timeout, missing={missing}")
+    gin_runtime.rendezvous_barrier(prefix, rank_size, rank, phase, timeout_s)
 
 
 def backend_mask(backend):
@@ -130,14 +126,14 @@ def create_hccl_gin(args):
 
 
 def hccl_signal_bytes(args):
-    return args.rank_size * SIGNAL_SLOTS * 8
+    return args.rank_size * SIGNAL_SLOTS * 32
 
 
 def hccl_window_numel(args, data_numel):
     if args.backend not in ("hccl_peer_mem", "hccl_channel"):
         return data_numel
     data_bytes = data_numel * 4
-    signal_offset = ((data_bytes + 7) // 8) * 8
+    signal_offset = ((data_bytes + 31) // 32) * 32
     total_bytes = signal_offset + hccl_signal_bytes(args)
     return (total_bytes + 3) // 4
 
@@ -260,7 +256,8 @@ def main():
             gin.close()
         if dist.is_initialized():
             dist.destroy_process_group()
-        if args.backend in ("hccl_peer_mem", "hccl_channel") and tile_comm.value:
+        if (args.backend in ("hccl_peer_mem", "hccl_channel") and tile_comm.value
+                and not skip_hccl_destroy()):
             gin_runtime.destroy_hccl_comm(tile_comm, hccl_library=args.hccl_lib)
         if tile is not None and tile_comm.value:
             tile.TileXRCommDestroy(tile_comm)

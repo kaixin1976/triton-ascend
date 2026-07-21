@@ -5,6 +5,7 @@
 
 #if defined(__NPU_ARCH__) || defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__CCE__)
 #include "kernel_operator.h"
+#include "hcomm/hcomm.h"
 #endif
 
 #if defined(TRITON_ASCEND_GIN_ENABLE_TILEXR)
@@ -27,12 +28,17 @@
 #define TRITON_ASCEND_GIN_COPY_CHUNK_BYTES 1024
 #endif
 
+#ifndef TRITON_ASCEND_GIN_HCOMM_WRITE_CHUNK_BYTES
+#define TRITON_ASCEND_GIN_HCOMM_WRITE_CHUNK_BYTES 128
+#endif
+
+#ifndef TRITON_ASCEND_GIN_HCCL_PROTOCOL_ROCE
+#define TRITON_ASCEND_GIN_HCCL_PROTOCOL_ROCE 1
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-int32_t HcommWriteOnThread(uint64_t thread, uint64_t channel, void *dst, const void *src, uint64_t len);
-int32_t HcommReadOnThread(uint64_t thread, uint64_t channel, void *dst, const void *src, uint64_t len);
 
 TRITON_ASCEND_GIN_DEVICE inline const TRITON_ASCEND_GIN_GM TritonAscendGinDev *
 __triton_ascend_gin_as_dev(uint64_t dev_comm) {
@@ -97,6 +103,91 @@ __triton_ascend_gin_peer_signal_addr(const TRITON_ASCEND_GIN_GM TritonAscendGinD
   uint64_t stride = comm->signal_stride != 0 ? comm->signal_stride : sizeof(uint64_t);
   uint64_t base = comm->peer_signal_base[target_peer];
   return base == 0 ? 0 : base + __triton_ascend_gin_signal_slot(comm, source_rank, signal_id) * stride;
+}
+
+TRITON_ASCEND_GIN_DEVICE inline bool
+__triton_ascend_gin_use_hcomm_thread(const TRITON_ASCEND_GIN_GM TritonAscendGinDev *comm,
+                                      int32_t peer) {
+  return comm != nullptr && peer >= 0 &&
+         peer < static_cast<int32_t>(comm->nranks) &&
+         peer != static_cast<int32_t>(comm->rank) &&
+         comm->hccl_thread_handle != 0 &&
+         comm->hccl_channel_handle[peer] != 0;
+}
+
+TRITON_ASCEND_GIN_DEVICE inline bool
+__triton_ascend_gin_use_hcomm_roce(const TRITON_ASCEND_GIN_GM TritonAscendGinDev *comm,
+                                   int32_t peer) {
+  return __triton_ascend_gin_use_hcomm_thread(comm, peer) &&
+         comm->hccl_channel_protocol[peer] == TRITON_ASCEND_GIN_HCCL_PROTOCOL_ROCE;
+}
+
+TRITON_ASCEND_GIN_DEVICE inline uint64_t
+__triton_ascend_gin_signal_write_bytes(const TRITON_ASCEND_GIN_GM TritonAscendGinDev *comm) {
+  uint64_t stride = comm != nullptr && comm->signal_stride != 0 ? comm->signal_stride : sizeof(uint64_t);
+  return stride < sizeof(uint64_t) ? sizeof(uint64_t) : stride;
+}
+
+TRITON_ASCEND_GIN_DEVICE inline bool
+__triton_ascend_gin_hcomm_write_bytes(uint64_t thread, uint64_t channel, uint64_t dst,
+                                      uint64_t src, uint64_t nbytes) {
+  (void)thread;
+#if defined(__NPU_ARCH__) || defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__CCE_IS_AICORE__) || defined(__CCE__)
+  uint64_t offset = 0;
+  while (offset < nbytes) {
+    uint64_t chunk = nbytes - offset;
+    if (chunk > TRITON_ASCEND_GIN_HCOMM_WRITE_CHUNK_BYTES) {
+      chunk = TRITON_ASCEND_GIN_HCOMM_WRITE_CHUNK_BYTES;
+    }
+    AscendC::Hcomm<AscendC::CommEngine::AIV, AscendC::CommProtocol::ROCE> hcomm;
+    AscendC::HcommHandle handle = hcomm.Write(
+        static_cast<AscendC::ChannelHandle>(channel),
+        reinterpret_cast<GM_ADDR>(dst + offset),
+        reinterpret_cast<GM_ADDR>(src + offset), chunk);
+    if (handle < 0 || hcomm.Wait(handle) != 0) {
+      return false;
+    }
+    offset += chunk;
+  }
+  return true;
+#else
+  (void)channel;
+  (void)dst;
+  (void)src;
+  (void)nbytes;
+  return false;
+#endif
+}
+
+TRITON_ASCEND_GIN_DEVICE inline bool
+__triton_ascend_gin_hcomm_read_bytes(uint64_t thread, uint64_t channel, uint64_t dst,
+                                     uint64_t src, uint64_t nbytes) {
+  (void)thread;
+#if defined(__NPU_ARCH__) || defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__CCE_IS_AICORE__) || defined(__CCE__)
+  uint64_t offset = 0;
+  while (offset < nbytes) {
+    uint64_t chunk = nbytes - offset;
+    if (chunk > TRITON_ASCEND_GIN_HCOMM_WRITE_CHUNK_BYTES) {
+      chunk = TRITON_ASCEND_GIN_HCOMM_WRITE_CHUNK_BYTES;
+    }
+    AscendC::Hcomm<AscendC::CommEngine::AIV, AscendC::CommProtocol::ROCE> hcomm;
+    AscendC::HcommHandle handle = hcomm.Read(
+        static_cast<AscendC::ChannelHandle>(channel),
+        reinterpret_cast<GM_ADDR>(dst + offset),
+        reinterpret_cast<GM_ADDR>(src + offset), chunk);
+    if (handle < 0 || hcomm.Wait(handle) != 0) {
+      return false;
+    }
+    offset += chunk;
+  }
+  return true;
+#else
+  (void)channel;
+  (void)dst;
+  (void)src;
+  (void)nbytes;
+  return false;
+#endif
 }
 
 TRITON_ASCEND_GIN_DEVICE inline void
@@ -211,7 +302,13 @@ TRITON_ASCEND_GIN_DEVICE int32_t __triton_ascend_gin_put(
     }
     uint64_t dst_addr = __triton_ascend_gin_peer_window_addr(comm, peer, dst_offset);
     if (dst_addr != 0 && src_ptr != 0 && nbytes != 0) {
-      __triton_ascend_gin_copy_bytes(dst_addr, src_ptr, nbytes);
+      if (__triton_ascend_gin_use_hcomm_roce(comm, peer)) {
+        __triton_ascend_gin_hcomm_write_bytes(
+            comm->hccl_thread_handle, comm->hccl_channel_handle[peer],
+            dst_addr, src_ptr, nbytes);
+      } else {
+        __triton_ascend_gin_copy_bytes(dst_addr, src_ptr, nbytes);
+      }
     }
     return token + 1;
   }
@@ -260,10 +357,27 @@ TRITON_ASCEND_GIN_DEVICE int32_t __triton_ascend_gin_put_signal(
     uint64_t remote_signal_addr = __triton_ascend_gin_peer_signal_addr(
         comm, peer, static_cast<int32_t>(comm->rank), signal_id);
     if (dst_addr != 0 && src_ptr != 0 && nbytes != 0) {
-      __triton_ascend_gin_copy_bytes(dst_addr, src_ptr, nbytes);
+      if (__triton_ascend_gin_use_hcomm_roce(comm, peer)) {
+        __triton_ascend_gin_hcomm_write_bytes(
+            comm->hccl_thread_handle, comm->hccl_channel_handle[peer],
+            dst_addr, src_ptr, nbytes);
+      } else {
+        __triton_ascend_gin_copy_bytes(dst_addr, src_ptr, nbytes);
+      }
     }
     if (remote_signal_addr != 0) {
-      __triton_ascend_gin_store_u64(remote_signal_addr, signal_value);
+      if (__triton_ascend_gin_use_hcomm_roce(comm, peer)) {
+        uint64_t local_signal_addr = __triton_ascend_gin_peer_signal_addr(
+            comm, static_cast<int32_t>(comm->rank),
+            static_cast<int32_t>(comm->rank), signal_id);
+        __triton_ascend_gin_store_u64(local_signal_addr, signal_value);
+        __triton_ascend_gin_hcomm_write_bytes(
+            comm->hccl_thread_handle, comm->hccl_channel_handle[peer],
+            remote_signal_addr, local_signal_addr,
+            __triton_ascend_gin_signal_write_bytes(comm));
+      } else {
+        __triton_ascend_gin_store_u64(remote_signal_addr, signal_value);
+      }
     }
     return token + 1;
   }
@@ -342,7 +456,13 @@ TRITON_ASCEND_GIN_DEVICE int32_t __triton_ascend_gin_get(
     }
     uint64_t src_addr = __triton_ascend_gin_peer_window_addr(comm, peer, src_offset);
     if (dst_ptr != 0 && src_addr != 0 && nbytes != 0) {
-      __triton_ascend_gin_copy_bytes(dst_ptr, src_addr, nbytes);
+      if (__triton_ascend_gin_use_hcomm_roce(comm, peer)) {
+        __triton_ascend_gin_hcomm_read_bytes(
+            comm->hccl_thread_handle, comm->hccl_channel_handle[peer],
+            dst_ptr, src_addr, nbytes);
+      } else {
+        __triton_ascend_gin_copy_bytes(dst_ptr, src_addr, nbytes);
+      }
     }
     return token + 1;
   }
@@ -386,7 +506,18 @@ TRITON_ASCEND_GIN_DEVICE int32_t __triton_ascend_gin_signal(
     uint64_t remote_signal_addr = __triton_ascend_gin_peer_signal_addr(
         comm, peer, static_cast<int32_t>(comm->rank), signal_id);
     if (remote_signal_addr != 0) {
-      __triton_ascend_gin_store_u64(remote_signal_addr, signal_value);
+      if (__triton_ascend_gin_use_hcomm_roce(comm, peer)) {
+        uint64_t local_signal_addr = __triton_ascend_gin_peer_signal_addr(
+            comm, static_cast<int32_t>(comm->rank),
+            static_cast<int32_t>(comm->rank), signal_id);
+        __triton_ascend_gin_store_u64(local_signal_addr, signal_value);
+        __triton_ascend_gin_hcomm_write_bytes(
+            comm->hccl_thread_handle, comm->hccl_channel_handle[peer],
+            remote_signal_addr, local_signal_addr,
+            __triton_ascend_gin_signal_write_bytes(comm));
+      } else {
+        __triton_ascend_gin_store_u64(remote_signal_addr, signal_value);
+      }
     }
     return token + 1;
   }

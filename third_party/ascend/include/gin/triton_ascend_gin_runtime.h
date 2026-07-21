@@ -149,6 +149,39 @@ struct TritonAscendGinHcclAlgBufferProbe {
   int32_t first_error_status;
 };
 
+struct TritonAscendGinHcclRdmaP2pProbe {
+  uint32_t struct_size;
+  uint32_t rank;
+  uint32_t nranks;
+  uint32_t src_rank;
+  uint32_t dst_rank;
+  uint32_t peer;
+  uint32_t engine;
+  uint32_t thread_engine;
+  uint32_t protocol;
+  uint32_t reserved0;
+  uint64_t bytes;
+  uint64_t channel;
+  uint64_t thread;
+  uint64_t local_ccl_buffer_ptr;
+  uint64_t local_ccl_buffer_bytes;
+  uint64_t remote_ccl_buffer_ptr;
+  uint64_t remote_ccl_buffer_bytes;
+  int32_t get_hccl_buffer_ret;
+  int32_t channel_acquire_ret;
+  int32_t channel_get_hccl_buffer_ret;
+  int32_t thread_acquire_ret;
+  int32_t local_copy_ret;
+  int32_t write_ret;
+  int32_t notify_ready_ret;
+  int32_t wait_ready_ret;
+  int32_t read_ret;
+  int32_t notify_done_ret;
+  int32_t wait_done_ret;
+  int32_t thread_sync_ret;
+  int32_t first_error_status;
+};
+
 TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinCreateFromTileXR(
     TritonAscendGinTileXRHandle tilexr_comm, const TritonAscendGinTileXROptions *options,
     TritonAscendGinHandle *handle);
@@ -170,6 +203,11 @@ TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinProbeHcclChannel(
 TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinProbeHcclAlgBuffers(
     const char *hccl_alg_library_path, uint32_t device,
     TritonAscendGinHcclAlgBufferProbe *probe);
+
+TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinProbeHcclRdmaP2p(
+    TritonAscendGinHcclHandle hccl_comm, const TritonAscendGinHcclChannelOptions *options,
+    void *send_buf, void *recv_buf, uint64_t bytes, uint32_t src_rank, uint32_t dst_rank,
+    TritonAscendGinHcclRdmaP2pProbe *probe);
 
 TRITON_ASCEND_GIN_RUNTIME_API int TritonAscendGinGetDevComm(TritonAscendGinHandle handle,
                                                             uint64_t *dev_comm);

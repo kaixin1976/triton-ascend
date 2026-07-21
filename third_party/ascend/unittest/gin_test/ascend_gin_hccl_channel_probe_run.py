@@ -18,16 +18,12 @@ SIGNAL_SLOTS = 128
 
 
 def wait_files(prefix, rank_size, rank, phase, timeout_s=180):
-    marker = pathlib.Path(f"{prefix}.{phase}.{rank}")
-    marker.write_text("ready")
-    deadline = time.time() + timeout_s
-    expected = [pathlib.Path(f"{prefix}.{phase}.{i}") for i in range(rank_size)]
-    while time.time() < deadline:
-        if all(p.exists() for p in expected):
-            return
-        time.sleep(0.05)
-    missing = [str(p) for p in expected if not p.exists()]
-    raise TimeoutError(f"barrier {phase} timeout, missing={missing}")
+    gin_runtime.rendezvous_barrier(prefix, rank_size, rank, phase, timeout_s)
+
+
+def skip_hccl_destroy():
+    value = os.getenv("TRITON_ASCEND_GIN_SKIP_HCCL_DESTROY", "")
+    return value and value != "0"
 
 
 def add_hex_masks(result):
@@ -70,6 +66,8 @@ def main():
     parser.add_argument("--hccl-channel-engine", default="aiv")
     parser.add_argument("--no-acquire", action="store_true")
     parser.add_argument("--add-exchange-info", action="store_true")
+    parser.add_argument("--require-hccs", action="store_true")
+    parser.add_argument("--require-roce", action="store_true")
     parser.add_argument("--require-ub-mem", action="store_true")
     parser.add_argument("--require-acquire", action="store_true")
     args = parser.parse_args()
@@ -108,6 +106,7 @@ def main():
     )
 
     prefix = f"/tmp/triton_gin_hccl_channel_probe_{args.tag}"
+    success = False
     try:
         result = gin_runtime.probe_hccl_channel(
             comm,
@@ -120,8 +119,20 @@ def main():
         print("HCCL_CHANNEL_PROBE_JSON=" + json.dumps(result, sort_keys=True), flush=True)
 
         peer_mask = int(result["peer_mask"])
+        hccs_peer_mask = int(result["hccs_peer_mask"])
+        roce_peer_mask = int(result["roce_peer_mask"])
         ub_mem_peer_mask = int(result["ub_mem_peer_mask"])
         acquire_peer_mask = int(result["acquire_peer_mask"])
+        if args.require_hccs and (hccs_peer_mask & peer_mask) != peer_mask:
+            raise AssertionError(
+                f"HCCL channel probe did not expose HCCS for all peers: "
+                f"peer_mask=0x{peer_mask:x} hccs_peer_mask=0x{hccs_peer_mask:x}"
+            )
+        if args.require_roce and (roce_peer_mask & peer_mask) == 0:
+            raise AssertionError(
+                f"HCCL channel probe did not expose any ROCE/RDMA peer: "
+                f"peer_mask=0x{peer_mask:x} roce_peer_mask=0x{roce_peer_mask:x}"
+            )
         if args.require_ub_mem and (ub_mem_peer_mask & peer_mask) != peer_mask:
             raise AssertionError(
                 f"HCCL channel probe did not expose UB_MEM for all peers: "
@@ -134,8 +145,12 @@ def main():
             )
         wait_files(prefix, args.rank_size, args.rank, "probed")
         print(f"HCCL channel probe: DONE rank={args.rank}", flush=True)
+        success = True
     finally:
-        gin_runtime.destroy_hccl_comm(comm, hccl_library=args.hccl_lib)
+        if success and skip_hccl_destroy():
+            os._exit(0)
+        if not skip_hccl_destroy():
+            gin_runtime.destroy_hccl_comm(comm, hccl_library=args.hccl_lib)
 
 
 if __name__ == "__main__":

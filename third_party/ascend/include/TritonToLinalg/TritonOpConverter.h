@@ -767,6 +767,26 @@ struct DotConverter : public OpConversionPattern<triton::ascend::DotOp> {
                   ConversionPatternRewriter &rewriter) const override;
 };
 
+struct GroupedDotConverter
+    : public OpConversionPattern<triton::ascend::GroupedDotOp> {
+  using OpConversionPattern<
+      triton::ascend::GroupedDotOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::ascend::GroupedDotOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+struct GroupedDotSwiGLUMxConverter
+    : public OpConversionPattern<triton::ascend::GroupedDotSwiGLUMxOp> {
+  using OpConversionPattern<
+      triton::ascend::GroupedDotSwiGLUMxOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::ascend::GroupedDotSwiGLUMxOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
 struct FlipOpConverter : public OpConversionPattern<triton::ascend::FlipOp> {
   using OpConversionPattern<triton::ascend::FlipOp>::OpConversionPattern;
 

@@ -91,7 +91,7 @@ testlist = [
 
 
 @pytest.mark.skipif(
-    not is_compile_on_910_95(triton.runtime.driver.active.get_current_target().arch),
+    not is_compile_on_910_95(),
     reason="only support in A5",
 )
 @pytest.mark.parametrize("dtype", ["fp8e4m3", "fp8e5m2"])
@@ -147,10 +147,12 @@ def _dot_scaled_test_fp4(
     scale_offs = tl.arange(0, K_SCALE)
 
     a = tl.load(a_ptr + m_offs[:, None] * K_PACKED + k_packed_offs[None, :])
-    a_scale = tl.load(a_scale_ptr + m_offs[:, None] * K_SCALE + scale_offs[None, :])
+    a_scale = tl.load(
+        a_scale_ptr + m_offs[:, None] * K_SCALE + scale_offs[None, :])
 
     b = tl.load(b_ptr + k_packed_offs[:, None] * N + n_offs[None, :])
-    b_scale = tl.load(b_scale_ptr + n_offs[:, None] * K_SCALE + scale_offs[None, :])
+    b_scale = tl.load(
+        b_scale_ptr + n_offs[:, None] * K_SCALE + scale_offs[None, :])
 
     acc = tl.dot_scaled(a, a_scale, "e2m1", b, b_scale, "e2m1")
 
@@ -171,7 +173,7 @@ def dequant_e2m1(packed_uint8, scale_uint8, rows, K):
     return out * scale_expanded
 
 
-@pytest.mark.skip(reason="to be supported in A5")
+@pytest.mark.skipif(not is_compile_on_910_95(), reason="only support in A5")
 def test_dot_scaled_fp4():
     M, N, K = 16, 16, 64
     K_PACKED = K // 2

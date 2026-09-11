@@ -2857,6 +2857,113 @@ DotConverter::matchAndRewrite(triton::ascend::DotOp op, OpAdaptor adaptor,
   return success();
 }
 
+LogicalResult GroupedDotConverter::matchAndRewrite(
+    triton::ascend::GroupedDotOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  auto createStaticView = [&](Value source, ArrayRef<int64_t> shape,
+                              StringRef name) -> FailureOr<Value> {
+    auto sourceTy = dyn_cast<MemRefType>(source.getType());
+    if (!sourceTy) {
+      op.emitOpError() << name << " must lower to a memref, got "
+                       << source.getType();
+      return failure();
+    }
+
+    SmallVector<int64_t> strides(shape.size(), 1);
+    for (int64_t i = static_cast<int64_t>(shape.size()) - 2; i >= 0; --i)
+      strides[i] = strides[i + 1] * shape[i + 1];
+
+    auto viewTy = MemRefType::get(shape, sourceTy.getElementType(),
+                                  MemRefLayoutAttrInterface{},
+                                  sourceTy.getMemorySpace());
+    SmallVector<int64_t> offsets{0};
+    Value view = rewriter.create<memref::ReinterpretCastOp>(
+        op.getLoc(), viewTy, source, ValueRange{}, ValueRange{}, ValueRange{},
+        offsets, shape, strides);
+    return view;
+  };
+
+  int64_t e = op.getNumExperts();
+  int64_t m = op.getMaxTokens();
+  int64_t n = op.getOutFeatures();
+  int64_t k = op.getInFeatures();
+  FailureOr<Value> weights =
+      createStaticView(adaptor.getWeights(), {e, n, k}, "weights");
+  FailureOr<Value> tokens =
+      createStaticView(adaptor.getTokens(), {m, k}, "tokens");
+  FailureOr<Value> counts = createStaticView(
+      adaptor.getTokensPerExpert(), {e}, "tokens_per_expert");
+  FailureOr<Value> output =
+      createStaticView(adaptor.getOutput(), {m, n}, "output");
+  if (failed(weights) || failed(tokens) || failed(counts) || failed(output))
+    return failure();
+
+  rewriter.replaceOpWithNewOp<hivm::MixGroupMatmulOp>(
+      op, TypeRange{}, *weights, *tokens, *counts, *output,
+      /*aTranspose=*/UnitAttr{}, /*bTranspose=*/UnitAttr{});
+  return success();
+}
+
+LogicalResult GroupedDotSwiGLUMxConverter::matchAndRewrite(
+    triton::ascend::GroupedDotSwiGLUMxOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  auto createStaticView = [&](Value source, ArrayRef<int64_t> shape,
+                              StringRef name) -> FailureOr<Value> {
+    auto sourceTy = dyn_cast<MemRefType>(source.getType());
+    if (!sourceTy) {
+      op.emitOpError() << name << " must lower to a memref, got "
+                       << source.getType();
+      return failure();
+    }
+
+    SmallVector<int64_t> strides(shape.size(), 1);
+    for (int64_t i = static_cast<int64_t>(shape.size()) - 2; i >= 0; --i)
+      strides[i] = strides[i + 1] * shape[i + 1];
+
+    auto viewTy = MemRefType::get(shape, sourceTy.getElementType(),
+                                  MemRefLayoutAttrInterface{},
+                                  sourceTy.getMemorySpace());
+    SmallVector<int64_t> offsets{0};
+    Value view = rewriter.create<memref::ReinterpretCastOp>(
+        op.getLoc(), viewTy, source, ValueRange{}, ValueRange{}, ValueRange{},
+        offsets, shape, strides);
+    return view;
+  };
+
+  int64_t e = op.getNumExperts();
+  int64_t m = op.getMaxTokens();
+  int64_t n = op.getOutFeatures();
+  int64_t k = op.getInFeatures();
+  FailureOr<Value> weights =
+      createStaticView(adaptor.getWeights(), {e, 2 * n, k}, "weights");
+  FailureOr<Value> tokens =
+      createStaticView(adaptor.getTokens(), {m, k}, "tokens");
+  FailureOr<Value> tokenScale = createStaticView(
+      adaptor.getTokenScale(), {m, k / 32}, "token_scale");
+  FailureOr<Value> weightScale = createStaticView(
+      adaptor.getWeightScale(), {e, 2 * n, k / 32}, "weight_scale");
+  FailureOr<Value> counts = createStaticView(
+      adaptor.getTokensPerExpert(), {e}, "tokens_per_expert");
+  FailureOr<Value> output =
+      createStaticView(adaptor.getOutput(), {m, n}, "output");
+  FailureOr<Value> outputScale = createStaticView(
+      adaptor.getOutputScale(), {m, n / 32}, "output_scale");
+  if (failed(weights) || failed(tokens) || failed(tokenScale) ||
+      failed(weightScale) || failed(counts) || failed(output) ||
+      failed(outputScale))
+    return failure();
+
+  auto fused = rewriter.create<hivm::MixGroupMatmulOp>(
+      op.getLoc(), TypeRange{}, *weights, *tokens, *counts, *output,
+      ValueRange{*tokenScale, *weightScale}, ValueRange{*outputScale},
+      ValueRange{}, Value{}, Value{}, Value{}, Value{}, UnitAttr{}, UnitAttr{},
+      hivm::DescaleModeAttr{});
+  fused->setAttr("post_vector_func",
+                 rewriter.getStringAttr("swiglu_mx_quant"));
+  rewriter.eraseOp(op);
+  return success();
+}
+
 LogicalResult
 FlipOpConverter::matchAndRewrite(triton::ascend::FlipOp op, OpAdaptor adaptor,
                                  ConversionPatternRewriter &rewriter) const {

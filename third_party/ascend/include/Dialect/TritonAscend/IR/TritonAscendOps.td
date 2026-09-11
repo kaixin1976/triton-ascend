@@ -588,4 +588,90 @@ def DotOp : TT_Ascend_Op<"dot", [
     let hasVerifier = 1;
 }
 
+//
+// Grouped Dot Op
+//
+def GroupedDotOp : TT_Ascend_Op<"grouped_dot", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+]> {
+    let summary = "Dynamic-M grouped matrix multiplication for MoE experts";
+    let description = [{
+        Computes one matrix multiplication per expert over GM buffers.
+        `weights` has shape `[E, N, K]`, `tokens` has capacity shape
+        `[M_max, K]`, and `tokens_per_expert` has shape `[E]`. The runtime values in
+        `tokens_per_expert` define each expert's dynamic M dimension; tokens
+        are stored contiguously in expert order. `output` has shape
+        `[M_max, N]`. The shapes are compile-time attributes because Triton
+        kernel arguments carry scalar pointers rather than ranked GM tensors.
+
+        This operation lowers to `hivm.hir.mix_group_matmul`, allowing NPUIR
+        to select the grouped-matmul template instead of expanding the
+        workload into a Python-side task queue of independent `tl.dot`
+        operations.
+    }];
+
+    let arguments = (ins
+        TT_Ptr:$weights,
+        TT_Ptr:$tokens,
+        TT_Ptr:$tokens_per_expert,
+        TT_Ptr:$output,
+        I64Attr:$num_experts,
+        I64Attr:$max_tokens,
+        I64Attr:$out_features,
+        I64Attr:$in_features
+    );
+
+    let assemblyFormat = [{
+        $weights `,` $tokens `,` $tokens_per_expert `,` $output attr-dict
+        `:` type($weights) `,` type($tokens) `,` type($tokens_per_expert)
+        `,` type($output)
+    }];
+
+    let hasVerifier = 1;
+}
+
+//
+// Grouped Dot + SwiGLU + MX quantization Op
+//
+def GroupedDotSwiGLUMxOp : TT_Ascend_Op<"grouped_dot_swiglu_mx", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+]> {
+    let summary = "Dynamic-M FP8 grouped matmul with fused SwiGLU and MX quantization";
+    let description = [{
+        Computes expert grouped matmul over `weights[E, 2N, K]` and
+        `tokens[M_max, K]`, applies `SwiGLU(gate, up)`, and writes the
+        quantized result to `output[M_max, N]`. MX scales use groups of 32:
+        `token_scale[M_max, K/32]`, `weight_scale[E, 2N, K/32]`, and
+        `output_scale[M_max, N/32]`.
+
+        The operation lowers to fused `hivm.hir.mix_group_matmul` with
+        `post_vector_func = "swiglu_mx_quant"` so NPUIR can select a native
+        AIC/AIV pipeline rather than materializing the GMM1 result in GM.
+    }];
+
+    let arguments = (ins
+        TT_Ptr:$weights,
+        TT_Ptr:$tokens,
+        TT_Ptr:$token_scale,
+        TT_Ptr:$weight_scale,
+        TT_Ptr:$tokens_per_expert,
+        TT_Ptr:$output,
+        TT_Ptr:$output_scale,
+        I64Attr:$num_experts,
+        I64Attr:$max_tokens,
+        I64Attr:$out_features,
+        I64Attr:$in_features
+    );
+
+    let assemblyFormat = [{
+        $weights `,` $tokens `,` $token_scale `,` $weight_scale `,`
+        $tokens_per_expert `,` $output `,` $output_scale attr-dict
+        `:` type($weights) `,` type($tokens) `,` type($token_scale) `,`
+        type($weight_scale) `,` type($tokens_per_expert) `,` type($output) `,`
+        type($output_scale)
+    }];
+
+    let hasVerifier = 1;
+}
+
 #endif // TRITON_ASCEND_OPS

@@ -209,3 +209,24 @@ def dot(a: tl.tensor, b: tl.tensor, fractal_a: bool, fractal_b: bool, fractal_c:
     acc_ty = tl.float32 if in_ty.is_floating() else tl.int32
     output_ty = tl.block_type(acc_ty, output_shape)
     return tl.tensor(out, output_ty)
+
+
+def grouped_dot(weights: tl.tensor, tokens: tl.tensor,
+                tokens_per_expert: tl.tensor, output: tl.tensor,
+                num_experts: int, max_tokens: int, out_features: int,
+                in_features: int, _semantic=None) -> None:
+    _semantic.builder._ascend_builder.create_grouped_dot(
+        weights.handle, tokens.handle, tokens_per_expert.handle, output.handle,
+        num_experts, max_tokens, out_features, in_features)
+
+
+def grouped_dot_swiglu_mx(
+        weights: tl.tensor, tokens: tl.tensor, token_scale: tl.tensor,
+        weight_scale: tl.tensor, tokens_per_expert: tl.tensor,
+        output: tl.tensor, output_scale: tl.tensor, num_experts: int,
+        max_tokens: int, out_features: int, in_features: int,
+        _semantic=None) -> None:
+    _semantic.builder._ascend_builder.create_grouped_dot_swiglu_mx(
+        weights.handle, tokens.handle, token_scale.handle, weight_scale.handle,
+        tokens_per_expert.handle, output.handle, output_scale.handle,
+        num_experts, max_tokens, out_features, in_features)

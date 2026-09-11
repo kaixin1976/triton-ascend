@@ -1151,6 +1151,44 @@ void init_ascend_ir(py::module &&m) {
           py::arg("input"), py::arg("weight"), py::arg("bias"),
           py::arg("stride"), py::arg("padding"), py::arg("dilation"),
           py::arg("groups"), py::arg("output_type"))
+      .def(
+          "create_grouped_dot",
+          [](AscendNPUIROpBuilder &self, Value &weights, Value &tokens,
+             Value &tokensPerExpert, Value &output, int64_t numExperts,
+             int64_t maxTokens, int64_t outFeatures,
+             int64_t inFeatures) -> void {
+            auto &builder = self.getBuilder();
+            self.create<triton::ascend::GroupedDotOp>(
+                weights, tokens, tokensPerExpert, output,
+                builder.getI64IntegerAttr(numExperts),
+                builder.getI64IntegerAttr(maxTokens),
+                builder.getI64IntegerAttr(outFeatures),
+                builder.getI64IntegerAttr(inFeatures));
+          },
+          py::arg("weights"), py::arg("tokens"),
+          py::arg("tokens_per_expert"), py::arg("output"),
+          py::arg("num_experts"), py::arg("max_tokens"),
+          py::arg("out_features"), py::arg("in_features"))
+      .def(
+          "create_grouped_dot_swiglu_mx",
+          [](AscendNPUIROpBuilder &self, Value &weights, Value &tokens,
+             Value &tokenScale, Value &weightScale, Value &tokensPerExpert,
+             Value &output, Value &outputScale, int64_t numExperts,
+             int64_t maxTokens, int64_t outFeatures,
+             int64_t inFeatures) -> void {
+            auto &builder = self.getBuilder();
+            self.create<triton::ascend::GroupedDotSwiGLUMxOp>(
+                weights, tokens, tokenScale, weightScale, tokensPerExpert,
+                output, outputScale, builder.getI64IntegerAttr(numExperts),
+                builder.getI64IntegerAttr(maxTokens),
+                builder.getI64IntegerAttr(outFeatures),
+                builder.getI64IntegerAttr(inFeatures));
+          },
+          py::arg("weights"), py::arg("tokens"), py::arg("token_scale"),
+          py::arg("weight_scale"), py::arg("tokens_per_expert"),
+          py::arg("output"), py::arg("output_scale"),
+          py::arg("num_experts"), py::arg("max_tokens"),
+          py::arg("out_features"), py::arg("in_features"))
       // Add sort
       .def("create_sort",
            [](AscendNPUIROpBuilder &self, Value src, int64_t dim,

@@ -147,10 +147,12 @@ def _dot_scaled_test_fp4(
     scale_offs = tl.arange(0, K_SCALE)
 
     a = tl.load(a_ptr + m_offs[:, None] * K_PACKED + k_packed_offs[None, :])
-    a_scale = tl.load(a_scale_ptr + m_offs[:, None] * K_SCALE + scale_offs[None, :])
+    a_scale = tl.load(
+        a_scale_ptr + m_offs[:, None] * K_SCALE + scale_offs[None, :])
 
     b = tl.load(b_ptr + k_packed_offs[:, None] * N + n_offs[None, :])
-    b_scale = tl.load(b_scale_ptr + n_offs[:, None] * K_SCALE + scale_offs[None, :])
+    b_scale = tl.load(
+        b_scale_ptr + n_offs[:, None] * K_SCALE + scale_offs[None, :])
 
     acc = tl.dot_scaled(a, a_scale, "e2m1", b, b_scale, "e2m1")
 

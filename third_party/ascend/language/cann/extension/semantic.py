@@ -221,3 +221,24 @@ def conv2d(input_tensor: tl.tensor, weight_tensor: tl.tensor, bias: Union[tl.ten
     out = _semantic.builder.create_conv2d(input_tensor.handle, weight_tensor.handle, bias_handle, stride, padding,
                                           dilation, groups, output_ty.to_ir(_semantic.builder))
     return tl.tensor(out, output_ty)
+
+
+def grouped_dot(weights: tl.tensor, tokens: tl.tensor,
+                tokens_per_expert: tl.tensor, output: tl.tensor,
+                num_experts: int, max_tokens: int, out_features: int,
+                in_features: int, _semantic=None) -> None:
+    _semantic.builder._ascend_builder.create_grouped_dot(
+        weights.handle, tokens.handle, tokens_per_expert.handle, output.handle,
+        num_experts, max_tokens, out_features, in_features)
+
+
+def grouped_dot_swiglu_mx(
+        weights: tl.tensor, tokens: tl.tensor, token_scale: tl.tensor,
+        weight_scale: tl.tensor, tokens_per_expert: tl.tensor,
+        output: tl.tensor, output_scale: tl.tensor, num_experts: int,
+        max_tokens: int, out_features: int, in_features: int,
+        _semantic=None) -> None:
+    _semantic.builder._ascend_builder.create_grouped_dot_swiglu_mx(
+        weights.handle, tokens.handle, token_scale.handle, weight_scale.handle,
+        tokens_per_expert.handle, output.handle, output_scale.handle,
+        num_experts, max_tokens, out_features, in_features)

@@ -448,6 +448,13 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=True):
         return _serialize_module(mod, opt)
 
 
+# Triton and standalone BiShengIR are built from different LLVM revisions.
+# Bytecode v5+ serializes native operation properties positionally, whose
+# encoding is not stable across those revisions. Version 4 stores properties
+# in the named attribute dictionary and is therefore the transport contract.
+_BISHENGIR_INTERCHANGE_BYTECODE_VERSION = 4
+
+
 def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
     """
     Convert Linalg IR to MLIR Bytecode format using triton-mlir-opt.
@@ -466,11 +473,12 @@ def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
 
         triton_mlir_opt_path = _get_triton_mlir_opt_path()
 
-        # The --emit-bytecode flag ensures output is in BC format
+        # Keep the cross-LLVM boundary on the named-property bytecode format.
         subprocess.run([
             triton_mlir_opt_path,
             ttadapter_path,
             "--emit-bytecode",
+            f"--emit-bytecode-version={_BISHENGIR_INTERCHANGE_BYTECODE_VERSION}",
             "-o",
             bc_path,
         ], check=True, capture_output=True, text=True)

@@ -24,7 +24,8 @@ __all__ = [
     "ascend_address_space", "builtin", "CORE", "copy_from_ub_to_l1", "copy", "debug_barrier", "fixpipe",
     "FixpipeDMAMode", "FixpipeDualDstMode", "FixpipePreQuantMode", "FixpipePreReluMode", "int64", "is_builtin", "MODE",
     "PIPE", "SYNC_HINT", "EVENT_ID", "IteratorType", "sub_vec_id", "sub_vec_num", "sync_block_all", "sync_block_set",
-    "sync_block_wait", "SYNC_IN_VF", "conv1d", "dot", "conv2d"
+    "sync_block_wait", "SYNC_IN_VF", "conv1d", "dot", "conv2d", "grouped_dot",
+    "grouped_dot_swiglu_mx"
 ]
 
 import enum
@@ -833,3 +834,97 @@ def conv2d(input: tl.tensor, weight: tl.tensor, bias: tl.tensor = None, stride=N
         output_shape = [C_out, H_out_val, W_out_val]
 
     return semantic.conv2d(input, weight, bias, stride, padding_int, dilation, groups, output_shape, _semantic)
+
+
+@builtin
+def grouped_dot(weights: tl.tensor, tokens: tl.tensor,
+                tokens_per_expert: tl.tensor, output: tl.tensor,
+                num_experts: tl.constexpr, max_tokens: tl.constexpr,
+                out_features: tl.constexpr, in_features: tl.constexpr,
+                _semantic=None) -> None:
+    """Run dynamic-M grouped matmul directly over expert-major GM buffers."""
+    operands = {
+        "weights": weights,
+        "tokens": tokens,
+        "tokens_per_expert": tokens_per_expert,
+        "output": output,
+    }
+    for name, operand in operands.items():
+        if not isinstance(operand, tl.tensor) or not operand.type.is_ptr():
+            raise TypeError(
+                f"grouped_dot operand `{name}` must be a scalar pointer, "
+                f"got {getattr(operand, 'type', type(operand))}")
+
+    weight_dtype = weights.type.element_ty
+    token_dtype = tokens.type.element_ty
+    count_dtype = tokens_per_expert.type.element_ty
+    output_dtype = output.type.element_ty
+    if weight_dtype != token_dtype:
+        raise TypeError("grouped_dot weights and tokens must have the same pointee dtype")
+    if token_dtype != output_dtype:
+        raise TypeError("grouped_dot tokens and output must have the same pointee dtype")
+    if not count_dtype.is_int():
+        raise TypeError("grouped_dot tokens_per_expert must point to an integer dtype")
+
+    shape = tuple(_unwrap_if_constexpr(dim) for dim in
+                  (num_experts, max_tokens, out_features, in_features))
+    if any(not isinstance(dim, int) or dim <= 0 for dim in shape):
+        raise ValueError("grouped_dot E, M_max, N, and K must all be positive integers")
+    semantic.grouped_dot(weights, tokens, tokens_per_expert, output, *shape,
+                         _semantic=_semantic)
+
+
+@builtin
+def grouped_dot_swiglu_mx(
+        weights: tl.tensor, tokens: tl.tensor, token_scale: tl.tensor,
+        weight_scale: tl.tensor, tokens_per_expert: tl.tensor,
+        output: tl.tensor, output_scale: tl.tensor,
+        num_experts: tl.constexpr, max_tokens: tl.constexpr,
+        out_features: tl.constexpr, in_features: tl.constexpr,
+        _semantic=None) -> None:
+    """Run FP8 grouped matmul, SwiGLU and MX output quantization in one op."""
+    operands = {
+        "weights": weights,
+        "tokens": tokens,
+        "token_scale": token_scale,
+        "weight_scale": weight_scale,
+        "tokens_per_expert": tokens_per_expert,
+        "output": output,
+        "output_scale": output_scale,
+    }
+    for name, operand in operands.items():
+        if not isinstance(operand, tl.tensor) or not operand.type.is_ptr():
+            raise TypeError(
+                f"grouped_dot_swiglu_mx operand `{name}` must be a scalar "
+                f"pointer, got {getattr(operand, 'type', type(operand))}")
+
+    data_types = (
+        weights.type.element_ty, tokens.type.element_ty, output.type.element_ty)
+    if (not data_types[0].is_fp8() or data_types[0] != data_types[1] or
+            data_types[1] != data_types[2]):
+        raise TypeError(
+            "grouped_dot_swiglu_mx weights, tokens and output must have the "
+            "same FP8 pointee dtype")
+    for name, operand in (
+            ("token_scale", token_scale), ("weight_scale", weight_scale),
+            ("output_scale", output_scale)):
+        dtype = operand.type.element_ty
+        if not dtype.is_int() or dtype.primitive_bitwidth != 8:
+            raise TypeError(
+                f"grouped_dot_swiglu_mx {name} must point to an 8-bit integer")
+    if not tokens_per_expert.type.element_ty.is_int():
+        raise TypeError(
+            "grouped_dot_swiglu_mx tokens_per_expert must point to an "
+            "integer dtype")
+
+    shape = tuple(_unwrap_if_constexpr(dim) for dim in
+                  (num_experts, max_tokens, out_features, in_features))
+    if any(not isinstance(dim, int) or dim <= 0 for dim in shape):
+        raise ValueError(
+            "grouped_dot_swiglu_mx E, M_max, N, and K must be positive")
+    if shape[2] % 32 or shape[3] % 32:
+        raise ValueError(
+            "grouped_dot_swiglu_mx N and K must be divisible by 32")
+    semantic.grouped_dot_swiglu_mx(
+        weights, tokens, token_scale, weight_scale, tokens_per_expert,
+        output, output_scale, *shape, _semantic=_semantic)

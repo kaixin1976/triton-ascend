@@ -108,6 +108,93 @@ LogicalResult DotOp::verify() {
   return success();
 }
 
+LogicalResult GroupedDotOp::verify() {
+  auto weightsTy = cast<triton::PointerType>(getWeights().getType());
+  auto tokensTy = cast<triton::PointerType>(getTokens().getType());
+  auto countsTy = cast<triton::PointerType>(getTokensPerExpert().getType());
+  auto outputTy = cast<triton::PointerType>(getOutput().getType());
+  if (!countsTy.getPointeeType().isIntOrIndex())
+    return emitOpError("tokens_per_expert pointer must have an integer pointee");
+  if (weightsTy.getPointeeType() != tokensTy.getPointeeType())
+    return emitOpError("weights and tokens must have the same element type");
+  if (tokensTy.getPointeeType() != outputTy.getPointeeType())
+    return emitOpError("tokens and output must have the same element type");
+  if (getNumExperts() <= 0 || getMaxTokens() <= 0 || getOutFeatures() <= 0 ||
+      getInFeatures() <= 0)
+    return emitOpError("E, M_max, N, and K must all be positive");
+  return success();
+}
+
+void GroupedDotOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), &getWeightsMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getTokensMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(),
+                       &getTokensPerExpertMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getOutputMutable(),
+                       triton::GlobalMemory::get());
+}
+
+LogicalResult GroupedDotSwiGLUMxOp::verify() {
+  auto weightsTy = cast<triton::PointerType>(getWeights().getType());
+  auto tokensTy = cast<triton::PointerType>(getTokens().getType());
+  auto tokenScaleTy = cast<triton::PointerType>(getTokenScale().getType());
+  auto weightScaleTy = cast<triton::PointerType>(getWeightScale().getType());
+  auto countsTy = cast<triton::PointerType>(getTokensPerExpert().getType());
+  auto outputTy = cast<triton::PointerType>(getOutput().getType());
+  auto outputScaleTy = cast<triton::PointerType>(getOutputScale().getType());
+
+  Type dataType = weightsTy.getPointeeType();
+  if (!isa<Float8E4M3FNType, Float8E5M2Type>(dataType) ||
+      tokensTy.getPointeeType() != dataType ||
+      outputTy.getPointeeType() != dataType)
+    return emitOpError(
+        "weights, tokens and output must have the same FP8 pointee type");
+  auto isByteType = [](Type type) {
+    auto intType = dyn_cast<IntegerType>(type);
+    return intType && intType.getWidth() == 8;
+  };
+  if (!isByteType(tokenScaleTy.getPointeeType()) ||
+      !isByteType(weightScaleTy.getPointeeType()) ||
+      !isByteType(outputScaleTy.getPointeeType()))
+    return emitOpError(
+        "token_scale, weight_scale and output_scale must point to 8-bit "
+        "integers");
+  if (!countsTy.getPointeeType().isIntOrIndex())
+    return emitOpError("tokens_per_expert pointer must have an integer pointee");
+  if (getNumExperts() <= 0 || getMaxTokens() <= 0 || getOutFeatures() <= 0 ||
+      getInFeatures() <= 0)
+    return emitOpError("E, M_max, N, and K must all be positive");
+  if (getOutFeatures() % 32 != 0 || getInFeatures() % 32 != 0)
+    return emitOpError(
+        "N and K must be divisible by the MX scale group size 32");
+  return success();
+}
+
+void GroupedDotSwiGLUMxOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(), &getWeightsMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getTokensMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getTokenScaleMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getWeightScaleMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(),
+                       &getTokensPerExpertMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getOutputMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getOutputScaleMutable(),
+                       triton::GlobalMemory::get());
+}
+
 //-- IndexSelectSimdOp --
 LogicalResult IndexSelectSimdOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,

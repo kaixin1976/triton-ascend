@@ -44,6 +44,8 @@ from .core import (
     conv1d,
     dot,
     conv2d,
+    grouped_dot,
+    grouped_dot_swiglu_mx,
 )
 
 from .scope import scope
@@ -164,4 +166,6 @@ __all__ = [
 
     # dot ops
     "dot",
+    "grouped_dot",
+    "grouped_dot_swiglu_mx",
 ]

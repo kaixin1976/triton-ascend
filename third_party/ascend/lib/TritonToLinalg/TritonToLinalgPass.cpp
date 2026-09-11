@@ -1186,6 +1186,10 @@ void TritonToLinalgPass::convertTTFunc(triton::FuncOp func, const bool existDot,
   if (autoBlockifyAttr)
     funcFunc->setAttr("auto_blockify_size", autoBlockifyAttr);
 
+  auto coreRatioAttr = func->getAttr("hivm.core_ratio");
+  if (coreRatioAttr)
+    funcFunc->setAttr("hivm.core_ratio", coreRatioAttr);
+
   auto &funcFuncBody = funcFunc.getBody();
   auto &funcBody = func.getBody();
 
@@ -1596,6 +1600,9 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::DevicePrintConverter>(patterns.getContext());
   patterns.add<TTOpConverters::MatmulConverter>(patterns.getContext());
   patterns.add<TTOpConverters::DotConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::GroupedDotConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::GroupedDotSwiGLUMxConverter>(
+      patterns.getContext());
   patterns.add<TTOpConverters::DotScaledConverter>(patterns.getContext());
   patterns.add<TTOpConverters::PtrToIntConverter>(patterns.getContext());
   patterns.add<TTOpConverters::IntToPtrConverter>(typeConverter,
@@ -1847,7 +1854,9 @@ void TritonToLinalgPass::runOnOperation() {
   });
   moduleOp.walk([&](Operation *op) {
     if (isa<triton::DotOp, triton::DotScaledOp, triton::ascend::DotOp,
-            hfusion::Conv1DOp, hfusion::Conv2DOp>(op)) {
+            triton::ascend::GroupedDotOp,
+            triton::ascend::GroupedDotSwiGLUMxOp, hfusion::Conv1DOp,
+            hfusion::Conv2DOp>(op)) {
       existDot = true;
       return WalkResult::interrupt();
     }

@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import warnings
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,6 +23,31 @@ def reset_option_warnings(monkeypatch):
 @pytest.fixture(params=["Ascend910B1", "Ascend910_9581"])
 def backend(request):
     return compiler.AscendBackend(GPUTarget("npu", request.param, 32))
+
+
+def test_linalg_to_bc_uses_cross_llvm_compatible_bytecode(monkeypatch, tmp_path):
+    tool = tmp_path / "triton-mlir-opt"
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        output = command[command.index("-o") + 1]
+        with open(output, "wb") as stream:
+            stream.write(b"MLIR-v4")
+
+    monkeypatch.setattr(compiler, "_get_triton_mlir_opt_path", lambda: str(tool))
+    monkeypatch.setattr(compiler.subprocess, "run", fake_run)
+
+    result = compiler.linalg_to_bc_by_triton_mlir_opt(
+        "module {}", {}, SimpleNamespace(debug=False)
+    )
+
+    assert result == b"MLIR-v4"
+    assert len(calls) == 1
+    command, kwargs = calls[0]
+    assert "--emit-bytecode" in command
+    assert "--emit-bytecode-version=4" in command
+    assert kwargs == {"check": True, "capture_output": True, "text": True}
 
 
 def _make_torch_npu_mock(cfg_dir):

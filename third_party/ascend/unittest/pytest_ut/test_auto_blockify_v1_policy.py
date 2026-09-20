@@ -26,6 +26,7 @@ import pytest
 from triton.backends.ascend.compiler import (
     _build_costmodel_analysis_ttir,
     _can_materialize_scope_superblock,
+    _default_auto_simt_profile_name,
     _publish_route_transform_capability,
     _resolve_auto_blockify_v1_policy,
     _selected_npuir_superblock_factor,
@@ -35,6 +36,19 @@ SAFE_TTIR = "module { tt.func public @safe() { tt.return } }"
 ATOMIC_TTIR = "module { tt.func public @atomic() { %0 = tt.atomic_rmw add } }"
 CACHE_MODIFIER_TTIR = (
     'module { tt.func public @cached() { tt.store %ptr, %value {cacheModifier = 1 : i32} : tensor<8x!tt.ptr<f16>> } }')
+
+
+@pytest.mark.parametrize(
+    "arch,expected",
+    [
+        ("Ascend950DT_9582", "simd_simt/ascend_950dt_simd_simt_v1.json"),
+        ("ascend950dt_9589", "simd_simt/ascend_950dt_simd_simt_v1.json"),
+        ("Ascend950PR_9579", "simd_simt/ascend_950pr_simd_simt_v1.json"),
+        ("dav-c310", "simd_simt/ascend_950pr_simd_simt_v1.json"),
+    ],
+)
+def test_default_auto_simt_profile_is_product_specific(arch, expected):
+    assert _default_auto_simt_profile_name(arch) == expected
 
 
 @pytest.mark.parametrize(
@@ -89,7 +103,13 @@ def test_route_transform_capability_is_single_resolved_fact():
         "auto_blockify_v1_enabled": True,
         "auto_blockify_v1_disable_reasons": [],
     }
-    opt = SimpleNamespace(compile_on_910_95=True, num_warps=4, logical_program_count_hint=9)
+    opt = SimpleNamespace(
+        compile_on_910_95=True,
+        num_warps=4,
+        logical_program_count_hint=9,
+        physical_vector_core_count_hint=4,
+        physical_aicore_count_hint=2,
+    )
     capability = __import__("json").loads(_publish_route_transform_capability(metadata, opt))
     assert capability["layout_coalescing_applied"]
     assert capability["layout_coalescing_factor"] == 8
@@ -98,10 +118,10 @@ def test_route_transform_capability_is_single_resolved_fact():
     assert capability["scope_superblock_factors"] == [1, 2, 4]
     assert capability["source_logical_program_count_hint"] == 9
     assert capability["logical_program_count_hint"] == 2
-    assert capability["superblock_runtime_groups"]["4"] == {
-        "full_group_count": 0,
-        "tail_count": 2,
-    }
+    assert capability["schema_version"] == 2
+    assert capability["physical_vector_core_count_hint"] == 4
+    assert capability["physical_aicore_count_hint"] == 2
+    assert "runtime_schedules" not in capability
 
 
 @pytest.mark.parametrize(
@@ -148,7 +168,7 @@ def test_costmodel_analysis_view_materializes_v1_only_on_clone():
     original = SimpleNamespace(context=object())
     analysis = SimpleNamespace()
     with patch("triton.backends.ascend.compiler._parse_ttir_text", return_value=analysis) as parse, \
-         patch("triton.backends.ascend.compiler._run_ta_simt_auto_blockify_v1", return_value=True) as run_v1:
+         patch("triton.backends.ascend.compiler._run_ta_auto_blockify_v1", return_value=True) as run_v1:
         result = _build_costmodel_analysis_ttir(original, metadata, SimpleNamespace())
     parse.assert_called_once()
     run_v1.assert_called_once()

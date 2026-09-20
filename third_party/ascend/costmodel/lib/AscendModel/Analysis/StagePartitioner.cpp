@@ -24,9 +24,12 @@ using namespace mlir::ascend;
 namespace {
 
 static void recomputeIssueElements(StageWorkload &work) {
-  double elements = work.scalarOperations + work.predicateElements;
-  for (const auto &entry : work.operationElements)
-    elements += entry.second;
+  double elements = work.scalarOperations;
+  for (const auto &[size, count] : work.predicateCounts)
+    elements += static_cast<double>(size) * count;
+  for (const auto &entry : work.operationCounts)
+    for (const auto &[size, count] : entry.second)
+      elements += static_cast<double>(size) * count;
   elements += 32.0 * (work.loadWarpInstructions + work.storeWarpInstructions);
   work.issueElements = elements;
 }
@@ -159,9 +162,20 @@ static void accumulateDotWorkload(Operation *operation, StageWorkload &work) {
   const int64_t m = lhs.getShape()[lhs.getRank() - 2];
   const int64_t k = lhs.getShape()[lhs.getRank() - 1];
   const int64_t n = rhs.getShape()[rhs.getRank() - 1];
-  if (m > 0 && n > 0 && k > 0)
-    work.dotFlops += 2.0 * static_cast<double>(m) * static_cast<double>(n) *
-                     static_cast<double>(k);
+  double batch = 1.0;
+  for (int64_t dim : lhs.getShape().drop_back(2))
+    batch *= static_cast<double>(dim);
+  if (m > 0 && n > 0 && k > 0) {
+    // Keep the shape key exact.  Do not let a malformed or merely enormous
+    // static tensor wrap the FLOP key and turn a non-tiny dot into a tiny one.
+    const __int128 product = static_cast<__int128>(2) * m * n * k;
+    if (product > std::numeric_limits<int64_t>::max())
+      return;
+    const int64_t flopsPerMatrix = static_cast<int64_t>(product);
+    work.dotOperations += batch;
+    work.dotFlopCounts[flopsPerMatrix] += batch;
+    work.dotFlops += static_cast<double>(flopsPerMatrix) * batch;
+  }
 }
 
 static void accumulateReductionWorkload(Operation *operation,
@@ -180,9 +194,21 @@ static void accumulateReductionWorkload(Operation *operation,
   const int64_t extent = input.getShape()[dimension];
   if (extent <= 1)
     return;
+  if (operation->getName().getStringRef() == "tt.scan") {
+    const int64_t totalElements = input.getNumElements();
+    const int64_t independentSequences = totalElements / extent;
+    if (independentSequences > 0)
+      work.prefixScanCounts[{extent, independentSequences}] += 1.0;
+    return;
+  }
   const double depth = std::ceil(std::log2(static_cast<double>(extent)));
   work.shuffleLaneSteps += getTypeElementCount(input) * depth;
 }
+
+static bool blockPointerCanUseFlatMemoryCurve(Value pointer, Type valueType);
+static StageMemoryAccess describeMemoryAccess(Operation *operation,
+                                              Value pointer, Type valueType,
+                                              bool store);
 
 static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
   if (!operation || operation->hasTrait<OpTrait::IsTerminator>())
@@ -193,26 +219,53 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
   if ((name == "tt.load" || name == "tt.gather") &&
       operation->getNumResults() > 0) {
     Value result = operation->getResult(0);
-    work.loadBytes += getValueBytes(result);
-    work.loadWarpInstructions += std::ceil(elements / 32.0);
+    const int64_t warpInstructions =
+        static_cast<int64_t>(std::ceil(elements / 32.0));
+    const double bytes = getValueBytes(result);
+    work.loadBytes += bytes;
+    work.loadOperations += 1.0;
+    work.loadWarpInstructions += warpInstructions;
+    work.memoryAccesses.push_back(
+        describeMemoryAccess(operation, operation->getOperand(0),
+                             result.getType(), /*store=*/false));
+    if (name == "tt.gather" || isLoadedIndexDependentMemoryOp(operation))
+      work.indirectLoadCounts[{static_cast<int64_t>(std::llround(bytes)),
+                               static_cast<int64_t>(elements)}] += 1.0;
+    else if (blockPointerCanUseFlatMemoryCurve(operation->getOperand(0),
+                                               result.getType()))
+      work.continuousLoadCounts[{static_cast<int64_t>(std::llround(bytes)),
+                                 static_cast<int64_t>(elements)}] += 1.0;
     return;
   }
   if ((name == "tt.store" || name.starts_with("tt.atomic")) &&
       operation->getNumOperands() > 1) {
     Value value = operation->getOperand(1);
     work.storeBytes += getValueBytes(value);
-    work.storeWarpInstructions +=
-        std::ceil(getTypeElementCount(value.getType()) / 32.0);
+    work.storeOperations += 1.0;
+    const int64_t warpInstructions = static_cast<int64_t>(
+        std::ceil(getTypeElementCount(value.getType()) / 32.0));
+    work.storeWarpInstructions += warpInstructions;
+    work.memoryAccesses.push_back(
+        describeMemoryAccess(operation, operation->getOperand(0),
+                             value.getType(), /*store=*/true));
+    if (name == "tt.store" && blockPointerCanUseFlatMemoryCurve(
+                                  operation->getOperand(0), value.getType()))
+      work.continuousStoreCounts[{
+          getValueBytes(value),
+          static_cast<int64_t>(getTypeElementCount(value.getType()))}] += 1.0;
     return;
   }
   if (name == "tt.dot") {
     accumulateDotWorkload(operation, work);
     return;
   }
-  if (name == "tt.reduce" || name == "tt.scan")
+  if (name == "tt.reduce" || name == "tt.scan") {
     accumulateReductionWorkload(operation, work);
+    if (name == "tt.scan")
+      return;
+  }
   if (name == "arith.cmpi" || name == "arith.cmpf") {
-    work.predicateElements += elements;
+    work.predicateCounts[static_cast<int64_t>(elements)] += 1.0;
     return;
   }
   if (name == "scf.for" || name == "scf.if" || name == "scf.while")
@@ -222,7 +275,8 @@ static void accumulateOneOperation(Operation *operation, StageWorkload &work) {
     work.scalarOperations += 1.0;
     return;
   }
-  work.operationElements[getProfileOperationName(operation)] += elements;
+  work.operationCounts[getProfileOperationName(operation)]
+                      [static_cast<int64_t>(elements)] += 1.0;
 }
 
 static void mergeWorkload(StageWorkload &into, StageWorkload from);
@@ -231,14 +285,34 @@ static void scaleWorkload(StageWorkload &work, double scale) {
   work.scalarOperations *= scale;
   work.loadBytes *= scale;
   work.storeBytes *= scale;
+  work.loadOperations *= scale;
+  work.storeOperations *= scale;
   work.loadWarpInstructions *= scale;
   work.storeWarpInstructions *= scale;
-  work.predicateElements *= scale;
+  for (auto &access : work.memoryAccesses)
+    access.count *= scale;
+  for (auto &[size, count] : work.indirectLoadCounts)
+    count *= scale;
+  for (auto &[size, count] : work.continuousLoadCounts)
+    count *= scale;
+  for (auto &[size, count] : work.continuousStoreCounts)
+    count *= scale;
+  for (auto &[size, count] : work.predicateCounts)
+    count *= scale;
+  for (auto &[shape, count] : work.prefixScanCounts)
+    count *= scale;
   work.shuffleLaneSteps *= scale;
+  work.dotOperations *= scale;
+  for (auto &[flops, count] : work.dotFlopCounts)
+    count *= scale;
   work.dotFlops *= scale;
-  work.estimatedSpillTransactions *= scale;
-  for (auto &entry : work.operationElements)
-    entry.second *= scale;
+  work.loopBackedges *= scale;
+  work.conditionalBranches *= scale;
+  work.divergentBranches *= scale;
+  work.synchronizations *= scale;
+  for (auto &entry : work.operationCounts)
+    for (auto &[size, count] : entry.second)
+      count *= scale;
   recomputeIssueElements(work);
 }
 
@@ -252,21 +326,152 @@ static std::optional<int64_t> getConstantInteger(Value value) {
   return attribute.getInt();
 }
 
+static int64_t getElementBits(Type type) {
+  type = getScalarElementType(type);
+  if (auto integer = dyn_cast<IntegerType>(type))
+    return integer.getWidth();
+  if (auto floating = dyn_cast<FloatType>(type))
+    return floating.getWidth();
+  if (type.isIndex())
+    return 64;
+  return 0;
+}
+
+static bool isPredicateType(Type type) {
+  type = getScalarElementType(type);
+  auto integer = dyn_cast<IntegerType>(type);
+  return integer && integer.getWidth() == 1;
+}
+
+static StageMemoryAccess describeMemoryAccess(Operation *operation,
+                                              Value pointer, Type valueType,
+                                              bool store) {
+  StageMemoryAccess access;
+  access.store = store;
+  access.elementBits = getElementBits(valueType);
+  if (auto shaped = dyn_cast<ShapedType>(valueType))
+    if (shaped.hasStaticShape())
+      access.shape.assign(shaped.getShape().begin(), shaped.getShape().end());
+  if (access.shape.empty())
+    access.shape.push_back(1);
+
+  Operation *definition = pointer.getDefiningOp();
+  while (definition && definition->getName().getStringRef() == "tt.advance") {
+    pointer = definition->getOperand(0);
+    definition = pointer.getDefiningOp();
+  }
+  const int64_t rank = static_cast<int64_t>(access.shape.size());
+  access.strides.resize(access.shape.size());
+  if (definition && definition->getName().getStringRef() ==
+                        "tt.make_tensor_ptr" &&
+      definition->getNumOperands() == 1 + 3 * rank) {
+    for (int64_t axis = 0; axis < rank; ++axis)
+      access.strides[axis] = getConstantInteger(
+          definition->getOperand(1 + rank + axis));
+  }
+  access.masked = llvm::any_of(operation->getOperands(), [](Value operand) {
+    return isPredicateType(operand.getType());
+  });
+  if (auto boundary = operation->getAttrOfType<DenseI32ArrayAttr>("boundaryCheck"))
+    access.masked |= !boundary.empty();
+  if (auto boundary = operation->getAttrOfType<DenseI32ArrayAttr>("boundary_check"))
+    access.masked |= !boundary.empty();
+  return access;
+}
+
+/// A unit inner stride does not make a rectangular block a flat transfer.
+/// Require the block-pointer strides to describe a packed tile (allowing axis
+/// permutations and ignoring singleton axes). Unknown strides retain the
+/// analytical workload; they are not evidence for the measured flat curve.
+/// Tensor-of-pointer analysis remains separate from this block-pointer check.
+static bool blockPointerCanUseFlatMemoryCurve(Value pointer, Type valueType) {
+  Operation *definition = pointer.getDefiningOp();
+  while (definition && definition->getName().getStringRef() == "tt.advance") {
+    pointer = definition->getOperand(0);
+    definition = pointer.getDefiningOp();
+  }
+  // Plain pointers and tensor-of-pointer accesses do not carry a complete
+  // rectangular descriptor.  Keep them on the analytical/indirect path;
+  // applying a flat measured curve here was the source of the old S6/S22
+  // under-modeling.
+  if (!definition ||
+      definition->getName().getStringRef() != "tt.make_tensor_ptr")
+    return false;
+  auto type = dyn_cast<RankedTensorType>(valueType);
+  if (!type || !type.hasStaticShape())
+    return false;
+  const int64_t rank = type.getRank();
+  // make_tensor_ptr operands: base, rank shapes, rank strides, rank offsets.
+  if (definition->getNumOperands() != 1 + 3 * rank)
+    return false;
+  std::vector<std::pair<int64_t, int64_t>> dimensions;
+  for (int64_t axis = 0; axis < rank; ++axis) {
+    const int64_t extent = type.getDimSize(axis);
+    if (extent == 1)
+      continue;
+    auto stride = getConstantInteger(definition->getOperand(1 + rank + axis));
+    if (!stride || *stride <= 0 || extent <= 0)
+      return false;
+    dimensions.emplace_back(*stride, extent);
+  }
+  llvm::sort(dimensions);
+  __int128 expectedStride = 1;
+  for (auto [stride, extent] : dimensions) {
+    if (stride != expectedStride)
+      return false;
+    expectedStride *= extent;
+  }
+  return true;
+}
+
+// A signed minimum supplies an upper bound even when its other operand is
+// runtime-dependent. Do not treat unsigned min, casts or arbitrary arithmetic
+// as signed bounds. The recursion limit also bounds analysis cost.
+static std::optional<int64_t> getSignedUpperBound(Value value,
+                                                  unsigned depth = 0) {
+  if (auto constant = getConstantInteger(value))
+    return constant;
+  Operation *definition = value.getDefiningOp();
+  if (!definition || depth >= 8 ||
+      definition->getName().getStringRef() != "arith.minsi" ||
+      definition->getNumOperands() != 2)
+    return std::nullopt;
+  auto left = getSignedUpperBound(definition->getOperand(0), depth + 1);
+  auto right = getSignedUpperBound(definition->getOperand(1), depth + 1);
+  if (left && right)
+    return std::min(*left, *right);
+  return left ? left : right;
+}
+
 static int64_t getLoopTripCount(Operation *operation,
-                                int64_t stageIterationCount) {
+                                int64_t stageIterationCount,
+                                StageModelFeatures *estimates = nullptr) {
   const llvm::StringRef name = operation->getName().getStringRef();
   if (name == "scf.for" && operation->getNumOperands() >= 3) {
     const std::optional<int64_t> lower =
         getConstantInteger(operation->getOperand(0));
-    const std::optional<int64_t> upper =
-        getConstantInteger(operation->getOperand(1));
+    const auto exactUpper = getConstantInteger(operation->getOperand(1));
+    const auto upper = getSignedUpperBound(operation->getOperand(1));
     const std::optional<int64_t> step =
         getConstantInteger(operation->getOperand(2));
-    if (lower && upper && step && *step > 0 && *upper > *lower)
-      return (*upper - *lower + *step - 1) / *step;
+    if (lower && upper && step && *step > 0) {
+      // Unsigned subtraction avoids signed overflow for wide integer bounds.
+      const uint64_t distance =
+          *upper > *lower ? uint64_t(*upper) - uint64_t(*lower) : 0;
+      const uint64_t count =
+          distance / uint64_t(*step) + (distance % uint64_t(*step) != 0);
+      if (count <= uint64_t(std::numeric_limits<int64_t>::max())) {
+        if (estimates && !exactUpper && count != 0)
+          ++estimates->upperBoundLoopCount;
+        return static_cast<int64_t>(count);
+      }
+    }
   }
-  if (name == "scf.for" || name == "scf.while")
+  if (name == "scf.for" || name == "scf.while") {
+    if (estimates)
+      ++estimates->unknownTripCountLoopCount;
     return std::max<int64_t>(1, stageIterationCount);
+  }
   return 1;
 }
 
@@ -280,24 +485,35 @@ static int64_t getLoopTripCount(Operation *operation,
 static void accumulateDynamicOperationTree(Operation *operation,
                                            StageWorkload &work,
                                            double multiplicity,
-                                           int64_t fallbackLoopTripCount) {
+                                           int64_t fallbackLoopTripCount,
+                                           StageModelFeatures &estimates) {
   if (!operation)
     return;
   StageWorkload local;
   accumulateOneOperation(operation, local);
+  const llvm::StringRef name = operation->getName().getStringRef();
+  const bool schedulingLoop = operation->hasAttr("ta.auto_blockify_v1.loop");
+  const double trips = schedulingLoop
+                           ? 1.0
+                           : static_cast<double>(getLoopTripCount(
+                                 operation, fallbackLoopTripCount, &estimates));
+  if (name == "scf.for" || name == "scf.while")
+    local.loopBackedges = trips;
+  if (name == "scf.if" || name == "cf.cond_br")
+    local.conditionalBranches = local.divergentBranches = 1.0;
+  if (name.contains("barrier") || name.contains("sync"))
+    local.synchronizations = 1.0;
   scaleWorkload(local, multiplicity);
   mergeWorkload(work, std::move(local));
 
-  if (operation->hasAttr("ta.auto_blockify_v1.loop"))
+  if (schedulingLoop)
     return;
-  const double childMultiplicity =
-      multiplicity *
-      static_cast<double>(getLoopTripCount(operation, fallbackLoopTripCount));
+  const double childMultiplicity = multiplicity * trips;
   for (Region &region : operation->getRegions())
     for (Block &block : region)
       for (Operation &nested : block.getOperations())
         accumulateDynamicOperationTree(&nested, work, childMultiplicity,
-                                       fallbackLoopTripCount);
+                                       fallbackLoopTripCount, estimates);
 }
 
 static int64_t countAlgorithmLoops(const LogicalStage &stage) {
@@ -319,14 +535,34 @@ static void mergeWorkload(StageWorkload &into, StageWorkload from) {
   into.scalarOperations += from.scalarOperations;
   into.loadBytes += from.loadBytes;
   into.storeBytes += from.storeBytes;
+  into.loadOperations += from.loadOperations;
+  into.storeOperations += from.storeOperations;
   into.loadWarpInstructions += from.loadWarpInstructions;
   into.storeWarpInstructions += from.storeWarpInstructions;
-  into.predicateElements += from.predicateElements;
+  into.memoryAccesses.insert(into.memoryAccesses.end(), from.memoryAccesses.begin(),
+                             from.memoryAccesses.end());
+  for (const auto &[size, count] : from.indirectLoadCounts)
+    into.indirectLoadCounts[size] += count;
+  for (const auto &[size, count] : from.continuousLoadCounts)
+    into.continuousLoadCounts[size] += count;
+  for (const auto &[size, count] : from.continuousStoreCounts)
+    into.continuousStoreCounts[size] += count;
+  for (const auto &[size, count] : from.predicateCounts)
+    into.predicateCounts[size] += count;
+  for (const auto &[shape, count] : from.prefixScanCounts)
+    into.prefixScanCounts[shape] += count;
   into.shuffleLaneSteps += from.shuffleLaneSteps;
+  into.dotOperations += from.dotOperations;
+  for (const auto &[flops, count] : from.dotFlopCounts)
+    into.dotFlopCounts[flops] += count;
   into.dotFlops += from.dotFlops;
-  into.estimatedSpillTransactions += from.estimatedSpillTransactions;
-  for (const auto &[name, elements] : from.operationElements)
-    into.operationElements[name] += elements;
+  into.loopBackedges += from.loopBackedges;
+  into.conditionalBranches += from.conditionalBranches;
+  into.divergentBranches += from.divergentBranches;
+  into.synchronizations += from.synchronizations;
+  for (const auto &[name, counts] : from.operationCounts)
+    for (const auto &[size, count] : counts)
+      into.operationCounts[name][size] += count;
   recomputeIssueElements(into);
 }
 
@@ -499,6 +735,19 @@ static bool operationTreeHasAnyName(Operation *root,
   });
 }
 
+static bool operationTreeHasVectorCompute(Operation *root) {
+  bool found = false;
+  root->walk([&](Operation *operation) {
+    // A one-element tensor is still vector work; a scalar arith.subf is not.
+    // Use IR semantics rather than a subf/name/profile whitelist. Constants
+    // and shape construction are not executed elementwise arithmetic.
+    found |= hasTensorResult(operation) &&
+             operation->hasTrait<OpTrait::Elementwise>() &&
+             !operation->hasTrait<OpTrait::ConstantLike>();
+  });
+  return found;
+}
+
 /// Classify one transitive semantic ownership unit.  This function consumes
 /// only TTIR structure; it does not inspect a kernel name, workload name,
 /// measured performance, or route score.
@@ -537,6 +786,8 @@ static StageCostModelKind classifySemanticRoot(Operation *root) {
     return StageCostModelKind::IndexGeneration;
   if (operationTreeHasAnyName(root, {"scf.if", "cf.cond_br"}))
     return StageCostModelKind::ScalarControl;
+  if (operationTreeHasVectorCompute(root))
+    return StageCostModelKind::VectorIssue;
   return StageCostModelKind::ScalarIssue;
 }
 
@@ -670,12 +921,19 @@ static void deriveStageLiveValues(StagePartition &partition) {
 static void deriveLocalSimtScopeTraffic(StagePartition &partition,
                                         const SimtAnchorPlan &anchorPlan) {
   for (LogicalStage &stage : partition.stages) {
-    stage.localSimtScopeCount = 0;
     stage.scopeInputTensorBytes = 0;
     stage.scopeOutputTensorBytes = 0;
     auto merged = mergeSimtStageAnchors(anchorPlan, stage.simtAnchorIndices);
-    if (!merged)
+    if (!merged) {
+      // The selector materializes exactly the same merged descriptor.  A
+      // Stage whose anchors cannot form one compound scope must not remain a
+      // scored Mixed candidate and fail only after route selection.
+      stage.localSimtMaterializable = false;
+      stage.localSuperblockMaterializable = false;
+      stage.localSimtFactors.clear();
+      stage.simtAnchorIndices.clear();
       continue;
+    }
     {
       const SimtAnchorDescriptor &anchor = *merged;
       llvm::SmallVector<Operation *> roots;
@@ -728,9 +986,8 @@ static void deriveLocalSimtScopeTraffic(StagePartition &partition,
         continue;
       }
 
-      ++stage.localSimtScopeCount;
-      stage.scopeInputTensorBytes += staticTensorBytes(captured.getArrayRef());
-      stage.scopeOutputTensorBytes += staticTensorBytes(returned.getArrayRef());
+      stage.scopeInputTensorBytes = staticTensorBytes(captured.getArrayRef());
+      stage.scopeOutputTensorBytes = staticTensorBytes(returned.getArrayRef());
     }
   }
 }
@@ -823,6 +1080,8 @@ static int semanticKindPriority(StageCostModelKind kind) {
   case StageCostModelKind::ContinuousShortLoad:
   case StageCostModelKind::CachePolicyStore:
     return 30;
+  case StageCostModelKind::VectorIssue:
+    return 25;
   case StageCostModelKind::PredicateMask:
   case StageCostModelKind::LoopPredicate:
     return 20;
@@ -833,7 +1092,7 @@ static int semanticKindPriority(StageCostModelKind kind) {
   }
 }
 
-/// Scalar/index/predicate work is a supporting resource of a Stage, rather
+/// Scalar/vector/index/predicate work is a supporting resource of a Stage, rather
 /// than necessarily a Stage boundary of its own.  StageCostModel accounts for
 /// those resources inside every dominant model.  Keeping this distinction
 /// here prevents one Triton statement such as a masked load from being split
@@ -843,6 +1102,7 @@ static bool isSupportingSemanticKind(StageCostModelKind kind) {
   case StageCostModelKind::ScalarIssue:
   case StageCostModelKind::ScalarControl:
   case StageCostModelKind::ScalarMath:
+  case StageCostModelKind::VectorIssue:
   case StageCostModelKind::IndexGeneration:
   case StageCostModelKind::PredicateMask:
   case StageCostModelKind::LoopPredicate:
@@ -1028,18 +1288,13 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
     for (Operation *root : stage.operations)
       collectOwnedOperationTree(root, owned);
     bool hasMemory = false;
-    int64_t algorithmLoopCount = 0;
-    if (stage.costModelKind != StageCostModelKind::AutoBlockifyDispatch &&
-        stage.costModelKind != StageCostModelKind::AutoBlockifyLoop)
-      for (Operation *root : stage.operations)
-        facts.replicatedByLocalSuperBlock |= isInsideAutoBlockifyV1Loop(root);
+    for (Operation *root : stage.operations)
+      facts.insideAutoBlockifyV1Loop |= isInsideAutoBlockifyV1Loop(root);
     for (Operation *operation : owned) {
       const llvm::StringRef name = operation->getName().getStringRef();
       if (name == "scf.for" || name == "scf.while") {
         facts.hasLoop = true;
         ++facts.loopBackedgeCount;
-        if (!operation->hasAttr("ta.auto_blockify_v1.loop"))
-          ++algorithmLoopCount;
         if (!operation->hasAttr("ta.auto_blockify_v1.loop") &&
             operation->getNumRegions() > 0 &&
             !operation->getRegion(0).empty()) {
@@ -1087,17 +1342,6 @@ llvm::Error StageFeatureAnalysis::analyze(StagePartition &partition) const {
           name.contains("pack") || name.contains("unpack");
     }
     facts.hasContiguousMemory = hasMemory && !facts.hasIndirectMemory;
-    if (algorithmLoopCount > 0 && stage.iterationCount > 1) {
-      if (facts.hasLoopCarriedDataDependency)
-        facts.parallelRecurrenceGroupCount = algorithmLoopCount;
-      facts.loopBackedgeCount = 1;
-      facts.conditionalBranchCount =
-          std::max<int64_t>(facts.conditionalBranchCount > 0 ? 1 : 0,
-                            facts.conditionalBranchCount / algorithmLoopCount);
-      facts.divergentBranchCount =
-          std::max<int64_t>(facts.divergentBranchCount > 0 ? 1 : 0,
-                            facts.divergentBranchCount / algorithmLoopCount);
-    }
     if (!facts.isValid())
       return llvm::createStringError(std::errc::invalid_argument,
                                      "Stage '%s' has invalid features",
@@ -1157,12 +1401,24 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
         return StageCostModelKind::PrefixScan;
       if (facts.hasReduction)
         return StageCostModelKind::RowwiseReduction;
-      if (facts.hasDot)
-        return stage.workload.dotFlops * stage.iterationCount <=
-                       static_cast<double>(
-                           std::max<int64_t>(1, tinyDotFlopsMax))
-                   ? StageCostModelKind::TinyCubeRoofline
-                   : StageCostModelKind::CubeRoofline;
+      if (facts.hasDot) {
+        const int64_t tinyLimit = std::max<int64_t>(1, tinyDotFlopsMax);
+        // `dotFlops` is the sum of all matrix instances in this Stage.  A
+        // chain of nine 16x16x16 dots is still a tiny-dot workload even
+        // though its aggregate FLOPs exceed the limit.  Prefer the exact
+        // per-matrix shape map; retain the aggregate fallback for synthetic
+        // StagePartition unit tests that construct workload by hand.
+        const bool allMatricesTiny =
+            !stage.workload.dotFlopCounts.empty()
+                ? llvm::all_of(stage.workload.dotFlopCounts,
+                               [&](const auto &entry) {
+                                 return entry.first <= tinyLimit;
+                               })
+                : stage.workload.dotFlops * stage.iterationCount <=
+                      static_cast<double>(tinyLimit);
+        return allMatricesTiny ? StageCostModelKind::TinyCubeRoofline
+                               : StageCostModelKind::CubeRoofline;
+      }
       if (facts.hasLoop)
         return StageCostModelKind::IndependentPipelinedLoop;
       if (facts.hasIndirectMemory)
@@ -1174,6 +1430,14 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
                        stage.workload.loadBytes == 0.0
                    ? StageCostModelKind::ContinuousTileStore
                    : StageCostModelKind::ContinuousTileMemory;
+      if (llvm::any_of(stage.operations, operationTreeHasVectorCompute)) {
+        // Predicate/cast/index models remain specialized. Ordinary tensor
+        // arithmetic must not fall back to scalar_issue after partitioning.
+        if (stage.costModelKind == StageCostModelKind::PredicateMask ||
+            stage.costModelKind == StageCostModelKind::IndexGeneration)
+          return stage.costModelKind;
+        return StageCostModelKind::VectorIssue;
+      }
       return StageCostModelKind::ScalarIssue;
     };
     const StageCostModelKind derived = derive();
@@ -1182,10 +1446,18 @@ llvm::Error StageKindClassifier::analyze(StagePartition &partition,
     if (semanticKindPriority(derived) > 0 ||
         !compatible(stage.costModelKind, facts))
       stage.costModelKind = derived;
-    if (!compatible(stage.costModelKind, facts) ||
-        (stage.costModelKind == StageCostModelKind::TinyCubeRoofline &&
-         stage.workload.dotFlops * stage.iterationCount >
-             static_cast<double>(std::max<int64_t>(1, tinyDotFlopsMax))))
+    const bool tinyDotShapeValid = [&]() {
+      if (stage.costModelKind != StageCostModelKind::TinyCubeRoofline)
+        return true;
+      const int64_t tinyLimit = std::max<int64_t>(1, tinyDotFlopsMax);
+      if (!stage.workload.dotFlopCounts.empty())
+        return llvm::all_of(
+            stage.workload.dotFlopCounts,
+            [&](const auto &entry) { return entry.first <= tinyLimit; });
+      return stage.workload.dotFlops * stage.iterationCount <=
+             static_cast<double>(tinyLimit);
+    }();
+    if (!compatible(stage.costModelKind, facts) || !tinyDotShapeValid)
       return llvm::createStringError(
           std::errc::invalid_argument,
           "Stage '%s' operation graph does not match StageCostModelKind '%s'",
@@ -1214,8 +1486,11 @@ llvm::Error StageWorkloadAnalysis::analyze(StagePartition &partition) const {
     const int64_t fallbackLoopTripCount =
         loopCount > 0 ? std::max<int64_t>(1, stage.iterationCount / loopCount)
                       : 1;
+    stage.features.upperBoundLoopCount = 0;
+    stage.features.unknownTripCountLoopCount = 0;
     for (Operation *root : stage.operations)
-      accumulateDynamicOperationTree(root, work, 1.0, fallbackLoopTripCount);
+      accumulateDynamicOperationTree(root, work, 1.0, fallbackLoopTripCount,
+                                     stage.features);
     recomputeIssueElements(work);
     stage.workload = std::move(work);
     makePerIteration(stage);

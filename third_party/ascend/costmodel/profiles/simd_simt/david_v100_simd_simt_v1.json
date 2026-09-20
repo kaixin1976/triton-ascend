@@ -138,6 +138,8 @@
       "scalar_operations_per_system_cycle": 1.0,
       "issue_instructions_per_system_cycle": 6.0,
       "spill_transactions_per_system_cycle": 1.0,
+      "register_budget_per_thread": 32.0,
+      "spill_transaction_coverage": 1.0,
       "prefix_scan": {
         "dependency_factor": 17.35,
         "description": "SIMD prefix-scan dependency factor calibrated from the identity-baseline-subtracted A5 batch-8, extent-16 scan sweep (143.398 us SIMD scan increment versus 8.267 us SIMT, ratio 17.345); unlike reduction throughput, successive scan levels remain dependent."
@@ -276,6 +278,8 @@
       "scalar_operations_per_system_cycle": 4.0,
       "issue_instructions_per_system_cycle": 4.0,
       "spill_transactions_per_system_cycle": 1.0,
+      "register_budget_per_thread": 32.0,
+      "spill_transaction_coverage": 1.0,
       "prefix_scan": {
         "dependency_factor": 1.0,
         "description": "SIMT shuffle throughput already represents the lane dependency chain measured by the A5 scan sweep."

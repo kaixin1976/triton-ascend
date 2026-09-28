@@ -78,6 +78,30 @@ using namespace TritonToStructured;
 
 namespace {
 
+bool hasUnchangedOperands(Operation *op,
+                          const std::shared_ptr<MemOpAttemptCache> &cache) {
+  if (!cache)
+    return false;
+
+  MemOpOperands operands(op->getOperands().begin(), op->getOperands().end());
+  auto [it, inserted] = cache->try_emplace(op, operands);
+  if (inserted)
+    return false;
+  if (it->second == operands)
+    return true;
+  it->second = std::move(operands);
+  return false;
+}
+
+void replaceAttemptedOp(Operation *oldOp, Operation *newOp,
+                        const std::shared_ptr<MemOpAttemptCache> &cache) {
+  if (!cache)
+    return;
+  cache->erase(oldOp);
+  (*cache)[newOp] =
+      MemOpOperands(newOp->getOperands().begin(), newOp->getOperands().end());
+}
+
 struct CatPointerShape {
   int64_t lhsSize;
   int64_t rhsSize;
@@ -282,26 +306,32 @@ bool shouldDeferScalarPointerBroadcastStore(Value ptr, Value value) {
 
 LogicalResult LoadConverter::matchAndRewrite(triton::LoadOp op,
                                              PatternRewriter &rewriter) const {
+  Operation *operation = op.getOperation();
+  if (hasUnchangedOperands(operation, attemptCache))
+    return failure();
   auto loc = op.getLoc();
   auto oldPtr = op.getPtr();
   auto oldMask = op.getMask();
   auto oldOther = op.getOther();
 
   if (auto catOp = oldPtr.getDefiningOp<triton::CatOp>()) {
-    if (succeeded(rewriteCatPointerLoad(op, catOp, rewriter)))
+    if (succeeded(rewriteCatPointerLoad(op, catOp, rewriter))) {
+      if (attemptCache)
+        attemptCache->erase(operation);
       return success();
+    }
   }
 
   MemOpTransformer tf(MemOpTransformer::MemType::load, optimizeDynamicOffset);
 
   auto newPtr = tf.createNewPtr(oldPtr, loc, rewriter);
-  auto newMask = tf.createNewMask(oldMask, loc, rewriter);
-  auto newOther = tf.createNewOther(oldOther, loc, rewriter);
-
   if (!tf.ptrState.shouldLinearize) {
     // no need to rewrite
     return failure();
   }
+
+  auto newMask = tf.createNewMask(oldMask, loc, rewriter);
+  auto newOther = tf.createNewOther(oldOther, loc, rewriter);
 
   if (!newPtr) {
     LLVM_DEBUG({
@@ -322,7 +352,7 @@ LogicalResult LoadConverter::matchAndRewrite(triton::LoadOp op,
   auto loadOp = rewriter.create<triton::LoadOp>(loc, newPtr, newMask, newOther,
                                                 op.getCache(), op.getEvict(),
                                                 op.getIsVolatile());
-
+  replaceAttemptedOp(operation, loadOp.getOperation(), attemptCache);
   // insert implicit ops
   auto broadCastResult =
       tf.materializeImplicitBroadcast(loadOp.getResult(), loc, rewriter);
@@ -339,14 +369,20 @@ LogicalResult LoadConverter::matchAndRewrite(triton::LoadOp op,
 
 LogicalResult StoreConverter::matchAndRewrite(triton::StoreOp op,
                                               PatternRewriter &rewriter) const {
+  Operation *operation = op.getOperation();
+  if (hasUnchangedOperands(operation, attemptCache))
+    return failure();
   auto loc = op.getLoc();
   auto oldPtr = op.getPtr();
   auto oldMask = op.getMask();
   auto oldValue = op.getValue();
 
   if (auto catOp = oldPtr.getDefiningOp<triton::CatOp>()) {
-    if (succeeded(rewriteCatPointerStore(op, catOp, rewriter)))
+    if (succeeded(rewriteCatPointerStore(op, catOp, rewriter))) {
+      if (attemptCache)
+        attemptCache->erase(operation);
       return success();
+    }
   }
 
   // AddPtrSplatConverter can preserve a non-singleton zero-stride dimension
@@ -360,12 +396,12 @@ LogicalResult StoreConverter::matchAndRewrite(triton::StoreOp op,
   MemOpTransformer tf(MemOpTransformer::MemType::store, optimizeDynamicOffset);
 
   auto newPtr = tf.createNewPtr(oldPtr, loc, rewriter);
-  auto newMask = tf.createNewMask(oldMask, loc, rewriter);
-
   if (!tf.ptrState.shouldLinearize) {
     // no need to rewrite
     return failure();
   }
+
+  auto newMask = tf.createNewMask(oldMask, loc, rewriter);
 
   if (!newPtr) {
     LLVM_DEBUG({
@@ -399,7 +435,7 @@ LogicalResult StoreConverter::matchAndRewrite(triton::StoreOp op,
   auto storeOp = rewriter.create<triton::StoreOp>(
       loc, newPtr, permuteResult, newMask, op.getBoundaryCheck(), op.getCache(),
       op.getEvict());
-
+  replaceAttemptedOp(operation, storeOp.getOperation(), attemptCache);
   // insert sync_block_unlock
   if (oldMask && !newMask) {
     rewriter.create<hivm::SyncBlockUnlockOp>(loc, lockVar);
@@ -577,6 +613,23 @@ Value MemOpTransformer::createNewPtr(Value oldPtr, const Location loc,
       InFlightDiagnostic diag =
           emitWarning(loc) << "PtranAlysis: failed to analyze load/store ptr.";
     });
+    return oldPtr;
+  }
+
+  // Zero strides on unit dimensions are normalized below and do not require
+  // a memory-op rewrite.  Detect the no-op case before materializing the
+  // replacement pointer; otherwise a failed pattern leaves dead IR behind and
+  // causes the greedy driver to retry the same load/store up to its iteration
+  // limit.
+  bool needsLinearization = false;
+  for (const auto &info : ptrState.stateInfo) {
+    if (isZero(info.stride) && !isOne(info.shape)) {
+      needsLinearization = true;
+      break;
+    }
+  }
+  if (!needsLinearization) {
+    ptrState.shouldLinearize = false;
     return oldPtr;
   }
 

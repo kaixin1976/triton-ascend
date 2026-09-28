@@ -252,6 +252,14 @@ struct ElementwiseInlineAsmOpConversion
 
 void TritonToLLVMPass::runOnOperation() {
   auto module = getOperation();
+  bool hasCandidate = false;
+  module.walk([&](triton::ElementwiseInlineAsmOp) {
+    hasCandidate = true;
+    return WalkResult::interrupt();
+  });
+  if (!hasCandidate)
+    return;
+
   ConversionTarget target(getContext());
   target.addLegalDialect<tensor::TensorDialect, LLVM::LLVMDialect,
                          arith::ArithDialect>();

@@ -426,7 +426,9 @@ public:
   }
 
   AnalysisRequirement getAnalysisRequirements() const override {
-    return AnalysisRequirement::ProgramAxisDependence;
+    // The non-SIMT dot path does not consume program-axis dependence.
+    return enableLegacyPattern ? AnalysisRequirement::ProgramAxisDependence
+                               : AnalysisRequirement::None;
   }
 
   LogicalResult findCandidates(

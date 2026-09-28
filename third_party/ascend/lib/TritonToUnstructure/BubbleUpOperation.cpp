@@ -538,6 +538,17 @@ BubbleUpOperationPass::BubbleUpOperationPass(
 
 void BubbleUpOperationPass::runOnOperation() {
   ModuleOp moduleOp = getOperation();
+  bool hasCandidate = false;
+  moduleOp.walk([&](Operation *op) {
+    if (isa<tensor::ExtractOp, tensor::ExtractSliceOp>(op)) {
+      hasCandidate = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (!hasCandidate)
+    return;
+
   MLIRContext *ctx = &getContext();
 
   RewritePatternSet patterns(ctx);

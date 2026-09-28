@@ -130,6 +130,9 @@ def compiler_module():
     ):
         setattr(utils_stub, name, lambda *_args, **_kwargs: "")
     utils_stub._get_npucompiler_path = lambda *_args, **_kwargs: ("", {})
+    utils_stub._get_bishengir_compile_capabilities = (
+        lambda *options: ("", {}, tuple(False for _option in options))
+    )
     utils_stub._get_auto_blockify_blacklist_reasons = lambda *_args, **_kwargs: []
     utils_stub._warn_auto_blockify_disabled = lambda *_args, **_kwargs: None
     utils_stub._remove_deprecated_npu_options = remove_deprecated_npu_options
@@ -149,6 +152,7 @@ def compiler_module():
 
     cache_stub = types.ModuleType(cache_name)
     cache_stub._base32 = lambda value: str(value)
+    cache_stub.get_cache_manager = lambda *_args, **_kwargs: None
     cache_stub.get_dump_manager = lambda *_args, **_kwargs: SimpleNamespace(cache_dir="", put=lambda *_args, **_kwargs:
                                                                             None)
 
@@ -204,6 +208,62 @@ def compiler_module():
 def _parse_options(compiler, arch, opts=None):
     backend = compiler.AscendBackend(SimpleNamespace(backend="npu", arch=arch))
     return backend.parse_options({} if opts is None else opts)
+
+
+def test_auto_blockify_blacklist_module_scan_only_stringifies_candidate_ops(compiler_module, monkeypatch):
+    class FakeOp:
+
+        def __init__(self, name, text):
+            self.name = name
+            self.text = text
+            self.stringify_count = 0
+
+        def get_name(self):
+            return self.name
+
+        def __str__(self):
+            self.stringify_count += 1
+            return self.text
+
+    class FakeModule:
+
+        def __init__(self, operations):
+            self.operations = operations
+
+        def walk(self, callback):
+            for operation in self.operations:
+                callback(operation)
+
+    regular = FakeOp("arith.addi", "%0 = arith.addi %a, %b : i32")
+    atomic = FakeOp("tt.atomic_rmw", "tt.atomic_rmw add")
+    volatile_load = FakeOp("tt.load", "tt.load %ptr {isVolatile = true}")
+    cached_store = FakeOp("tt.store", 'tt.store %ptr, %value {cacheModifier = "wb"}')
+    inline_asm = FakeOp("tt.elementwise_inline_asm", "tt.elementwise_inline_asm")
+
+    def scan_text(text):
+        reasons = []
+        if "isVolatile = true" in text:
+            reasons.append("loads with volatile")
+        if "cacheModifier" in text:
+            reasons.append("loads or stores with cache modifiers")
+        return reasons
+
+    monkeypatch.setattr(compiler_module, "_get_auto_blockify_blacklist_reasons", scan_text)
+    reasons = compiler_module._get_auto_blockify_blacklist_reasons_from_module(
+        FakeModule([regular, cached_store, atomic, volatile_load, inline_asm])
+    )
+
+    assert reasons == [
+        "atomic operations",
+        "inline elementwise assembly",
+        "loads with volatile",
+        "loads or stores with cache modifiers",
+    ]
+    assert regular.stringify_count == 0
+    assert atomic.stringify_count == 0
+    assert inline_asm.stringify_count == 0
+    assert volatile_load.stringify_count == 1
+    assert cached_store.stringify_count == 1
 
 
 @pytest.mark.skip(reason="The case is not supported on A5, skipping for now. Will be fixed in future.")
@@ -325,6 +385,88 @@ def _make_program_grid_contract(*transforms):
     }
 
 
+def test_npubin_content_cache_reuses_binary_and_callback_metadata(compiler_module, monkeypatch, tmp_path):
+    monkeypatch.setenv("TRITON_ASCEND_NPUBIN_CACHE", "1")
+    monkeypatch.delenv("TRITON_ALWAYS_COMPILE", raising=False)
+    compiler_path = tmp_path / "bishengir-compile"
+    compiler_path.write_bytes(b"compiler-v1")
+
+    managers = {}
+
+    class FakeCacheManager:
+
+        def __init__(self, key):
+            self.cache_dir = None
+            self.root = tmp_path / key
+            self.root.mkdir()
+            self.group = None
+
+        def get_group(self, _name):
+            return self.group
+
+        def put(self, data, filename, binary=True):
+            path = self.root / filename
+            if isinstance(data, bytes):
+                path.write_bytes(data)
+            else:
+                path.write_text(str(data))
+            return str(path)
+
+        def put_group(self, _name, group):
+            self.group = dict(group)
+
+    def get_manager(key):
+        if key not in managers:
+            managers[key] = FakeCacheManager(key)
+        return managers[key]
+
+    monkeypatch.setattr(compiler_module, "get_cache_manager", get_manager)
+    monkeypatch.setattr(compiler_module, "get_cann_version_file_hash", lambda: "cann-v1")
+
+    compile_options = ["--target=Ascend910B3", "--enable-triton-kernel-compile=true"]
+    environment = {"PATH": "/toolchain/bin", "LD_LIBRARY_PATH": "/toolchain/lib"}
+    producer = compiler_module._NpubinContentCache(
+        "module { func.func @kernel() }", str(compiler_path), compile_options, environment, debug=False)
+    assert producer.load() is None
+    producer.store(
+        b"npubin-v1", {
+            "bs_task_type": 1,
+            "workspace_size": 4096,
+            "sync_block_lock_layout": 2,
+            "lock_init_val": 3,
+            "hash": "specialization-specific",
+        })
+
+    consumer = compiler_module._NpubinContentCache(
+        "module { func.func @kernel() }", str(compiler_path), compile_options, environment, debug=False)
+    binary, cached_metadata = consumer.load()
+    assert binary == b"npubin-v1"
+    assert cached_metadata == {
+        "bs_task_type": 1,
+        "workspace_size": 4096,
+        "sync_block_lock_layout": 2,
+        "lock_init_val": 3,
+    }
+
+    Path(consumer.manager.get_group("npubin-cache.json")["kernel.npubin"]).write_bytes(b"corrupt")
+    assert consumer.load() is None
+
+    changed_options = compiler_module._NpubinContentCache(
+        "module { func.func @kernel() }", str(compiler_path), [*compile_options, "--different"], environment,
+        debug=False)
+    assert changed_options.load() is None
+
+    compiler_path.write_bytes(b"compiler-version-two")
+    changed_compiler = compiler_module._NpubinContentCache(
+        "module { func.func @kernel() }", str(compiler_path), compile_options, environment, debug=False)
+    assert changed_compiler.load() is None
+
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "true")
+    bypassed = compiler_module._NpubinContentCache(
+        "module { func.func @kernel() }", str(compiler_path), compile_options, environment, debug=False)
+    assert bypassed.manager is None
+
+
 def _run_ttir_to_npubin(
     compiler,
     monkeypatch,
@@ -410,6 +552,7 @@ def _run_ttir_to_npubin(
 
 
 def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op):
+    monkeypatch.setenv("TRITON_ASCEND_NPUBIN_CACHE", "0")
     commands = []
     parsed_metadata = defaultdict(
         lambda: None, {
@@ -444,6 +587,11 @@ def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op
     monkeypatch.setattr(compiler, "get_auto_bind_sub_block_option", lambda _metadata: False)
     monkeypatch.setattr(compiler, "NPUUtils", FakeNPUUtils)
     monkeypatch.setattr(compiler, "_get_npucompiler_path", lambda: ("/fake/bishengir-compile", {}))
+    monkeypatch.setattr(
+        compiler,
+        "_get_bishengir_compile_capabilities",
+        lambda *options: ("/fake/bishengir-compile", {}, tuple(False for _option in options)),
+    )
     monkeypatch.setattr(compiler, "_is_auto_map_parallel_blocks_enabled", lambda: True)
     monkeypatch.setattr(compiler.subprocess, "run", run_bisheng)
 

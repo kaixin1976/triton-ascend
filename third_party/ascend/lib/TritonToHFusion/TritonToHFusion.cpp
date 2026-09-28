@@ -342,6 +342,16 @@ struct TritonToHFusionPass
 
 void TritonToHFusionPass::runOnOperation() {
   auto module = getOperation();
+  bool hasCandidate = false;
+  module.walk([&](Operation *op) {
+    hasCandidate = isa<triton::ascend::ModOp, triton::FpToFpOp,
+                       triton::ascend::Conv1dOp,
+                       triton::ascend::Conv2dOp>(op) ||
+                   (!compileOn91095 && isa<triton::HistogramOp>(op));
+    return hasCandidate ? WalkResult::interrupt() : WalkResult::advance();
+  });
+  if (!hasCandidate)
+    return;
 
   // Use greedy pattern rewriter for simpler pattern matching
   // Patterns decide themselves whether to convert (via returning

@@ -38,6 +38,23 @@ def _write_acl_config(cfg_dir, config):
     return cfg_path
 
 
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
+def test_compiler_stacktrace_can_be_enabled_explicitly(monkeypatch, value):
+    monkeypatch.setenv("TRITON_ASCEND_COMPILER_STACKTRACE", value)
+
+    assert compiler._is_compiler_stacktrace_enabled()
+
+
+@pytest.mark.parametrize("value", [None, "", "0", "false", "off", "invalid"])
+def test_compiler_stacktrace_is_disabled_by_default(monkeypatch, value):
+    if value is None:
+        monkeypatch.delenv("TRITON_ASCEND_COMPILER_STACKTRACE", raising=False)
+    else:
+        monkeypatch.setenv("TRITON_ASCEND_COMPILER_STACKTRACE", value)
+
+    assert not compiler._is_compiler_stacktrace_enabled()
+
+
 def test_get_simt_stack_limit_default(monkeypatch):
     """Without torch_npu installed, should return default 1152."""
     monkeypatch.setitem(sys.modules, "torch_npu", None)
@@ -146,7 +163,7 @@ def test_empty_options_expose_all_legacy_names(backend):
     assert utils._DEPRECATED_NPU_OPTIONS <= options.__dict__.keys()
     assert options.__dict__["arch"] == options.arch == backend.target.arch
     assert options.__dict__["warp_size"] == 32
-    assert options.__dict__["use_bytecode"] is True
+    assert options.__dict__["use_bytecode"] is False
     assert options.__dict__["enable_vf_fusion"] is None
 
 
@@ -158,6 +175,15 @@ def test_active_options_keep_explicit_values(backend):
     assert options.enable_mixed_cv is True
     assert options.enable_dynamic_cv_pipeline is False
     assert options.num_warps == 16
+
+
+def test_normal_pipeline_passes_ttadapter_directly_to_npubin(backend):
+    options = backend.parse_options({})
+    stages = {}
+
+    backend.add_stages(stages, options, None)
+
+    assert list(stages) == ["ttir", "ttadapter", "npubin"]
 
 
 _IGNORED_OPTIONS = sorted(utils._DEPRECATED_NPU_OPTIONS - utils._DEPRECATED_NPU_OPTION_ROUTES.keys() -

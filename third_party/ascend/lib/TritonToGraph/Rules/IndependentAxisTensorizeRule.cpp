@@ -1198,6 +1198,14 @@ public:
            AnalysisRequirement::ProgramAxisDependence |
            AnalysisRequirement::ResourceCost;
   }
+  bool mayHaveCandidates(GraphOptimizationContext &context) const override {
+    if (!enabledForCompileMode)
+      return false;
+    triton::FuncOp function = context.getFunction();
+    ModuleOp module = function->getParentOfType<ModuleOp>();
+    return module && !hasConflictingLaunchContract(module) &&
+           hasSupportedControlFlow(function);
+  }
   LogicalResult findCandidates(
       GraphOptimizationContext &context,
       SmallVectorImpl<std::unique_ptr<RewritePlan>> &plans) override {

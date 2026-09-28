@@ -24,12 +24,10 @@
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/PatternMatch.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "mark-tensor-kind"
@@ -131,47 +129,25 @@ static void addTensorKindToArguments(OpTy op, TensorKind tensorKind) {
   }
 }
 
-template <TensorKind Kind, typename OpTy>
-struct MarkTensorKindPattern : public OpRewritePattern<OpTy> {
-  using OpRewritePattern<OpTy>::OpRewritePattern;
-
-  LogicalResult matchAndRewrite(OpTy op,
-                                PatternRewriter &rewriter) const override {
-    addTensorKindToArguments(op, Kind);
-    return success();
-  }
-};
-
 void MarkTensorKindPass::runOnOperation() {
-  RewritePatternSet patterns(&getContext());
-
-  // INPUT tensors
-  patterns.add<
-      MarkTensorKindPattern<TensorKind::INPUT, triton::LoadOp>,
-      MarkTensorKindPattern<TensorKind::INPUT,
-                            triton::ascend::IndexSelectSimdOp>,
-      MarkTensorKindPattern<TensorKind::INPUT, triton::ascend::GatherOutToUbOp>,
-      MarkTensorKindPattern<TensorKind::INPUT, triton::ascend::IndirectLoadOp>,
-      MarkTensorKindPattern<TensorKind::INPUT, triton::ascend::StrideLoadOp>>(
-      &getContext());
-
-  // OUTPUT tensors
-  patterns.add<
-      MarkTensorKindPattern<TensorKind::OUTPUT, triton::StoreOp>,
-      MarkTensorKindPattern<TensorKind::OUTPUT, triton::ascend::IndexPutOp>,
-      MarkTensorKindPattern<TensorKind::OUTPUT,
-                            triton::ascend::ScatterUbToOutOp>,
-      MarkTensorKindPattern<TensorKind::OUTPUT, triton::ascend::StrideStoreOp>,
-      MarkTensorKindPattern<TensorKind::OUTPUT,
-                            triton::ascend::IndirectStoreOp>>(&getContext());
-
-  // INPUT_OUTPUT tensors
-  patterns.add<
-      MarkTensorKindPattern<TensorKind::INPUT_OUTPUT, triton::AtomicRMWOp>,
-      MarkTensorKindPattern<TensorKind::INPUT_OUTPUT, triton::AtomicCASOp>>(
-      &getContext());
-
-  (void)applyPatternsGreedily(getOperation(), std::move(patterns));
+  getOperation().walk([](Operation *op) {
+    llvm::TypeSwitch<Operation *>(op)
+        .Case<triton::LoadOp, triton::ascend::IndexSelectSimdOp,
+              triton::ascend::GatherOutToUbOp,
+              triton::ascend::IndirectLoadOp,
+              triton::ascend::StrideLoadOp>([](auto inputOp) {
+          addTensorKindToArguments(inputOp, TensorKind::INPUT);
+        })
+        .Case<triton::StoreOp, triton::ascend::IndexPutOp,
+              triton::ascend::ScatterUbToOutOp,
+              triton::ascend::StrideStoreOp,
+              triton::ascend::IndirectStoreOp>([](auto outputOp) {
+          addTensorKindToArguments(outputOp, TensorKind::OUTPUT);
+        })
+        .Case<triton::AtomicRMWOp, triton::AtomicCASOp>([](auto atomicOp) {
+          addTensorKindToArguments(atomicOp, TensorKind::INPUT_OUTPUT);
+        });
+  });
 }
 
 std::unique_ptr<OperationPass<ModuleOp>> triton::createMarkTensorKindPass() {

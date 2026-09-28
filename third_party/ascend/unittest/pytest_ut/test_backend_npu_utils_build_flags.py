@@ -96,6 +96,108 @@ def test_npu_utils_build_uses_special_flags(monkeypatch, tmp_path):
     _assert_npu_utils_uses_special_flags(utils, monkeypatch, tmp_path)
 
 
+def test_bishengir_help_is_shared_and_invalidated_by_file_identity(monkeypatch, tmp_path):
+    utils = _load_utils_module()
+    monkeypatch.setenv("TRITON_ASCEND_TOOL_CACHE_DIR", str(tmp_path / "tool-cache"))
+    compiler = tmp_path / "bishengir-compile"
+    compiler.write_text("v1")
+    compiler.chmod(0o755)
+    monkeypatch.setattr(utils, "_get_npucompiler_path", lambda: (str(compiler), {}))
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(
+            returncode=0,
+            stdout="limit-auto-multi-buffer-buffer reg-based save-linked-ir",
+        )
+
+    monkeypatch.setattr(utils.subprocess, "run", fake_run)
+
+    assert utils._check_bishengir_api_change()
+    assert utils._check_bishengir_is_regbased()
+    assert utils._check_bishengir_able_save_ir()
+    assert len(calls) == 1
+
+    # A new Python process/module can reuse the capability result without
+    # launching `bishengir-compile --help` again.
+    utils_again = _load_utils_module()
+    monkeypatch.setattr(utils_again, "_get_npucompiler_path", lambda: (str(compiler), {}))
+    monkeypatch.setattr(utils_again.subprocess, "run", fake_run)
+    assert utils_again._check_bishengir_api_change()
+    assert utils_again._check_bishengir_is_regbased()
+    assert len(calls) == 1
+
+    compiler.write_text("version-two")
+    assert utils._check_bishengir_api_change()
+    assert len(calls) == 2
+
+
+def test_bishengir_capabilities_share_path_environment_and_help_lookup(monkeypatch, tmp_path):
+    utils = _load_utils_module()
+    monkeypatch.setenv("TRITON_ASCEND_TOOL_CACHE_DIR", str(tmp_path / "tool-cache"))
+    compiler = tmp_path / "bishengir-compile"
+    compiler.write_text("compiler")
+    compiler.chmod(0o755)
+    compiler_env = {"PATH": "/toolchain"}
+    path_calls = []
+    help_calls = []
+
+    def fake_path():
+        path_calls.append(True)
+        return str(compiler), compiler_env
+
+    monkeypatch.setattr(utils, "_get_npucompiler_path", fake_path)
+    monkeypatch.setattr(
+        utils.subprocess,
+        "run",
+        lambda *args, **kwargs: help_calls.append(args) or SimpleNamespace(
+            returncode=0,
+            stdout="limit-auto-multi-buffer-buffer reg-based",
+        ),
+    )
+
+    path, env, capabilities = utils._get_bishengir_compile_capabilities(
+        "limit-auto-multi-buffer-buffer",
+        "reg-based",
+        "missing-option",
+    )
+
+    assert path == str(compiler)
+    assert env is compiler_env
+    assert capabilities == (True, True, False)
+    assert len(path_calls) == 1
+    assert len(help_calls) == 1
+
+
+def test_npucompiler_path_cache_tracks_complete_environment(monkeypatch):
+    utils = _load_utils_module()
+    utils._get_npucompiler_path_for_env.cache_clear()
+    monkeypatch.setattr(utils.os.path, "exists", lambda _path: False)
+    calls = []
+
+    def fake_which(name, *, path=None):
+        calls.append((name, path))
+        return "/tools/bishengir-compile"
+
+    monkeypatch.setattr(utils.shutil, "which", fake_which)
+    monkeypatch.setenv("PATH", "/tools")
+    monkeypatch.delenv("TA_COMMAND_CACHE_TEST", raising=False)
+
+    first_path, first_env = utils._get_npucompiler_path()
+    second_path, second_env = utils._get_npucompiler_path()
+    assert first_path == second_path == "/tools/bishengir-compile"
+    assert first_env is second_env
+    assert calls == [("bishengir-compile", "/tools")]
+
+    monkeypatch.setenv("TA_COMMAND_CACHE_TEST", "changed")
+    third_path, third_env = utils._get_npucompiler_path()
+    assert third_path == first_path
+    assert third_env is not first_env
+    assert third_env["TA_COMMAND_CACHE_TEST"] == "changed"
+    assert calls == [("bishengir-compile", "/tools"), ("bishengir-compile", "/tools")]
+
+
 def test_get_backend_func_uses_torch_npu_without_import(monkeypatch):
     utils = _load_utils_module()
     monkeypatch.delenv("TRITON_BACKEND", raising=False)
@@ -176,6 +278,27 @@ def test_npu_utils_initialization_refreshes_build_path_without_loading(monkeypat
         (npu_utils, str(producer_cache)),
         (npu_utils, str(consumer_cache)),
     ]
+
+
+def test_npu_utils_initialization_reuses_build_path_for_same_cache_root(monkeypatch, tmp_path):
+    driver = _load_driver_module()
+    cache_root = tmp_path / "cache"
+    cached_so = cache_root / "npu_utils.so"
+    build_calls = []
+
+    def fake_build(npu_utils):
+        build_calls.append(npu_utils)
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cached_so.write_bytes(b"cached")
+        return str(cached_so)
+
+    monkeypatch.setattr(driver.NPUUtils, "_build_or_get_cached_so", fake_build)
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(cache_root))
+
+    npu_utils = driver.NPUUtils()
+    assert driver.NPUUtils() is npu_utils
+    assert npu_utils._cache_path == str(cached_so)
+    assert build_calls == [npu_utils]
 
 
 def test_npu_utils_load_binary_requires_explicit_mix_mode(monkeypatch, tmp_path):

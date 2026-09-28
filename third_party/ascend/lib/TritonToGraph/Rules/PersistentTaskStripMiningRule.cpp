@@ -905,6 +905,14 @@ public:
            AnalysisRequirement::ProgramAxisDependence |
            AnalysisRequirement::ResourceCost;
   }
+  bool mayHaveCandidates(GraphOptimizationContext &context) const override {
+    if (!enabledForCompileMode)
+      return false;
+    triton::FuncOp function = context.getFunction();
+    return classifyIndependentRowReduction(function) !=
+               IndependentRowReductionKind::Other &&
+           !hasDisallowedEffectOrControlFlow(function);
+  }
   LogicalResult findCandidates(
       GraphOptimizationContext &context,
       SmallVectorImpl<std::unique_ptr<RewritePlan>> &plans) override {

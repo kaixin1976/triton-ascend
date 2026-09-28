@@ -3,9 +3,9 @@ index cab58801f..406ed4634 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -15,13 +15,22 @@ include(CTest)
- 
+
  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
- 
+
 +# Security compilation options settings
 +include(${CMAKE_CURRENT_SOURCE_DIR}/safe_compile.cmake)
 +
@@ -16,7 +16,7 @@ index cab58801f..406ed4634 100644
  option(TRITON_BUILD_UT "Build C++ Triton Unit Tests" ON)
  option(TRITON_BUILD_WITH_CCACHE "Build with ccache (if available)" ON)
  set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
- 
+
 +if(TRITON_BUILD_TD)
 +  set(TRITON_USE_ASCEND ON)
 +  add_compile_definitions(TRITON_USE_ASCEND=1)
@@ -45,12 +45,12 @@ index cab58801f..406ed4634 100644
 +    endif()
 +  endif()
  endfunction()
- 
+
  set_property(GLOBAL PROPERTY TRITON_PLUGINS "")
 @@ -164,6 +188,21 @@ if (NOT WIN32 AND NOT APPLE AND NOT BSD)
    link_libraries(stdc++fs)
  endif()
- 
+
 +# Adapter LLVM VERSION For AscendNPU IR
 +option(LLVM_MAJOR_VERSION_21_COMPATIBLE "NPUIR build with LLVM 21 or later" OFF)
 +if(LLVM_MAJOR_VERSION_21_COMPATIBLE)
@@ -66,9 +66,9 @@ index cab58801f..406ed4634 100644
 +  add_definitions(-D__LLVM_MAJOR_VERSION_21_COMPATIBLE__)
 +  add_definitions(-D__LLVM_MAJOR_VERSION_22_COMPATIBLE__)
 +endif()
- 
+
  # -----
- 
+
 @@ -176,11 +215,21 @@ if(TRITON_BUILD_PYTHON_MODULE)
    # Python Interpreter is used to run lit tests
    find_package(Python3 REQUIRED COMPONENTS Development.Module Interpreter)
@@ -79,11 +79,11 @@ index cab58801f..406ed4634 100644
 +  link_directories(${Python3_LIBRARY_DIRS})
 +  link_libraries(${Python3_LIBRARIES})
 +  add_link_options(${Python3_LINK_OPTIONS})
- 
+
    foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
      add_subdirectory(third_party/${CODEGEN_BACKEND})
    endforeach()
- 
+
 +  if(TRITON_BUILD_TD)
 +    list(APPEND TRITON_PLUGIN_NAMES "distributed")
 +  endif()
@@ -105,7 +105,7 @@ index cab58801f..406ed4634 100644
  if (UNIX AND NOT APPLE)
 @@ -338,6 +387,12 @@ endif()
  find_package(Threads REQUIRED)
- 
+
  add_subdirectory(third_party/f2reduce)
 +
 +# To enable the hitest coverage tool, you need to set the environment variable TRITON_ENABLE_COVERAGE_HITEST=1
@@ -115,14 +115,14 @@ index cab58801f..406ed4634 100644
 +
  add_subdirectory(bin)
  add_subdirectory(test)
- 
+
 diff --git a/bin/CMakeLists.txt b/bin/CMakeLists.txt
 index cc0b4fa15..82f52f87e 100644
 --- a/bin/CMakeLists.txt
 +++ b/bin/CMakeLists.txt
 @@ -1,11 +1,38 @@
  get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
- 
+
 +include_directories(
 +    ${PROJECT_SOURCE_DIR}/third_party/ascend/include
 +    ${PROJECT_SOURCE_DIR}/third_party/ascend/AscendNPU-IR/bishengir/include
@@ -132,7 +132,7 @@ index cc0b4fa15..82f52f87e 100644
  add_llvm_executable(triton-opt triton-opt.cpp PARTIAL_SOURCES_INTENDED)
 +target_include_directories(triton-opt PRIVATE
 +  "${PROJECT_SOURCE_DIR}/third_party/ascend/include")
- 
+
  # TODO: what's this?
  llvm_update_compile_flags(triton-opt)
  target_link_libraries(triton-opt PRIVATE
@@ -302,7 +302,7 @@ index 48049f026..e96284bc2 100644
 @@ -136,16 +178,39 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
    mlir::triton::proton::gpu::registerScheduleBufferStorePass();
    mlir::triton::proton::gpu::registerAddSchedBarriersPass();
- 
+
 +  // DynamicCVPipeline passes
 +  mlir::triton::registerAddDynamicCVPipelinePasses();
 +  mlir::triton::registerPreCheckAvailablePasses();
@@ -458,16 +458,26 @@ index a3cf0ff0c..28ba11c92 100644
 +        # if not is_power_of_two(d):
 +        #     raise ValueError(f"Shape element {i} must be a power of 2")
          numel *= d
- 
+
      if numel > TRITON_MAX_TENSOR_NUMEL:
 diff --git a/python/triton/compiler/code_generator.py b/python/triton/compiler/code_generator.py
-index c572f81e3..6e06b8477 100644
+index c572f81e3..6c2bdd8af 100644
 --- a/python/triton/compiler/code_generator.py
 +++ b/python/triton/compiler/code_generator.py
-@@ -10,8 +10,16 @@ from dataclasses import dataclass
+@@ -2,16 +2,26 @@ import ast
+ import builtins
+ import contextlib
+ import copy
++import functools
+ import inspect
+ import re
+ import warnings
+ import textwrap
++from collections import namedtuple
+ from dataclasses import dataclass
  from types import ModuleType
  from typing import Any, Callable, Dict, Optional, Tuple, Type, Union, Iterable, List
- 
+
 +# Import and register Ascend extension dispatch handlers
 +import triton.language.extra.cann.extension as extension
 +from triton.language.extra.cann.extension.dispatch import ASCEND_WITH_DISPATCH
@@ -482,18 +492,51 @@ index c572f81e3..6e06b8477 100644
  from ..language import constexpr, str_to_ty, tensor, tuple as tl_tuple
  from ..language.core import _unwrap_if_constexpr, base_value, base_type
  # ideally we wouldn't need any runtime component
-@@ -20,6 +28,10 @@ from .._utils import find_paths_if, get_iterable_path, set_iterable_path, is_nam
- 
+@@ -20,6 +30,16 @@ from .._utils import find_paths_if, get_iterable_path, set_iterable_path, is_nam
+
  from .errors import (CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct)
- 
+
 +# Central registry for all 'with' statement handlers
 +WITH_DISPATCH = {}
 +WITH_DISPATCH.update(ASCEND_WITH_DISPATCH)
++SpecializationProxy = namedtuple("SpecializationProxy", ["constants", "signature"])
 +
- 
++
++@functools.lru_cache(maxsize=512)
++def _cached_python_function_signature(fn, signature_override):
++    return inspect.signature(fn)
++
+
  def check_identifier_legality(name, type):
      pattern = r'^[a-zA-Z_][a-zA-Z0-9_]*$'
-@@ -300,7 +312,14 @@ class CodeGenerator(ast.NodeVisitor):
+@@ -115,6 +135,26 @@ def _clone_scope(scope):
+     return {name: _clone_triton_value(val) if _is_triton_value(val) else val for name, val in scope.items()}
+
+
++def _body_rebinds_any_name(body, names: set[str]) -> bool:
++    """Return whether the loop body may rebind one of the tracked names."""
++    if not names:
++        return False
++    for statement in body:
++        for node in ast.walk(statement):
++            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)) and node.id in names:
++                return True
++            # These bindings are outside Triton's normal kernel subset, but
++            # treating them conservatively keeps this proof valid if support is
++            # added later.
++            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in names:
++                return True
++            if isinstance(node, ast.ExceptHandler) and node.name in names:
++                return True
++            if isinstance(node, ast.alias) and (node.asname or node.name.split(".")[0]) in names:
++                return True
++    return False
++
++
+ class enter_sub_region:
+
+     def __init__(self, generator):
+@@ -300,15 +340,37 @@ class CodeGenerator(ast.NodeVisitor):
              self.semantic = GluonSemantic(self.builder)
          else:
              from triton.language.semantic import TritonSemantic
@@ -507,9 +550,14 @@ index c572f81e3..6e06b8477 100644
 +            else:
 +                self.builder = ir.builder(context)
              self.semantic = TritonSemantic(self.builder)
- 
+
          self.name_loc_as_prefix = None
-@@ -309,6 +328,17 @@ class CodeGenerator(ast.NodeVisitor):
++        # Source locations are only consumed by the debug-line pipeline.  Keep
++        # the current AST node for diagnostics when line info is disabled, but
++        # avoid two C++ location round trips for every visited AST node.
++        self.generate_line_info = not knobs.compilation.disable_line_info
+         self.file_name = file_name
+         # node.lineno starts from 1, so we need to subtract 1
          self.begin_line = begin_line - 1
          self.builder.set_loc(file_name, begin_line, 0)
          self.builder.options = options
@@ -527,10 +575,21 @@ index c572f81e3..6e06b8477 100644
          # dict of functions provided by the backend. Below are the list of possible functions:
          # Convert custom types not natively supported on HW.
          # convert_custom_types(input_tensor, dtype, fp_downcast_rounding=None, _builder=None)
-@@ -451,17 +481,19 @@ class CodeGenerator(ast.NodeVisitor):
+@@ -351,6 +413,10 @@ class CodeGenerator(ast.NodeVisitor):
+         # Are we currently visiting an ast.arg's default value?  These have some
+         # special handling.
+         self.visiting_arg_default_value = False
++        # A kernel calls the same small set of Triton builtins many times while
++        # lowering its AST. Their Python signatures are immutable for the life
++        # of this generator, so inspect each callable at most once.
++        self._callable_signatures = {}
+
+     builtin_namespace: Dict[str, Any] = {
+         _.__name__: _
+@@ -451,19 +517,30 @@ class CodeGenerator(ast.NodeVisitor):
          self.lscope[name] = value
          self.local_defs[name] = value
- 
+
 -    def _get_insertion_point_and_loc(self):
 +    def _get_insertion_point_and_loc(self, builder=None):
          # XXX: this is a hack to get the location of the insertion point.
@@ -542,7 +601,7 @@ index c572f81e3..6e06b8477 100644
 +        loc = _builder.get_loc()
 +        ip = _builder.get_insertion_point()
          return ip, loc
- 
+
 -    def _set_insertion_point_and_loc(self, ip, loc):
 -        self.builder.restore_insertion_point(ip)
 -        self.builder.set_loc(loc)
@@ -550,12 +609,23 @@ index c572f81e3..6e06b8477 100644
 +        _builder = self.builder if not builder else builder
 +        _builder.restore_insertion_point(ip)
 +        _builder.set_loc(loc)
- 
+
      def _find_carries(self, node, liveins, ignore: set[str] = set()):
++        tracked_liveins = set(liveins).difference(ignore)
++        if not _body_rebinds_any_name(node.body, tracked_liveins):
++            # Loop-carried values can only arise when the body rebinds a name
++            # that was live on entry. Avoid compiling and erasing the complete
++            # loop body just to prove the empty case.
++            self.lscope = liveins.copy()
++            self.local_defs = {}
++            return [], [], []
++
          # create loop body block
-@@ -980,6 +1012,26 @@ class CodeGenerator(ast.NodeVisitor):
+         block = self.builder.create_block()
+         self.builder.set_insertion_point_to_start(block)
+@@ -980,6 +1057,26 @@ class CodeGenerator(ast.NodeVisitor):
                  return self.visit(node.orelse)
- 
+
      def visit_With(self, node):
 +        """
 +        Handle 'with' statements with dispatch pattern for Ascend extensions,
@@ -580,7 +650,7 @@ index c572f81e3..6e06b8477 100644
          # Lower `with` statements by constructing context managers and calling their enter/exit hooks
          # Instantiate each context manager with builder injection
          cm_list = []
-@@ -1147,7 +1199,7 @@ class CodeGenerator(ast.NodeVisitor):
+@@ -1147,7 +1244,7 @@ class CodeGenerator(ast.NodeVisitor):
          flatten = False
          warp_specialize = False
          disable_licm = False
@@ -589,7 +659,7 @@ index c572f81e3..6e06b8477 100644
              iterator = IteratorClass(*iter_args, **iter_kwargs)
              # visit iterator arguments
              # note: only `range` iterator is supported now
-@@ -1224,7 +1276,9 @@ class CodeGenerator(ast.NodeVisitor):
+@@ -1224,7 +1321,9 @@ class CodeGenerator(ast.NodeVisitor):
              if warp_specialize:
                  for_op.set_attr("tt.warp_specialize", self.builder.get_unit_attr())
              if disable_licm:
@@ -597,10 +667,10 @@ index c572f81e3..6e06b8477 100644
 +                for_op.set_attr("tt.disable_licm", self.builder.get_unit_attr())
 +            if (IteratorClass is extension.parallel):
 +                for_op.set_attr("hivm.parallel_loop", self.builder.get_unit_attr())
- 
+
              self.scf_stack.append(node)
              for_op_body = for_op.get_body(0)
-@@ -1286,7 +1340,7 @@ class CodeGenerator(ast.NodeVisitor):
+@@ -1286,7 +1385,7 @@ class CodeGenerator(ast.NodeVisitor):
          args = inspect.getcallargs(fn.fn, *args, **kwargs)
          args = [args[name] for name in fn.arg_names]
          for i, arg in enumerate(args):
@@ -609,36 +679,102 @@ index c572f81e3..6e06b8477 100644
                  args[i] = language.core.constexpr(arg)
          args_cst = find_paths_if(args, lambda _, x: _is_constexpr(x))
          args_cst = {path: get_iterable_path(args, path) for path in args_cst}
-@@ -1340,6 +1394,11 @@ class CodeGenerator(ast.NodeVisitor):
+@@ -1340,12 +1439,30 @@ class CodeGenerator(ast.NodeVisitor):
              return self.call_JitFunction(fn, args, kws)
          if (hasattr(fn, '__self__') and _is_triton_value(fn.__self__)) or language.core.is_builtin(fn) or isinstance(
                  fn, ConstexprFunction):
-+            # Copy builder's location and insertion point.
-+            ip, last_loc = self._get_insertion_point_and_loc()
-+            # Use ascend_builder if this function is a builtin extension operation.
-+            _builder = self.ascend_builder if extension.is_builtin(fn) else self.builder
-+            self._set_insertion_point_and_loc(ip, last_loc, _builder)
++            is_ascend_builtin = extension.is_builtin(fn)
++            _builder = self.ascend_builder if is_ascend_builtin else self.builder
++            if is_ascend_builtin:
++                # Synchronize builders only when switching to the Ascend builder.
++                ip, last_loc = self._get_insertion_point_and_loc()
++                self._set_insertion_point_and_loc(ip, last_loc, _builder)
              extra_kwargs = dict()
- 
-             if isinstance(fn, ConstexprFunction):
-@@ -1355,6 +1414,9 @@ class CodeGenerator(ast.NodeVisitor):
+
+-            if isinstance(fn, ConstexprFunction):
+-                sig = inspect.signature(fn.__call__)
++            signature_target = fn.__call__ if isinstance(fn, ConstexprFunction) else fn
++            if inspect.isfunction(signature_target):
++                sig = _cached_python_function_signature(signature_target,
++                                                        getattr(signature_target, "__signature__", None))
+             else:
+-                sig = inspect.signature(fn)
++                try:
++                    sig = self._callable_signatures.get(signature_target)
++                except TypeError:
++                    # Preserve support for an unusual unhashable callable.
++                    sig = None
++            if sig is None:
++                sig = inspect.signature(signature_target)
++                try:
++                    self._callable_signatures[signature_target] = sig
++                except TypeError:
++                    pass
+             if '_semantic' in sig.parameters:
+                 extra_kwargs["_semantic"] = self.semantic
+             if '_generator' in sig.parameters:
+@@ -1355,6 +1472,10 @@ class CodeGenerator(ast.NodeVisitor):
                  # builtin functions return plain tuples for readability
                  if isinstance(ret, tuple):
                      ret = language.tuple(ret)
-+                # Sync the builder's location before return.
-+                ip, last_loc = self._get_insertion_point_and_loc(_builder)
-+                self._set_insertion_point_and_loc(ip, last_loc)
++                if is_ascend_builtin:
++                    # Synchronize back after an Ascend extension operation.
++                    ip, last_loc = self._get_insertion_point_and_loc(_builder)
++                    self._set_insertion_point_and_loc(ip, last_loc)
                  return ret
              except Exception as e:
                  if knobs.compilation.front_end_debugging:
-@@ -1594,6 +1656,7 @@ class CodeGenerator(ast.NodeVisitor):
+@@ -1517,6 +1638,19 @@ class CodeGenerator(ast.NodeVisitor):
+     def visit(self, node):
+         if node is None:
+             return
++        if not self.generate_line_info:
++            last_node = self.cur_node
++            self.cur_node = node
++            try:
++                ret = super().visit(node)
++            except CompilationError:
++                raise
++            except Exception as e:
++                if knobs.compilation.front_end_debugging:
++                    raise
++                raise CompilationError(self.jit_fn.src, self.cur_node, repr(e)) from None
++            self.cur_node = last_node
++            return ret
+         with warnings.catch_warnings():
+             # The ast library added visit_Constant and deprecated some other
+             # methods but we can't move to that without breaking Python 3.6 and 3.7.
+@@ -1594,14 +1728,16 @@ class CodeGenerator(ast.NodeVisitor):
          ttgl.static_print: static_executor(print),
          int: static_executor(int),
          len: static_executor(len),
 +        extension.int64: static_executor(extension.int64),
      }
- 
- 
+
+
+ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None):
+     arg_types = [None] * len(fn.arg_names)
++    arg_name_to_index = {name: index for index, name in enumerate(fn.arg_names)}
+
+     for k, v in src.signature.items():
+-        idx = fn.arg_names.index(k)
++        idx = arg_name_to_index[k]
+         arg_types[idx] = str_to_ty(v, None)
+
+     def apply_constexpr_types(argument, indices, value):
+@@ -1620,11 +1756,10 @@ def ast_to_ttir(fn, src, context, options, codegen_fns, module_map, module=None)
+     prototype = ASTFunction([], arg_types, src.constants, src.attrs)
+     file_name, begin_line = get_jit_fn_file_line(fn)
+     # query function representation
+-    from collections import namedtuple
+     leaves = filter(lambda v: len(v) == 1, src.constants)
+     constants = {fn.arg_names[i[0]]: src.constants[i] for i in leaves}
+     signature = src.signature
+-    proxy = namedtuple("SpecializationProxy", ["constants", "signature"])(constants, signature)
++    proxy = SpecializationProxy(constants, signature)
+     generator = CodeGenerator(context, prototype, gscope=fn.get_capture_scope(), function_name=fn.repr(proxy),
+                               jit_fn=fn, is_kernel=True, file_name=file_name, begin_line=begin_line, options=options,
+                               codegen_fns=codegen_fns, module_map=module_map, module=module, is_gluon=fn.is_gluon())
 diff --git a/python/triton/compiler/compiler.py b/python/triton/compiler/compiler.py
 index d4872a463..51347e144 100644
 --- a/python/triton/compiler/compiler.py
@@ -708,7 +844,7 @@ index 39e6c4dfb..c72ca65c2 100644
 --- a/python/triton/compiler/errors.py
 +++ b/python/triton/compiler/errors.py
 @@ -49,3 +49,24 @@ class CompileTimeAssertionFailure(CompilationError):
- 
+
  class UnsupportedLanguageConstruct(CompilationError):
      pass
 +
@@ -749,11 +885,11 @@ index 582cd876cb..13ff1cef09 100644
 +                if arg_type not in dtypes:
 +                    raise ValueError(f"Expected dtype {dtypes} but got {arg_type}")
              return fn(*args, **kwargs)
- 
+
          return check
 @@ -92,7 +96,7 @@ def umulhi(x, y, _semantic=None):
- 
- 
+
+
  @core.builtin
 -@_check_dtype(dtypes=["fp32", "fp64"])
 +@_check_dtype(dtypes=["fp16", "fp32"])
@@ -770,7 +906,7 @@ index 52192cf3e..241ba3378 100644
          msg = f"int{lhs_sca_ty.int_bitwidth} overflow detected for operation {binary_op.__name__}"
 -        self.device_assert(cond, msg, None)
 +        self.device_assert(cond, msg, None, auto_overflow=True)
- 
+
      def add(self, input: TensorTy | numbers.Number, other: TensorTy | numbers.Number,
              sanitize_overflow: bool) -> TensorTy:
 @@ -344,6 +344,9 @@ class TritonSemantic(Generic[TensorTy]):
@@ -785,7 +921,7 @@ index 52192cf3e..241ba3378 100644
              else:
 @@ -429,22 +432,61 @@ class TritonSemantic(Generic[TensorTy]):
          return self.tensor(self.builder.create_xor(input.handle, other.handle), input.type)
- 
+
      def logical_and(self, input: TensorTy, other: TensorTy) -> TensorTy:
 +        dst_sca_ty = tl.dtype("int1")
 +        dst_bits = dst_sca_ty.primitive_bitwidth
@@ -812,7 +948,7 @@ index 52192cf3e..241ba3378 100644
 +            else:
 +                other = self.not_equal(other, 0)
          return self.and_(input, other)
- 
+
      def logical_or(self, input: TensorTy, other: TensorTy) -> TensorTy:
 +        dst_sca_ty = tl.dtype("int1")
 +        dst_bits = dst_sca_ty.primitive_bitwidth
@@ -839,7 +975,7 @@ index 52192cf3e..241ba3378 100644
 +            else:
 +                other = self.not_equal(other, 0)
          return self.or_(input, other)
- 
+
      def not_(self, input: TensorTy):
 -        if not input.type.is_int1():
 -            input = self.bitcast(input, tl.int1)
@@ -849,10 +985,10 @@ index 52192cf3e..241ba3378 100644
 +        if input.type.scalar.is_floating():
 +            raise TypeError(f"unexpected type {input.type.scalar}")
          return self.invert(input)
- 
+
      def lshr(self, input: TensorTy, other: TensorTy) -> TensorTy:
 @@ -468,14 +510,22 @@ class TritonSemantic(Generic[TensorTy]):
- 
+
      def minus(self, input: TensorTy) -> TensorTy:
          input_sca_ty = input.type.scalar
 +        if hasattr(input, 'was_bool_to_int8'):
@@ -862,7 +998,7 @@ index 52192cf3e..241ba3378 100644
              raise ValueError("wrong type argument to unary minus (" + input_sca_ty.__repr__() + ")")
          _0 = self.tensor(self.builder.get_null_value(input_sca_ty.to_ir(self.builder)), input_sca_ty)
          return self.sub(_0, input, True)
- 
+
      def invert(self, input: TensorTy) -> TensorTy:
 +        if hasattr(input, 'was_bool_to_int8'):
 +            assert input.type.scalar.is_int8(), "input wat bool to int8. However, input.type is not int8."
@@ -892,7 +1028,7 @@ index 52192cf3e..241ba3378 100644
 @@ -1009,6 +1062,8 @@ class TritonSemantic(Generic[TensorTy]):
          # Check `boundary_check` argument
          boundary_check = self._canonicalize_boundary_check(boundary_check, dst_ty.get_block_shapes())
- 
+
 +        if boundary_check and padding is None:
 +            padding = ir.PADDING_OPTION.PAD_ZERO
          # Build IR
@@ -913,7 +1049,7 @@ index 52192cf3e..241ba3378 100644
          if not ptr.type.is_block():
              if mask and mask.type.is_block():
 @@ -1065,13 +1125,19 @@ class TritonSemantic(Generic[TensorTy]):
- 
+
          # Build IR
          if mask is None:
 -            ret = self.tensor(self.builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)
@@ -935,12 +1071,12 @@ index 52192cf3e..241ba3378 100644
 +            ret.was_bool_to_int8 = True
 +
          return ret
- 
+
      def load(self, ptr: TensorTy, mask: Optional[TensorTy], other: Optional[TensorTy], boundary_check: Tuple,
 @@ -1799,12 +1865,17 @@ class TritonSemantic(Generic[TensorTy]):
          is_signed = [arg.dtype.is_int_signed() for arg in args]
          return self.tensor(self.builder.create_print(prefix, hex, new_args, is_signed), tl.void)
- 
+
 -    def device_assert(self, cond: TensorTy, msg: str, mask: Optional[TensorTy]) -> TensorTy:
 +    def device_assert(self, cond: TensorTy, msg: str, mask: Optional[TensorTy],
 +                      auto_overflow: bool = False) -> TensorTy:
@@ -954,7 +1090,7 @@ index 52192cf3e..241ba3378 100644
 +        else:
 +            self.builder.create_assert(cond.handle, msg)
 +        return self.tensor(None, tl.void)
- 
+
      def assume(self, cond) -> TensorTy:
          return self.tensor(self.builder.create_assume(cond.handle), tl.void)
 diff --git a/python/triton/language/standard.py b/python/triton/language/standard.py
@@ -963,8 +1099,8 @@ index b1dd327bb..c49330d40 100644
 +++ b/python/triton/language/standard.py
 @@ -170,11 +170,17 @@ def _elementwise_max(a, b):
      return core.maximum(a, b)
- 
- 
+
+
 +@jit
 +def _elementwise_max_propagate_nan(a, b):
 +    return core.maximum(a, b, propagate_nan=core.PropagateNan.ALL)
@@ -989,17 +1125,17 @@ index b1dd327bb..c49330d40 100644
 +            return core.reduce(input, axis, _elementwise_max, keep_dims=keep_dims)
 +        else:
 +            return core.reduce(input, axis, _elementwise_max_propagate_nan, keep_dims=keep_dims)
- 
- 
+
+
  @core._tensor_member_fn
 diff --git a/python/triton/runtime/interpreter.py b/python/triton/runtime/interpreter.py
 index cd871cb2e..82eb6960d 100644
 --- a/python/triton/runtime/interpreter.py
 +++ b/python/triton/runtime/interpreter.py
 @@ -22,6 +22,25 @@ from .._C.libtriton import ir as _ir
- 
+
  T = TypeVar("T")
- 
+
 +# Import Ascend-specific interpreter builder (with deferred import to avoid circular dependency)
 +_has_ascend_support = False
 +AscendInterpreterBuilder = None
@@ -1019,7 +1155,7 @@ index cd871cb2e..82eb6960d 100644
 +        _has_ascend_support = False
 +        AscendInterpreterBuilder = None
 +
- 
+
  @dataclass
  class TensorHandle:
 @@ -134,7 +153,7 @@ class InterpreterOptions:
@@ -1030,7 +1166,7 @@ index cd871cb2e..82eb6960d 100644
 +    allowed_dot_input_precisions: Tuple[str] = ("tf32", "tf32x3", "ieee", "hf32")
      max_num_imprecise_acc_default: int = 0
      backend_name: str = "interpreter"
- 
+
 @@ -210,6 +229,8 @@ def _convert_float(input, input_dtype, output_dtype, rounding_mode):
      bias_input = input_dtype.exponent_bias
      bias_output = output_dtype.exponent_bias
@@ -1071,18 +1207,18 @@ index cd871cb2e..82eb6960d 100644
 +        # For interpreter mode, don't enforce GPU hardware shape constraints
 +        # NumPy matmul works with any size, including small matrices
          self.codegen_fns["min_dot_size"] = lambda lhsType, rhsType: (1, 1, 1)
- 
+
      def set_grid_idx(self, x, y, z):
 @@ -755,6 +785,9 @@ class InterpreterBuilder:
          # Interpreter's device_assert function has a different format than Triton's device_assert
          assert condition, f"{message}"
- 
+
 +    def create_auto_overflow_assert(self, condition, message):
 +        self.create_assert(condition, message)
 +
      def create_assume(self, condition):
          assert condition, "Assume failed"
- 
+
 @@ -1190,6 +1223,11 @@ def _patch_lang(fn):
          _patch_lang_tensor(lang.tensor, scope)
          _patch_lang_core(lang, scope)
@@ -1093,12 +1229,12 @@ index cd871cb2e..82eb6960d 100644
 +        interpreter_builder.patch_extensions(fn, scope)
 +
      return scope
- 
- 
+
+
 @@ -1237,7 +1275,12 @@ def _implicit_cvt(arg):
      return arg
- 
- 
+
+
 -interpreter_builder = InterpreterBuilder()
 +# Use AscendInterpreterBuilder if available, otherwise fall back to base InterpreterBuilder
 +_try_import_ascend()
@@ -1107,8 +1243,8 @@ index cd871cb2e..82eb6960d 100644
 +else:
 +    interpreter_builder = InterpreterBuilder()
  interpreter_semantic = TritonSemantic(interpreter_builder)
- 
- 
+
+
 @@ -1350,11 +1393,14 @@ class GridExecutor:
              grid = grid + (1, ) * (3 - len(grid))
              interpreter_builder.set_grid_dim(*grid)
@@ -1130,10 +1266,10 @@ index cd871cb2e..82eb6960d 100644
                  if triton.knobs.compilation.front_end_debugging:
                      raise
 diff --git a/python/triton/runtime/jit.py b/python/triton/runtime/jit.py
-index 0f506818f..43742c328 100644
+index 0f506818f..f1b321f5a 100644
 --- a/python/triton/runtime/jit.py
 +++ b/python/triton/runtime/jit.py
-@@ -398,14 +398,19 @@ def create_function_from_signature(sig, kparams, backend):
+@@ -398,33 +398,49 @@ def create_function_from_signature(sig, kparams, backend):
      assert len(sig.parameters) == len(kparams)
      # Create the function argument list and the dict entries for the return statement
      specialization = []
@@ -1157,7 +1293,7 @@ index 0f506818f..43742c328 100644
 +                   f"{effective_align})")
              if kp.annotation_type:
                  if isinstance(kp.annotation_type, str):
-@@ -413,7 +418,14 @@ def create_function_from_signature(sig, kparams, backend):
+                     if kp.annotation_type == "u1" or kp.annotation_type[:2] in ["fp", "bf"]:
                          # we do not specialize non-constexpr floats and bools:
                          specialize = False
                  if specialize:
@@ -1173,11 +1309,10 @@ index 0f506818f..43742c328 100644
                  else:
                      # skip runtime specialization:
                      specialization.append(f'("{kp.annotation_type}", None)')
-@@ -420,2 +432,3 @@ def create_function_from_signature(sig, kparams, backend):
              else:
 +                uses_alignment_specialization = uses_alignment_specialization or (align and specialize)
                  specialization.append(f"{ret}")
-@@ -423,8 +436,11 @@ def create_function_from_signature(sig, kparams, backend):
+
      # compute argument string for a given parameter
      arg = lambda x: x[0] if x[1].default is inspect.Parameter.empty else f"{x[0]}=default_{x[0]}"
 +    alignment_specialization_init = (f"    {alignment_specialization_name} = "
@@ -1190,3 +1325,41 @@ index 0f506818f..43742c328 100644
      specialization = [{','.join(specialization)}]
      return params, specialization, options
  """
+@@ -468,6 +484,8 @@ class JITCallable:
+         src = textwrap.dedent("".join(self.raw_src))
+         src = src[re.search(r"^def\s+\w+\s*\(", src, re.MULTILINE).start():]
+         self._src = src
++        self._parsed_src = None
++        self._parsed_tree = None
+         self.hash = None
+
+         # Map of global variables used by the function and any functions it
+@@ -521,11 +539,14 @@ class JITCallable:
+     # the user might want to monkey-patch self.src dynamically.
+     # Our unit tests do this, for example.
+     def parse(self):
+-        tree = ast.parse(self._src)
+-        assert isinstance(tree, ast.Module)
+-        assert len(tree.body) == 1
+-        assert isinstance(tree.body[0], ast.FunctionDef)
+-        return tree
++        if self._parsed_src != self._src:
++            tree = ast.parse(self._src)
++            assert isinstance(tree, ast.Module)
++            assert len(tree.body) == 1
++            assert isinstance(tree.body[0], ast.FunctionDef)
++            self._parsed_src = self._src
++            self._parsed_tree = tree
++        return self._parsed_tree
+
+     @property
+     def type(self):
+@@ -541,6 +562,8 @@ class JITCallable:
+         """
+         self.hash = None
+         self._src = new_src
++        self._parsed_src = None
++        self._parsed_tree = None
+
+     def _set_src(self):
+         raise AttributeError("Cannot set attribute 'src' directly. "

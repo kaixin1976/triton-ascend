@@ -23,7 +23,9 @@
 #include "TritonToStructured/TritonToStructuredPass.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 
 #include "Utils/InterleaveOptimization.h"
@@ -65,11 +67,49 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/raw_ostream.h"
 
 #define DEBUG_TYPE "triton-to-structured"
 
 using namespace mlir;
 using namespace triton;
+
+namespace {
+
+class T2SPhaseTimer {
+public:
+  explicit T2SPhaseTimer(llvm::StringRef phase)
+      : phase(phase), enabled(isEnabled()) {
+    if (enabled)
+      start = Clock::now();
+  }
+
+  ~T2SPhaseTimer() {
+    if (!enabled)
+      return;
+    double elapsedMs =
+        std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    llvm::errs() << "[TritonToStructured timing] " << phase << ": "
+                 << elapsedMs << " ms\n";
+  }
+
+private:
+  using Clock = std::chrono::steady_clock;
+
+  static bool isEnabled() {
+    static const bool enabled = [] {
+      const char *value = std::getenv("TRITON_ASCEND_T2S_TIMING");
+      return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+  }
+
+  llvm::StringRef phase;
+  bool enabled;
+  Clock::time_point start{};
+};
+
+} // namespace
 
 void TritonToStructuredPass::getDependentDialects(
     DialectRegistry &registry) const {
@@ -106,16 +146,35 @@ void TritonToStructuredPass::populateTritonToStructuredCanonicalizationPatterns(
 void TritonToStructuredPass::populateTritonToStructuredPatterns(
     RewritePatternSet &patterns, bool optimizeDynamicOffset,
     bool enableMaskFallbackConversion) {
+  // A failed conversion may materialize dead helper IR, which makes the greedy
+  // driver revisit otherwise unchanged memory operations.  Share operand-aware
+  // attempt state between both patterns so a rewritten dependency still
+  // invalidates the cached failure.
+  auto attemptCache = std::make_shared<MemOpConverter::MemOpAttemptCache>();
   patterns.add<MemOpConverter::LoadConverter>(patterns.getContext(),
                                               optimizeDynamicOffset,
-                                              enableMaskFallbackConversion);
+                                              enableMaskFallbackConversion,
+                                              attemptCache);
   patterns.add<MemOpConverter::StoreConverter>(patterns.getContext(),
                                                optimizeDynamicOffset,
-                                               enableMaskFallbackConversion);
+                                               enableMaskFallbackConversion,
+                                               attemptCache);
 }
 
 LogicalResult
 TritonToStructuredPass::processSplatBinaryOperations(ModuleOp moduleOp) {
+  bool hasCandidate = false;
+  moduleOp.walk([&](arith::CmpIOp cmpOp) {
+    if (!isa<RankedTensorType>(cmpOp.getType()) ||
+        !cmpOp.getLhs().getDefiningOp<triton::SplatOp>() ||
+        !cmpOp.getRhs().getDefiningOp<triton::SplatOp>())
+      return WalkResult::advance();
+    hasCandidate = true;
+    return WalkResult::interrupt();
+  });
+  if (!hasCandidate)
+    return success();
+
   mlir::RewritePatternSet patterns(&getContext());
   patterns.add<CannonicalizerConverter::SplatCmpConverter>(
       patterns.getContext());
@@ -129,34 +188,45 @@ TritonToStructuredPass::processSplatBinaryOperations(ModuleOp moduleOp) {
 void TritonToStructuredPass::runOnOperation() {
   auto moduleOp = getOperation();
   ConversionTarget target(getContext());
-  RewritePatternSet canonicalizerPatterns(&getContext());
-
-  this->populateTritonToStructuredCanonicalizationPatterns(
-      canonicalizerPatterns);
-  if (failed(
-          applyPatternsGreedily(moduleOp, std::move(canonicalizerPatterns)))) {
-    moduleOp.emitWarning("Canonicalize failed");
+  {
+    T2SPhaseTimer timer("canonicalizer patterns");
+    RewritePatternSet canonicalizerPatterns(&getContext());
+    this->populateTritonToStructuredCanonicalizationPatterns(
+        canonicalizerPatterns);
+    if (failed(applyPatternsGreedily(
+            moduleOp, std::move(canonicalizerPatterns)))) {
+      moduleOp.emitWarning("Canonicalize failed");
+    }
   }
 
-  RewritePatternSet tritonToStructuredPatterns(&getContext());
-  populateTritonToStructuredPatterns(tritonToStructuredPatterns,
-                                     optimizeDynamicOffset,
-                                     enableMaskFallbackConversion);
-
-  if (failed(applyPatternsGreedily(moduleOp,
-                                   std::move(tritonToStructuredPatterns)))) {
-    LLVM_DEBUG({ moduleOp->emitRemark("PtrAnalysis: rewrite MemOp failed"); });
+  {
+    T2SPhaseTimer timer("load/store patterns");
+    RewritePatternSet tritonToStructuredPatterns(&getContext());
+    populateTritonToStructuredPatterns(tritonToStructuredPatterns,
+                                       optimizeDynamicOffset,
+                                       enableMaskFallbackConversion);
+    if (failed(applyPatternsGreedily(
+            moduleOp, std::move(tritonToStructuredPatterns)))) {
+      LLVM_DEBUG(
+          { moduleOp->emitRemark("PtrAnalysis: rewrite MemOp failed"); });
+    }
   }
 
-  if (failed(processSplatBinaryOperations(moduleOp))) {
-    moduleOp.emitWarning("Splat binary op processing failed");
+  {
+    T2SPhaseTimer timer("splat binary patterns");
+    if (failed(processSplatBinaryOperations(moduleOp))) {
+      moduleOp.emitWarning("Splat binary op processing failed");
+    }
   }
 
-  PassManager pm(&getContext(), moduleOp.getOperationName());
-  pm.addPass(createCSEPass());
-  pm.addPass(createCanonicalizerPass());
-  if (failed(runPipeline(pm, getOperation()))) {
-    moduleOp->emitWarning("Canonicalize failed");
+  {
+    T2SPhaseTimer timer("CSE and canonicalize");
+    PassManager pm(&getContext(), moduleOp.getOperationName());
+    pm.addPass(createCSEPass());
+    pm.addPass(createCanonicalizerPass());
+    if (failed(runPipeline(pm, getOperation()))) {
+      moduleOp->emitWarning("Canonicalize failed");
+    }
   }
 }
 

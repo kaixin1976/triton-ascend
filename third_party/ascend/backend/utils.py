@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sysconfig
+import tempfile
 import warnings
 from pathlib import Path
 import logging
@@ -160,7 +161,7 @@ _DEPRECATED_NPU_OPTION_DETAILS = {
     "it is ignored; this option has been moved into the first digit of simt_optimization_mode.",
     "storage_align": "it is ignored; the removed vendor compiler control has no replacement.",
     "stream": "it is ignored; launch streams are managed by the runtime and driver.",
-    "use_bytecode": "it is ignored; the bytecode pipeline is always enabled.",
+    "use_bytecode": "it is ignored; TTAdapter text is passed directly to the NPU compiler.",
     "warp_size": "it is ignored; the Ascend backend fixes warp_size to 32.",
 }
 
@@ -492,21 +493,30 @@ def _get_bishengir_opt_path() -> str:
     return bishengir_opt_path, env
 
 
-def _get_npucompiler_path() -> str:
+@functools.lru_cache(maxsize=8)
+def _get_npucompiler_path_for_env(env_items) -> tuple[str, dict]:
+    """Resolve the compiler once for an immutable environment snapshot."""
+    env = dict(env_items)
     ascend_dir = os.path.dirname(os.path.abspath(__file__))
-    env = os.environ.copy()
     npu_compiler_path = os.path.join(ascend_dir, "bishengir", "bin", "bishengir-compile")
     if os.path.exists(npu_compiler_path):
         npuir_env_path = os.path.dirname(npu_compiler_path)
         env["PATH"] = npuir_env_path + ":" + env["PATH"]
     else:
-        npu_compiler_path = shutil.which("bishengir-compile")
+        npu_compiler_path = shutil.which("bishengir-compile", path=env.get("PATH"))
         if npu_compiler_path is None:
-            npu_compiler_root = os.getenv("TRITON_NPU_COMPILER_PATH", None)
+            npu_compiler_root = env.get("TRITON_NPU_COMPILER_PATH")
             if npu_compiler_root is None:
                 raise EnvironmentError("Couldn't find executable bishengir-compile or TRITON_NPU_COMPILER_PATH.")
             npu_compiler_path = os.path.join(npu_compiler_root, "npuc")
     return npu_compiler_path, env
+
+
+def _get_npucompiler_path() -> tuple[str, dict]:
+    # Include every variable because the returned mapping is passed verbatim to
+    # the compiler subprocess. A changed environment gets a distinct cache key;
+    # repeated specializations reuse path resolution and dictionary creation.
+    return _get_npucompiler_path_for_env(tuple(os.environ.items()))
 
 
 def _get_bisheng_path() -> str:
@@ -529,53 +539,76 @@ def _is_valid_bishengir_path(path: str) -> bool:
     return True
 
 
+@functools.lru_cache(maxsize=8)
+def _get_bishengir_help(bishengir_path: str, size: int, mtime_ns: int) -> str:
+    """Return compiler help, keyed by the executable's stable file identity."""
+    cache_root = os.getenv("TRITON_ASCEND_TOOL_CACHE_DIR")
+    if not cache_root:
+        cache_root = os.path.join(os.getenv("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "triton-ascend")
+    identity = f"{os.path.realpath(bishengir_path)}\0{size}\0{mtime_ns}"
+    cache_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    cache_dir = os.path.join(cache_root, "tool-capabilities")
+    cache_path = os.path.join(cache_dir, f"bishengir-{cache_key}.txt")
+    try:
+        return Path(cache_path).read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError, UnicodeError):
+        pass
+
+    result = subprocess.run(
+        [bishengir_path, "--help"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode != 0:
+        return ""
+
+    help_text = result.stdout
+    tmp_path = None
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=cache_dir, delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            tmp_file.write(help_text)
+        os.replace(tmp_path, cache_path)
+    except OSError:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    return help_text
+
+
+def _get_bishengir_compile_capabilities(*options: str):
+    """Resolve the compiler and query several help options with one snapshot."""
+    bishengir_path, env = _get_npucompiler_path()
+    if not _is_valid_bishengir_path(bishengir_path):
+        print(f"ERROR: Invalid bishengir path format: {bishengir_path}")
+        return bishengir_path, env, tuple(False for _option in options)
+    try:
+        identity = os.stat(bishengir_path)
+        help_text = _get_bishengir_help(bishengir_path, identity.st_size, identity.st_mtime_ns)
+        return bishengir_path, env, tuple(option in help_text for option in options)
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return bishengir_path, env, tuple(False for _option in options)
+
+
+def _bishengir_supports(option: str) -> bool:
+    _, _, supported = _get_bishengir_compile_capabilities(option)
+    return supported[0]
+
+
 # grep bishengir-compile's option limit-auto-multi-buffer-buffer to check
 # if bishengir-compile is a newer version which does not generate kernel_reloc.o
 # any more.
 def _check_bishengir_api_change() -> bool:
-    bishengir_path, _ = _get_npucompiler_path()
-    if not _is_valid_bishengir_path(bishengir_path):
-        print(f"ERROR: Invalid bishengir path format: {bishengir_path}")
-        return False
-    try:
-        result = subprocess.run(
-            [bishengir_path, "--help"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode == 0 and 'limit-auto-multi-buffer-buffer' in result.stdout:
-            # bishengir-compile is newer version
-            return True
-        else:
-            # bishengir-compile is older version
-            return False
-    except Exception as e:
-        print(f"ERROR: {e}")
-        return False
+    return _bishengir_supports('limit-auto-multi-buffer-buffer')
 
 
 def _check_bishengir_is_regbased() -> bool:
-    bishengir_path, _ = _get_npucompiler_path()
-    if not _is_valid_bishengir_path(bishengir_path):
-        print(f"ERROR: Invalid bishengir path format: {bishengir_path}")
-        return False
-    try:
-        result = subprocess.run(
-            [bishengir_path, "--help"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode == 0 and 'reg-based' in result.stdout:
-            # bishengir-compile is regbased version
-            return True
-        else:
-            # bishengir-compile is membased version
-            return False
-    except Exception as e:
-        print(f"ERROR: {e}")
-        return False
+    return _bishengir_supports('reg-based')
 
 
 @functools.lru_cache(None)
@@ -754,24 +787,7 @@ def convert_dtype_to_numpy(dtype):
 
 
 def _check_bishengir_able_save_ir() -> bool:
-    bishengir_path, _ = _get_npucompiler_path()
-    if not _is_valid_bishengir_path(bishengir_path):
-        print(f"ERROR: Invalid bishengir path format: {bishengir_path}")
-        return False
-    try:
-        result = subprocess.run(
-            [bishengir_path, "--help"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if result.returncode == 0 and 'save-linked-ir' in result.stdout:
-            return True
-        else:
-            return False
-    except Exception as e:
-        print(f"ERROR: {e}")
-        return False
+    return _bishengir_supports('save-linked-ir')
 
 
 def get_ascend_arch_from_env():

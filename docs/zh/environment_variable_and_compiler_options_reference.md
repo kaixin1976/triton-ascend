@@ -28,6 +28,7 @@ python run_kernel.py
 | **调试与日志** | TRITON_LLVM_DEBUG_ONLY | 未设置 | 功能等同于 LLVM 的`-debug-only`命令行选项。该参数可将 LLVM 调试输出限定到特定的优化通道或组件名称（这些名称通过 LLVM 和 Triton 中的`#define DEBUG_TYPE`宏定义），从而有效减少调试信息的冗余输出。用户可指定一个或多个逗号分隔的值，例如：`TRITON_LLVM_DEBUG_ONLY="tritongpu-remove-layout-conversions"`或`TRITON_LLVM_DEBUG_ONLY="tritongpu-remove-layout-conversions,regalloc"`。 | 逗号分隔值：通道或组件名称 | |
 | **调试与日志** | USE_IR_LOC | 0 或未设置 | 控制是否在生成的中间表示（IR）中包含位置信息（如文件名、行号等）。这些信息对调试很有帮助，但可能会增加生成的IR的大小。设置为1，会重新解析中间表示(IR)，将位置信息映射为具有特定扩展名的IR文件行号（而非Python源文件行号）。这能建立从IR到LLVM IR/PTX的直接映射关系。配合性能分析工具使用时，可实现对IR指令的细粒度性能剖析。 | 0：不包含位置信息<br>1：包含位置信息 | |
 | **调试与日志** | TRITON_PRINT_AUTOTUNING | 0 或未设置 | 在自动调优完成后，输出每个内核的最佳配置及总耗时。 | 0：不输出<br>1：输出 | |
+| **调试与日志** | TRITON_ASCEND_NPUBIN_TIMING | 0 或未设置 | 为每次外部 NPUBIN 编译输出一条 JSON 计时记录，包含缓存查询、临时文件读写、子进程、callback 加载和清理时间。 | 0：不启用<br>1/true/yes/on：启用 | 仅用于诊断；关闭时不读取计时时钟。 |
 | **调试与日志** | MLIR_ENABLE_REMARK | 0 或未设置 | 启用MLIR 编译过程中的备注信息输出，包括以备注形式输出的性能警告。 | 0：不启用<br>1：启用 | |
 | **调试与日志** | TRITON_KERNEL_DUMP | 0 或未设置 | 启用或禁用 Triton 内核的转储功能，当启用时，Triton 会将生成的内核代码（各编译阶段IR及最终PTX）保存到指定目录。 | 0：不启用<br>1：启用 | |
 | **调试与日志** | TRITON_DUMP_DIR | ~/.triton/dump | 指定 Triton 内核转储文件的保存目录。当`TRITON_KERNEL_DUMP=1`时保存IR和PTX的目录。 | "path"：保存路径 | |
@@ -41,6 +42,10 @@ python run_kernel.py
 | **编译控制** | TRITON_KERNEL_OVERRIDE | 0 或未设置 | 启用或禁用 Triton 内核覆盖功能，允许在每个编译阶段开始时用用户指定的外部文件（IR/PTX等）覆盖默认生成的内核代码。 | 0：不启用<br>1：启用 | |
 | **编译控制** | TRITON_OVERRIDE_DIR | ~/.triton/override | 指定 Triton 内核覆盖文件的查找目录。当`TRITON_KERNEL_OVERRIDE=1`时加载IR/PTX文件的目录。 | "path"：保存路径 | |
 | **编译控制** | TRITON_ASCEND_COMPILE_SPEED_OPT | 0 或未设置 | 控制JIT编译器在发现内核编译失败后是否跳过后续编译阶段。设为`1`跳过（默认`0`继续尝试）。 | 0：继续尝试<br>1：跳过 | |
+| **编译控制** | TRITON_ASCEND_COMPILER_STACKTRACE | 0 或未设置 | 控制是否向 `bishengir-compile` 传递 `--mlir-print-stacktrace-on-diagnostic`。该诊断会显著增加编译耗时，默认关闭；仅在排查编译器错误时启用。 | 0：不启用<br>1/true/yes/on：启用 | |
+| **编译控制** | TRITON_ASCEND_GENERIC_LAUNCHER | 1 或未设置 | 使用运行时打包 kernel 参数的缓存 launcher，使 launcher metadata 类型相同的 kernel 共享一个已编译 launcher。不支持的 tensor descriptor 和 tensor profiling 配置会自动回退到逐 kernel launcher。 | 1/true/yes/on：启用<br>0/false/no/off：禁用 | |
+| **编译控制** | TRITON_ASCEND_TOOL_CACHE_DIR | `$XDG_CACHE_HOME/triton-ascend`；未设置 `XDG_CACHE_HOME` 时为 `~/.cache/triton-ascend` | 跨 Python 进程缓存外部编译器能力探测结果。编译器解析路径、文件大小或修改时间变化时，缓存自动失效。 | 目录路径 | 仅在默认用户缓存目录不适用时设置。 |
+| **编译控制** | TRITON_ASCEND_NPUBIN_CACHE | 1 | 当最终 TTAdapter 文本、编译参数、工具链身份、CANN 身份和相关工具链环境完全一致时，复用 NPUBIN 与编译器 callback 元数据。同 key 的并发进程通过文件锁共享一个 producer。debug 编译及 `TRITON_ALWAYS_COMPILE=1` 会绕过该缓存。 | 1/true/yes/on：启用<br>0/false/no/off：禁用 | 该内容缓存可跨等价 Triton specialization 复用二进制。 |
 | **编译控制** | TRITON_COMPILE_ONLY | 0 或未设置 | remote_launch时使用，只编译不运行。 | 0：不启用<br>1：启用 | |
 | **编译控制** | TRITON_DISABLE_FFTS | 0 或未设置 | 是否禁用FFTS。 | 0：启用<br>1：禁用 | |
 | **编译控制** | TRITON_DISABLE_PRECOMPILE | 0 或未设置 | 是否禁用预编译。                                                                                                                                                                                                                                                                                  | 0：启用预编译<br>1：禁用预编译                                                                               | |

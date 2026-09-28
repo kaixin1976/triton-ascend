@@ -35,6 +35,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 
 #include <algorithm>
@@ -289,12 +290,25 @@ void GraphOptimizePass::runOnOperation() {
     unsigned rewriteCount = 0;
 
     for (GraphOptimizationRulePhase phase : kRulePhases) {
+      const bool hasRulesForPhase = llvm::any_of(
+          enabledRules, [phase](const GraphOptimizationRule *rule) {
+            return getGraphOptimizationRulePhase(rule->getId()) == phase;
+          });
+      if (!hasRulesForPhase)
+        continue;
+
       while (rewriteCount < options.maxRewritesPerFunction) {
-        ProgramOrderMap programOrder = buildProgramOrderMap(function);
         SmallVector<std::unique_ptr<RewritePlan>> plans;
 
         for (GraphOptimizationRule *rule : enabledRules) {
           if (getGraphOptimizationRulePhase(rule->getId()) != phase)
+            continue;
+
+          // Several program-mapping rules have cheap structural exclusions
+          // (for example, nested SCF) but request comparatively expensive
+          // alias/dependence/resource analyses.  Prove applicability first so
+          // a rule that cannot match does not construct unused analyses.
+          if (!rule->mayHaveCandidates(context))
             continue;
 
           if (failed(context.ensure(rule->getAnalysisRequirements()))) {
@@ -321,6 +335,10 @@ void GraphOptimizePass::runOnOperation() {
         if (plans.empty())
           break;
 
+        // Candidate discovery is read-only. Build the ordering map only when
+        // at least one plan exists instead of walking the full function once
+        // for every empty rule phase.
+        ProgramOrderMap programOrder = buildProgramOrderMap(function);
         std::stable_sort(
             plans.begin(), plans.end(),
             [&programOrder](const std::unique_ptr<RewritePlan> &lhs,

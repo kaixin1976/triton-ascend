@@ -37,6 +37,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/LogicalResult.h"
 
@@ -59,6 +60,61 @@ static bool compileOn91095Flag = false;
 static triton::ascend::CompileMode compileModeFlag =
     triton::ascend::CompileMode::Simd;
 static bool useSyncBlockLockFlag = true;
+
+static bool isScalarSplat(Value value) {
+  auto splat = value.getDefiningOp<triton::SplatOp>();
+  return splat && !isa<ShapedType>(splat.getSrc().getType());
+}
+
+static bool isZeroBasedRangeWithScalarOffset(Value value) {
+  auto isZeroBasedRange = [](Value candidate) {
+    auto range = candidate.getDefiningOp<triton::MakeRangeOp>();
+    return range && range.getStart() == 0 && range.getEnd() > 0;
+  };
+  if (isZeroBasedRange(value))
+    return true;
+  auto add = value.getDefiningOp<arith::AddIOp>();
+  return add && ((isZeroBasedRange(add.getLhs()) && isScalarSplat(add.getRhs())) ||
+                 (isZeroBasedRange(add.getRhs()) && isScalarSplat(add.getLhs())));
+}
+
+static bool isSimpleContinuousPrefixMask(Value mask) {
+  auto cmp = mask.getDefiningOp<arith::CmpIOp>();
+  return cmp && cmp.getPredicate() == arith::CmpIPredicate::slt &&
+         isZeroBasedRangeWithScalarOffset(cmp.getLhs()) &&
+         isScalarSplat(cmp.getRhs());
+}
+
+static bool needsDiscreteMaskConversion(ModuleOp module) {
+  bool needsConversion = false;
+  module.walk([&](Operation *op) {
+    if (isa<triton::AtomicRMWOp, triton::AtomicCASOp>(op)) {
+      needsConversion = true;
+      return WalkResult::interrupt();
+    }
+    if (auto loop = dyn_cast<scf::ForOp>(op)) {
+      if (llvm::any_of(loop.getInitArgs(), [](Value init) {
+            auto type = dyn_cast<RankedTensorType>(init.getType());
+            return type && type.getElementType().isInteger(1);
+          })) {
+        needsConversion = true;
+        return WalkResult::interrupt();
+      }
+    }
+
+    Value mask;
+    if (auto load = dyn_cast<triton::LoadOp>(op))
+      mask = load.getMask();
+    else if (auto store = dyn_cast<triton::StoreOp>(op))
+      mask = store.getMask();
+    if (mask && !isSimpleContinuousPrefixMask(mask)) {
+      needsConversion = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return needsConversion;
+}
 
 // Only signed comparisons against the same fixed, zero-based range are
 // accepted. Preserve the original bound's integer semantics, including
@@ -716,6 +772,9 @@ void DiscreteMaskAccessConversionPass::runOnOperation() {
   }
   compileModeFlag = *compileMode;
   auto moduleOp = getOperation();
+  if (!needsDiscreteMaskConversion(moduleOp))
+    return;
+
   RewritePatternSet loopMaskPatterns(&getContext());
   loopMaskPatterns.add<CanonicalizeLoopPrefixMask>(&getContext());
   if (failed(applyPatternsGreedily(moduleOp, std::move(loopMaskPatterns)))) {

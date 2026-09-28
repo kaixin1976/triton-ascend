@@ -158,6 +158,14 @@ struct TritonCustomOpToHIVMSyncOpConversion
 
 void TritonToHIVMPass::runOnOperation() {
   auto module = getOperation();
+  bool hasCandidate = false;
+  module.walk([&](triton::ascend::CustomOp) {
+    hasCandidate = true;
+    return WalkResult::interrupt();
+  });
+  if (!hasCandidate)
+    return;
+
   ConversionTarget target(getContext());
   target.addLegalDialect<hivm::HIVMDialect>();
 

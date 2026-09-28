@@ -22,6 +22,9 @@
 #ifndef TRITON_ADAPTER_MEMOPCONVERTER_H
 #define TRITON_ADAPTER_MEMOPCONVERTER_H
 
+#include <memory>
+#include <utility>
+
 #include "TritonToStructured/MaskAnalysis.h"
 #include "TritonToStructured/PtrAnalysis.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
@@ -36,20 +39,28 @@
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 
 namespace MemOpConverter {
 
 using namespace mlir;
 using namespace triton;
 
+using MemOpOperands = llvm::SmallVector<Value, 4>;
+using MemOpAttemptCache = llvm::DenseMap<Operation *, MemOpOperands>;
+
 class LoadConverter : public OpRewritePattern<triton::LoadOp> {
 public:
   explicit LoadConverter(MLIRContext *context,
                          bool optimizeDynamicOffset = false,
-                         bool enableMaskFallbackConversion = false)
+                         bool enableMaskFallbackConversion = false,
+                         std::shared_ptr<MemOpAttemptCache> attemptCache =
+                             nullptr)
       : OpRewritePattern<triton::LoadOp>(context),
         optimizeDynamicOffset(optimizeDynamicOffset),
-        enableMaskFallbackConversion(enableMaskFallbackConversion) {};
+        enableMaskFallbackConversion(enableMaskFallbackConversion),
+        attemptCache(std::move(attemptCache)) {};
 
   using OpRewritePattern<triton::LoadOp>::OpRewritePattern;
 
@@ -59,16 +70,20 @@ public:
 private:
   bool optimizeDynamicOffset;
   bool enableMaskFallbackConversion;
+  std::shared_ptr<MemOpAttemptCache> attemptCache;
 };
 
 class StoreConverter : public OpRewritePattern<triton::StoreOp> {
 public:
   explicit StoreConverter(MLIRContext *context,
                           bool optimizeDynamicOffset = false,
-                          bool enableMaskFallbackConversion = false)
+                          bool enableMaskFallbackConversion = false,
+                          std::shared_ptr<MemOpAttemptCache> attemptCache =
+                              nullptr)
       : OpRewritePattern<triton::StoreOp>(context),
         optimizeDynamicOffset(optimizeDynamicOffset),
-        enableMaskFallbackConversion(enableMaskFallbackConversion) {};
+        enableMaskFallbackConversion(enableMaskFallbackConversion),
+        attemptCache(std::move(attemptCache)) {};
 
   using OpRewritePattern<triton::StoreOp>::OpRewritePattern;
 
@@ -78,6 +93,7 @@ public:
 private:
   bool optimizeDynamicOffset;
   bool enableMaskFallbackConversion;
+  std::shared_ptr<MemOpAttemptCache> attemptCache;
 };
 
 class MemOpTransformer {

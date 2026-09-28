@@ -60,6 +60,14 @@ struct TritonAnnotationConversionPattern
 
 void TritonToAnnotationPass::runOnOperation() {
   auto module = getOperation();
+  bool hasCandidate = false;
+  module.walk([&](mlir::triton::ascend::AnnotationOp) {
+    hasCandidate = true;
+    return WalkResult::interrupt();
+  });
+  if (!hasCandidate)
+    return;
+
   ConversionTarget target(getContext());
   target.addLegalDialect<annotation::AnnotationDialect>();
 

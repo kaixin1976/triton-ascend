@@ -41,6 +41,7 @@
 #include "ascend/include/TritonToLinalg/TritonToLinalgPass.h"
 #include "ascend/include/TritonToStructured/CannonicalizerConverter.h"
 #include "ascend/include/TritonToUnstructure/UnstructureConversionPass.h"
+#include "ascend/include/Utils/DebugUtils.h"
 #include "ascend/include/Utils/InterleaveOptimization.h"
 
 #include "bishengir/Dialect/HFusion/IR/HFusion.h"
@@ -55,6 +56,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
@@ -86,8 +88,10 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -96,6 +100,43 @@
 
 using namespace mlir;
 using namespace triton;
+
+namespace {
+
+class T2LPhaseTimer {
+public:
+  explicit T2LPhaseTimer(llvm::StringRef phase)
+      : phase(phase), enabled(isEnabled()) {
+    if (enabled)
+      start = Clock::now();
+  }
+
+  ~T2LPhaseTimer() {
+    if (!enabled)
+      return;
+    double elapsedMs =
+        std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    llvm::errs() << "[TritonToLinalg timing] " << phase << ": " << elapsedMs
+                 << " ms\n";
+  }
+
+private:
+  using Clock = std::chrono::steady_clock;
+
+  static bool isEnabled() {
+    static const bool enabled = [] {
+      const char *value = std::getenv("TRITON_ASCEND_T2L_TIMING");
+      return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+  }
+
+  llvm::StringRef phase;
+  bool enabled;
+  Clock::time_point start{};
+};
+
+} // namespace
 
 int nd2nzFlag = 0;
 bool compileOn91095Flag = false;
@@ -1176,15 +1217,22 @@ static LogicalResult finishMemoryConversion(ModuleOp moduleOp) {
   // Pointer/control-flow handoff metadata has no consumers after the memory
   // stage. Drop it before canonicalization so SCF can safely remove dead
   // iter_args and results in addition to ordinary trivially-dead operations.
-  removePointerConversionHandoffAttrs(moduleOp);
+  {
+    T2LPhaseTimer timer("finish: remove pointer handoff attrs");
+    removePointerConversionHandoffAttrs(moduleOp);
+  }
 
-  PassManager cleanupPipeline(moduleOp.getContext(),
-                              moduleOp.getOperationName());
-  cleanupPipeline.addPass(createCSEPass());
-  cleanupPipeline.addPass(createCanonicalizerPass());
-  if (failed(cleanupPipeline.run(moduleOp)))
-    return failure();
+  {
+    T2LPhaseTimer timer("finish: CSE and canonicalize");
+    PassManager cleanupPipeline(moduleOp.getContext(),
+                                moduleOp.getOperationName());
+    cleanupPipeline.addPass(createCSEPass());
+    cleanupPipeline.addPass(createCanonicalizerPass());
+    if (failed(cleanupPipeline.run(moduleOp)))
+      return failure();
+  }
 
+  T2LPhaseTimer timer("finish: verify no Triton pointers");
   return verifyNoTritonPointers(moduleOp);
 }
 
@@ -1489,6 +1537,37 @@ TritonToLinalgPass::processPtrBroadcastOperations(ModuleOp moduleOp) {
 
 LogicalResult
 TritonToLinalgPass::processImplicitPermuteOperations(ModuleOp moduleOp) {
+  bool hasCandidate = false;
+  moduleOp.walk([&](Operation *op) {
+    if (auto cmp = dyn_cast<arith::CmpIOp>(op)) {
+      if (cmp.getLhs().getDefiningOp<triton::SplatOp>() &&
+          cmp.getRhs().getDefiningOp<triton::SplatOp>()) {
+        hasCandidate = true;
+        return WalkResult::interrupt();
+      }
+    }
+
+    Value pointer;
+    if (auto load = dyn_cast<triton::LoadOp>(op))
+      pointer = load.getPtr();
+    else if (auto store = dyn_cast<triton::StoreOp>(op))
+      pointer = store.getPtr();
+    else if (auto atomicRmw = dyn_cast<triton::AtomicRMWOp>(op))
+      pointer = atomicRmw.getPtr();
+    else if (auto atomicCas = dyn_cast<triton::AtomicCASOp>(op))
+      pointer = atomicCas.getPtr();
+
+    auto pointerType = pointer ? dyn_cast<RankedTensorType>(pointer.getType())
+                               : RankedTensorType();
+    if (pointerType && pointerType.getRank() > 1) {
+      hasCandidate = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  if (!hasCandidate)
+    return success();
+
   mlir::RewritePatternSet patterns(&getContext());
   patterns.add<ImplicitPermute::LoadConverter>(patterns.getContext());
   patterns.add<ImplicitPermute::StoreConverter>(patterns.getContext());
@@ -1570,51 +1649,83 @@ TritonToLinalgPass::processLegalStrideOperations(ModuleOp moduleOp) {
 }
 
 void TritonToLinalgPass::runOnOperation() {
-  if (failed(initializeTargetOptions())) {
-    signalPassFailure();
-    return;
+  {
+    T2LPhaseTimer timer("initialize target options");
+    if (failed(initializeTargetOptions())) {
+      signalPassFailure();
+      return;
+    }
   }
 
   auto moduleOp = getOperation();
 
   // Validate the CFO handoff before any rewrite can erase malformed metadata.
-  if (failed(validatePointerDescriptorHandoffMetadata(moduleOp))) {
-    moduleOp->emitError("invalid pointer descriptor handoff metadata");
-    signalPassFailure();
-    return;
+  {
+    T2LPhaseTimer timer("validate pointer handoff");
+    if (failed(validatePointerDescriptorHandoffMetadata(moduleOp))) {
+      moduleOp->emitError("invalid pointer descriptor handoff metadata");
+      signalPassFailure();
+      return;
+    }
   }
 
   // CUBE requirements affect normalization itself. SIMT requirements must also
   // account for indirect accesses introduced by that normalization.
-  bool hasCubeOps = collectCubeRequirements(moduleOp);
-  existDotFlag = hasCubeOps;
-  normalizeMemoryAccessForms(moduleOp);
-  bool hasSimtOps = collectSimtRequirements(moduleOp);
-
-  if (failed(prepareMemoryConversion(moduleOp))) {
-    signalPassFailure();
-    return;
+  bool hasCubeOps;
+  {
+    T2LPhaseTimer timer("collect cube requirements");
+    hasCubeOps = collectCubeRequirements(moduleOp);
   }
-  if (failed(convertMemoryAndPointers(moduleOp))) {
-    signalPassFailure();
-    return;
+  existDotFlag = hasCubeOps;
+  {
+    T2LPhaseTimer timer("normalize memory access forms");
+    normalizeMemoryAccessForms(moduleOp);
+  }
+  bool hasSimtOps;
+  {
+    T2LPhaseTimer timer("collect simt requirements");
+    hasSimtOps = collectSimtRequirements(moduleOp);
+  }
+
+  {
+    T2LPhaseTimer timer("prepare memory conversion");
+    if (failed(prepareMemoryConversion(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
+  }
+  {
+    T2LPhaseTimer timer("convert memory and pointers");
+    if (failed(convertMemoryAndPointers(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
   }
 
   // Retire the consumed handoff, remove dead address chains, and verify the
   // pointer-free boundary before converting the remaining computations.
-  if (failed(finishMemoryConversion(moduleOp))) {
-    moduleOp->emitError("failed to clean up after memory conversion");
-    signalPassFailure();
-    return;
+  {
+    T2LPhaseTimer timer("finish memory conversion");
+    if (failed(finishMemoryConversion(moduleOp))) {
+      moduleOp->emitError("failed to clean up after memory conversion");
+      signalPassFailure();
+      return;
+    }
   }
-  if (failed(convertRemainingComputations(moduleOp))) {
-    signalPassFailure();
-    return;
+  {
+    T2LPhaseTimer timer("convert remaining computations");
+    if (failed(convertRemainingComputations(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
   }
 
-  if (failed(finalizeLoweredModule(moduleOp, hasCubeOps, hasSimtOps))) {
-    signalPassFailure();
-    return;
+  {
+    T2LPhaseTimer timer("finalize lowered module");
+    if (failed(finalizeLoweredModule(moduleOp, hasCubeOps, hasSimtOps))) {
+      signalPassFailure();
+      return;
+    }
   }
 }
 
@@ -1635,25 +1746,35 @@ LogicalResult TritonToLinalgPass::initializeTargetOptions() {
 // in order. Preserve their existing failure reporting and continuation.
 void TritonToLinalgPass::normalizeMemoryAccessForms(ModuleOp moduleOp) {
   // Execute tensor descriptor operations conversion
-  if (failed(processDescriptorOperations(moduleOp))) {
-    signalPassFailure();
+  {
+    T2LPhaseTimer timer("normalize: descriptor operations");
+    if (failed(processDescriptorOperations(moduleOp))) {
+      signalPassFailure();
+    }
   }
 
   // Execute implicit permute
-  if (failed(processImplicitPermuteOperations(moduleOp))) {
-    LLVM_DEBUG(
-        { llvm::dbgs() << "Failed to process implicit permute operations\n"; });
-    signalPassFailure();
+  {
+    T2LPhaseTimer timer("normalize: implicit permute");
+    if (failed(processImplicitPermuteOperations(moduleOp))) {
+      LLVM_DEBUG({
+        llvm::dbgs() << "Failed to process implicit permute operations\n";
+      });
+      signalPassFailure();
+    }
   }
 
   // SIMT IndirectLoad fast-path rewrite (runs after ImplicitPermute so the
   // permuted access patterns have already been absorbed; this step only
   // catches non-permuted last-axis stride > 1 loads).
-  if (failed(processStridedLoadStoreRewriteOperations(moduleOp))) {
-    LLVM_DEBUG({
-      llvm::dbgs() << "Failed to process indirect-load rewrite operations\n";
-    });
-    signalPassFailure();
+  {
+    T2LPhaseTimer timer("normalize: strided load/store rewrite");
+    if (failed(processStridedLoadStoreRewriteOperations(moduleOp))) {
+      LLVM_DEBUG({
+        llvm::dbgs() << "Failed to process indirect-load rewrite operations\n";
+      });
+      signalPassFailure();
+    }
   }
 }
 
@@ -1663,6 +1784,7 @@ LogicalResult TritonToLinalgPass::prepareMemoryConversion(ModuleOp moduleOp) {
   // Annotate Memory-Related Triton FuncOps with tensor_kind (used by
   // profiling).
   {
+    T2LPhaseTimer timer("prepare: mark tensor kind");
     PassManager pm(&getContext(), moduleOp.getOperationName());
     pm.addPass(triton::createMarkTensorKindPass());
     if (failed(runPipeline(pm, moduleOp))) {
@@ -1671,26 +1793,33 @@ LogicalResult TritonToLinalgPass::prepareMemoryConversion(ModuleOp moduleOp) {
     }
   }
 
-  RewritePatternSet canonicalizerPatterns(&getContext());
-  // Canonicalize load/store related patterns.
-  // The currently registered patterns rewrite pointer consumers but do not
-  // replace tt.make_tensor_ptr/tt.addptr descriptor rebuild roots. A future
-  // pattern that rewrites those producers must atomically transfer
-  // PointerDescriptorRebuild to its replacement; entry validation alone
-  // cannot preserve metadata across a producer rewrite.
-  this->populateTritonToLinalgCanonicalizationPatterns(canonicalizerPatterns);
-  if (failed(
-          applyPatternsGreedily(moduleOp, std::move(canonicalizerPatterns)))) {
-    moduleOp->emitError("failed to apply Canonicalizer Patterns");
-    return failure();
+  {
+    T2LPhaseTimer timer("prepare: canonicalizer patterns");
+    RewritePatternSet canonicalizerPatterns(&getContext());
+    // Canonicalize load/store related patterns.
+    // The currently registered patterns rewrite pointer consumers but do not
+    // replace tt.make_tensor_ptr/tt.addptr descriptor rebuild roots. A future
+    // pattern that rewrites those producers must atomically transfer
+    // PointerDescriptorRebuild to its replacement; entry validation alone
+    // cannot preserve metadata across a producer rewrite.
+    this->populateTritonToLinalgCanonicalizationPatterns(
+        canonicalizerPatterns);
+    if (failed(applyPatternsGreedily(moduleOp,
+                                     std::move(canonicalizerPatterns)))) {
+      moduleOp->emitError("failed to apply Canonicalizer Patterns");
+      return failure();
+    }
   }
 
   // Canonicalization may legitimately delete an unused, already validated
   // boundary. Revalidate every surviving handoff so later phases never consume
   // a marker whose structural edges changed without updating its slot contract.
-  if (failed(validatePointerDescriptorHandoffMetadata(moduleOp))) {
-    moduleOp->emitError("invalid pointer descriptor handoff metadata");
-    return failure();
+  {
+    T2LPhaseTimer timer("prepare: revalidate pointer handoff");
+    if (failed(validatePointerDescriptorHandoffMetadata(moduleOp))) {
+      moduleOp->emitError("invalid pointer descriptor handoff metadata");
+      return failure();
+    }
   }
 
   // Pre-clean genuinely dead TTIR. Descriptor handoff attributes require
@@ -1698,55 +1827,65 @@ LogicalResult TritonToLinalgPass::prepareMemoryConversion(ModuleOp moduleOp) {
   // restricted cleanup until the memory stage has consumed that contract.
   // This remains ordinary side-effect-aware DCE; it does not infer liveness
   // backwards from stores or discard memory reads on its own.
-  if (failed(preCleanBeforeMemoryConversion(moduleOp))) {
-    moduleOp->emitError(
-        "failed to pre-clean dead control-flow before memory conversion");
-    return failure();
+  {
+    T2LPhaseTimer timer("prepare: pre-clean");
+    if (failed(preCleanBeforeMemoryConversion(moduleOp))) {
+      moduleOp->emitError(
+          "failed to pre-clean dead control-flow before memory conversion");
+      return failure();
+    }
   }
 
   // Normalize pointer broadcasts before the pointer-only type conversion.
-  if (failed(processPtrBroadcastOperations(moduleOp))) {
-    return failure();
+  {
+    T2LPhaseTimer timer("prepare: pointer broadcasts");
+    if (failed(processPtrBroadcastOperations(moduleOp))) {
+      return failure();
+    }
   }
 
   // Inject program id / number of programs arguments before the first
   // function signature conversion so both conversion stages observe the same
   // kernel ABI.
-  for (auto func : getOperation().getOps<triton::FuncOp>()) {
-    addProgramInfo(func, globalKernel);
-  }
-
-  // Mark the control-flow boundaries that must be structurally rewritten
-  // while pointer values and address-only tensor carriers are still present.
-  moduleOp.walk([this](LoopLikeOpInterface loopOp) {
-    auto *op = loopOp.getOperation();
-    // CFO-expanded pointer loops already carry policy-owned descriptor
-    // components. They require ordinary nested-op conversion, not the legacy
-    // pointer-loop decomposition a second time. Unmarked loops are delegated
-    // only when their original boundary still carries Triton pointer/address
-    // state. A fixed-layout memref is already a complete SCF value; the fact
-    // that its init is produced by reinterpret_cast does not make it BlockData.
-    bool hasExpandedPointerDescriptor =
-        op->hasAttr(mlir::triton::controlflow::kPointerDescriptorBoundaryAttr);
-    if (!op->hasAttr("ExtractedLoadOrStore") &&
-        needsLegacyBlockDataLoopRewrite(loopOp))
-      op->setAttr("UnhandledLoopOp", UnitAttr::get(op->getContext()));
-
-    if (hasExpandedPointerDescriptor)
-      return;
-
-    for (auto res : loopOp->getResults()) {
-      if (auto tensorType = dyn_cast<RankedTensorType>(res.getType());
-          tensorType &&
-          !isa<triton::PointerType>(tensorType.getElementType())) {
-        IRRewriter rewriter(op->getContext());
-        rewriter.setInsertionPointAfter(op);
-        auto newVal =
-            rewriter.create<tensor::CastOp>(op->getLoc(), res.getType(), res);
-        rewriter.replaceAllUsesExcept(res, newVal, newVal);
-      }
+  {
+    T2LPhaseTimer timer("prepare: ABI and loop boundaries");
+    for (auto func : getOperation().getOps<triton::FuncOp>()) {
+      addProgramInfo(func, globalKernel);
     }
-  });
+
+    // Mark the control-flow boundaries that must be structurally rewritten
+    // while pointer values and address-only tensor carriers are still present.
+    moduleOp.walk([this](LoopLikeOpInterface loopOp) {
+      auto *op = loopOp.getOperation();
+      // CFO-expanded pointer loops already carry policy-owned descriptor
+      // components. They require ordinary nested-op conversion, not the legacy
+      // pointer-loop decomposition a second time. Unmarked loops are delegated
+      // only when their original boundary still carries Triton pointer/address
+      // state. A fixed-layout memref is already a complete SCF value; the fact
+      // that its init is produced by reinterpret_cast does not make it
+      // BlockData.
+      bool hasExpandedPointerDescriptor = op->hasAttr(
+          mlir::triton::controlflow::kPointerDescriptorBoundaryAttr);
+      if (!op->hasAttr("ExtractedLoadOrStore") &&
+          needsLegacyBlockDataLoopRewrite(loopOp))
+        op->setAttr("UnhandledLoopOp", UnitAttr::get(op->getContext()));
+
+      if (hasExpandedPointerDescriptor)
+        return;
+
+      for (auto res : loopOp->getResults()) {
+        if (auto tensorType = dyn_cast<RankedTensorType>(res.getType());
+            tensorType &&
+            !isa<triton::PointerType>(tensorType.getElementType())) {
+          IRRewriter rewriter(op->getContext());
+          rewriter.setInsertionPointAfter(op);
+          auto newVal = rewriter.create<tensor::CastOp>(
+              op->getLoc(), res.getType(), res);
+          rewriter.replaceAllUsesExcept(res, newVal, newVal);
+        }
+      }
+    });
+  }
   return success();
 }
 
@@ -1807,64 +1946,104 @@ LogicalResult TritonToLinalgPass::finalizeLoweredModule(ModuleOp moduleOp,
   // incorrect code on Ascend, so this is fixed post-conversion on
   // linalg::ReduceOp.
   {
-    RewritePatternSet foldPatterns(&getContext());
-    TTOpConverters::populatePostConversionCanonicalizationPatterns(
-        foldPatterns);
+    T2LPhaseTimer timer("finalize: post-conversion patterns");
+    bool hasMaxWithIndexReduce = false;
+    moduleOp.walk([&](linalg::ReduceOp reduceOp) {
+      auto reduceMode = reduceOp->getAttrOfType<StringAttr>("reduce_mode");
+      if (!reduceMode || reduceMode != "max_with_index")
+        return WalkResult::advance();
+      hasMaxWithIndexReduce = true;
+      return WalkResult::interrupt();
+    });
 
-    if (failed(applyPatternsGreedily(moduleOp, std::move(foldPatterns)))) {
-      moduleOp->emitError("failed to fold one-hot gather after max_with_index");
-      return failure();
+    if (hasMaxWithIndexReduce) {
+      RewritePatternSet foldPatterns(&getContext());
+      TTOpConverters::populatePostConversionCanonicalizationPatterns(
+          foldPatterns);
+
+      if (failed(applyPatternsGreedily(moduleOp, std::move(foldPatterns)))) {
+        moduleOp->emitError(
+            "failed to fold one-hot gather after max_with_index");
+        return failure();
+      }
     }
   }
 
   // Execute legal stride operations conversion
-  if (failed(processLegalStrideOperations(moduleOp))) {
-    signalPassFailure();
+  {
+    T2LPhaseTimer timer("finalize: legal stride operations");
+    if (failed(processLegalStrideOperations(moduleOp))) {
+      signalPassFailure();
+    }
   }
 
   // Convert function prologue/epilogue.
-  moduleOp.walk([&](triton::FuncOp func) {
-    this->convertTTFunc(func, hasCubeOps, hasSimtOps);
-  });
+  {
+    T2LPhaseTimer timer("finalize: function ABI conversion");
+    moduleOp.walk([&](triton::FuncOp func) {
+      this->convertTTFunc(func, hasCubeOps, hasSimtOps);
+    });
+  }
 
-  rewriteDevicePrintOffsets(moduleOp);
+  {
+    T2LPhaseTimer timer("finalize: device print offsets");
+    rewriteDevicePrintOffsets(moduleOp);
+  }
 
   // Clean up dead code and simplify IR.
-  PassManager pm(&getContext(), moduleOp.getOperationName());
-  pm.addPass(createCSEPass());
-  pm.addPass(createCanonicalizerPass());
-  if (failed(runPipeline(pm, getOperation()))) {
-    signalPassFailure();
-  }
-
-  // Collapses call-site locations whose callee is an inlined Triton stdlib
-  // helper (under site-packages) down to their caller (user-file) frame
-  //     Opt-in via LLVM_EXTRACT_DI_LOCAL_VARIABLES=1.
   {
+    T2LPhaseTimer timer("finalize: CSE and canonicalize");
     PassManager pm(&getContext(), moduleOp.getOperationName());
-    pm.addPass(triton::createCanonicalizeDebugLocationsPass());
-    if (failed(runPipeline(pm, moduleOp))) {
-      moduleOp->emitWarning("CanonicalizeDebugLocationsPass pass failed");
+    pm.addPass(createCSEPass());
+    pm.addPass(createCanonicalizerPass());
+    if (failed(runPipeline(pm, getOperation()))) {
+      signalPassFailure();
     }
   }
 
-  // Deduplicate debug NOPs inserted by converters.
-  //     Opt-in via LLVM_EXTRACT_DI_LOCAL_VARIABLES=1.
-  {
-    PassManager pm(&getContext(), moduleOp.getOperationName());
-    pm.addPass(triton::createDeduplicateDebugNopsPass());
-    if (failed(runPipeline(pm, moduleOp))) {
-      moduleOp->emitWarning("DeduplicateDebugNops pass failed");
-      // Non-fatal: dedup is a quality improvement, not a correctness pass.
+  // Both debug passes are opt-in. Avoid constructing and running two nested
+  // pass managers when debug NOP generation is disabled.
+  if (triton::debug::isDebugNopEnabled()) {
+    // Collapse inlined stdlib call-site locations to their caller frame.
+    {
+      T2LPhaseTimer timer("finalize: canonicalize debug locations");
+      PassManager pm(&getContext(), moduleOp.getOperationName());
+      pm.addPass(triton::createCanonicalizeDebugLocationsPass());
+      if (failed(runPipeline(pm, moduleOp))) {
+        moduleOp->emitWarning("CanonicalizeDebugLocationsPass pass failed");
+      }
+    }
+
+    // Deduplicate debug NOPs inserted by converters.
+    {
+      T2LPhaseTimer timer("finalize: deduplicate debug nops");
+      PassManager pm(&getContext(), moduleOp.getOperationName());
+      pm.addPass(triton::createDeduplicateDebugNopsPass());
+      if (failed(runPipeline(pm, moduleOp))) {
+        moduleOp->emitWarning("DeduplicateDebugNops pass failed");
+        // Non-fatal: dedup is a quality improvement, not correctness.
+      }
     }
   }
 
-  if (failed(finalizePointerCasts(moduleOp)))
-    return failure();
+  {
+    T2LPhaseTimer timer("finalize: pointer casts");
+    if (failed(finalizePointerCasts(moduleOp)))
+      return failure();
+  }
 
-  optimizeInterleavedStores(moduleOp);
-  addRuntimeWorkspaceArguments(moduleOp);
-  repairUnknownLocations(moduleOp);
+  {
+    T2LPhaseTimer timer("finalize: interleaved stores");
+    optimizeInterleavedStores(moduleOp);
+  }
+  {
+    T2LPhaseTimer timer("finalize: runtime workspace arguments");
+    addRuntimeWorkspaceArguments(moduleOp);
+  }
+  {
+    T2LPhaseTimer timer("finalize: repair unknown locations");
+    repairUnknownLocations(moduleOp);
+  }
   return success();
 }
 
@@ -2194,19 +2373,27 @@ void TritonToLinalgPass::addRuntimeWorkspaceArguments(ModuleOp moduleOp) {
 
 // Propagate known locations after all IR and ABI mutations have completed.
 void TritonToLinalgPass::repairUnknownLocations(ModuleOp moduleOp) {
+  if (triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO"))
+    return;
+
   // Fix the Location info
   moduleOp.walk([&](Operation *op) {
     auto loc = op->getLoc();
     if (isa<UnknownLoc>(loc)) {
       llvm::SmallPtrSet<Operation *, 16> stopOps;
-      traverseForwardUpdateUserChainIf(
-          op,
-          /*conditionFn*/
-          [](Operation *curOp) { return false; },
-          /*stopFn*/
-          [](Operation *curOp) { return !isa<UnknownLoc>(curOp->getLoc()); },
-          /*actionFn*/
-          nullptr, stopOps);
+      llvm::SmallPtrSet<Operation *, 32> visited;
+      SmallVector<Operation *, 32> worklist{op};
+      while (!worklist.empty()) {
+        Operation *current = worklist.pop_back_val();
+        if (!current || !visited.insert(current).second)
+          continue;
+        if (!isa<UnknownLoc>(current->getLoc())) {
+          stopOps.insert(current);
+          continue;
+        }
+        for (Value result : current->getResults())
+          llvm::append_range(worklist, result.getUsers());
+      }
       if (stopOps.empty()) {
         op->emitWarning() << *op << " and its users all have no location!";
       } else {

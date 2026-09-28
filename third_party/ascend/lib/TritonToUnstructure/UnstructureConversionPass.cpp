@@ -39,6 +39,8 @@
 
 #include "llvm/ADT/STLExtras.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <optional>
 
 #define DEBUG_TYPE "triton-unstructure-converter"
@@ -52,6 +54,39 @@ static triton::ascend::CompileMode unstructureCompileMode =
     triton::ascend::CompileMode::Simd;
 
 namespace {
+
+class UnstructurePhaseTimer {
+public:
+  explicit UnstructurePhaseTimer(llvm::StringRef phase)
+      : phase(phase), enabled(isEnabled()) {
+    if (enabled)
+      start = Clock::now();
+  }
+
+  ~UnstructurePhaseTimer() {
+    if (!enabled)
+      return;
+    double elapsedMs =
+        std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+    llvm::errs() << "[TritonToUnstructure timing] " << phase << ": "
+                 << elapsedMs << " ms\n";
+  }
+
+private:
+  using Clock = std::chrono::steady_clock;
+
+  static bool isEnabled() {
+    static const bool enabled = [] {
+      const char *value = std::getenv("TRITON_ASCEND_UNSTRUCTURE_TIMING");
+      return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+  }
+
+  llvm::StringRef phase;
+  bool enabled;
+  Clock::time_point start{};
+};
 
 static bool isTensorOfPointers(Type type) {
   auto tensorType = dyn_cast<RankedTensorType>(type);
@@ -1199,6 +1234,16 @@ void TritonToUnstructurePass::runParse(MemAccOpTy op) {
 
 LogicalResult
 TritonToUnstructurePass::processIfYieldAddHoistOperations(ModuleOp moduleOp) {
+  bool hasCandidate = false;
+  moduleOp.walk([&](scf::IfOp ifOp) {
+    if (ifOp.getNumResults() == 0)
+      return WalkResult::advance();
+    hasCandidate = true;
+    return WalkResult::interrupt();
+  });
+  if (!hasCandidate)
+    return success();
+
   mlir::RewritePatternSet patterns(&getContext());
   patterns.add<CannonicalizerConverter::IfYieldAddHoistConverter>(
       patterns.getContext());
@@ -1235,29 +1280,41 @@ void TritonToUnstructurePass::runOnOperation() {
   ModuleOp moduleOp = getOperation();
   MLIRContext *ctx = &getContext();
 
-  canonicalizeSupportedPointerBitcasts(moduleOp);
-
-  moduleOp->walk([this](triton::FuncOp funcOp) {
-    replacePtrArguments(funcOp, offsetMapForLoopArgs);
-  });
-  offsetMapForLoopArgs.clear();
-
-  if (failed(processIfYieldAddHoistOperations(moduleOp))) {
-    moduleOp.emitWarning("Failed to process IfYieldAddHoist operations");
+  {
+    UnstructurePhaseTimer timer("canonicalize pointer bitcasts");
+    canonicalizeSupportedPointerBitcasts(moduleOp);
   }
 
-  moduleOp->walk([this](LoopLikeOpInterface op) { runPreparse(op); });
-  moduleOp->walk([this](Operation *op) {
-    if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {
-      runParse(loadOp);
-    } else if (auto storeOp = dyn_cast<triton::StoreOp>(op)) {
-      runParse(storeOp);
-    } else if (auto atomicRMWOp = dyn_cast<triton::AtomicRMWOp>(op)) {
-      runParse(atomicRMWOp);
-    } else if (auto atomicCASOp = dyn_cast<triton::AtomicCASOp>(op)) {
-      runParse(atomicCASOp);
+  {
+    UnstructurePhaseTimer timer("replace pointer arguments");
+    moduleOp->walk([this](triton::FuncOp funcOp) {
+      replacePtrArguments(funcOp, offsetMapForLoopArgs);
+    });
+    offsetMapForLoopArgs.clear();
+  }
+
+  {
+    UnstructurePhaseTimer timer("if-yield add hoist");
+    if (failed(processIfYieldAddHoistOperations(moduleOp))) {
+      moduleOp.emitWarning("Failed to process IfYieldAddHoist operations");
     }
-  });
+  }
+
+  {
+    UnstructurePhaseTimer timer("preparse loops and memory accesses");
+    moduleOp->walk([this](LoopLikeOpInterface op) { runPreparse(op); });
+    moduleOp->walk([this](Operation *op) {
+      if (auto loadOp = dyn_cast<triton::LoadOp>(op)) {
+        runParse(loadOp);
+      } else if (auto storeOp = dyn_cast<triton::StoreOp>(op)) {
+        runParse(storeOp);
+      } else if (auto atomicRMWOp = dyn_cast<triton::AtomicRMWOp>(op)) {
+        runParse(atomicRMWOp);
+      } else if (auto atomicCASOp = dyn_cast<triton::AtomicCASOp>(op)) {
+        runParse(atomicCASOp);
+      }
+    });
+  }
 
   RewritePatternSet patterns(ctx);
 
@@ -1272,20 +1329,26 @@ void TritonToUnstructurePass::runOnOperation() {
     os << "Parsing done\n";
   });
 
-  if (failed(applyPatternsGreedily(moduleOp, std::move(patterns)))) {
-    moduleOp->emitError("failed to apply Patterns");
-    signalPassFailure();
-    return;
+  {
+    UnstructurePhaseTimer timer("unstructured memory rewrite");
+    if (failed(applyPatternsGreedily(moduleOp, std::move(patterns)))) {
+      moduleOp->emitError("failed to apply Patterns");
+      signalPassFailure();
+      return;
+    }
   }
 
   bool unsupportedLoopMask = false;
-  moduleOp.walk([&](Operation *op) {
-    if (op->hasAttr(ConverterUtils::runtimeLoopMaskAttrName)) {
-      op->emitError("cannot lower this loop-carried mask with a masked "
-                    "indirect access for the selected target and compile mode");
-      unsupportedLoopMask = true;
-    }
-  });
+  {
+    UnstructurePhaseTimer timer("validate loop masks");
+    moduleOp.walk([&](Operation *op) {
+      if (op->hasAttr(ConverterUtils::runtimeLoopMaskAttrName)) {
+        op->emitError("cannot lower this loop-carried mask with a masked "
+                      "indirect access for the selected target and compile mode");
+        unsupportedLoopMask = true;
+      }
+    });
+  }
   if (unsupportedLoopMask) {
     signalPassFailure();
     return;
@@ -1293,14 +1356,21 @@ void TritonToUnstructurePass::runOnOperation() {
 
   // The offset-boundary marker is only an intra-pass analysis handoff.  Do
   // not expose it to T2L or let it inhibit later canonicalization.
-  moduleOp->walk(
-      [](Operation *op) { op->removeAttr(kScalarPointerOffsetBoundaryAttr); });
+  {
+    UnstructurePhaseTimer timer("remove pointer handoff attributes");
+    moduleOp->walk([](Operation *op) {
+      op->removeAttr(kScalarPointerOffsetBoundaryAttr);
+    });
+  }
 
-  PassManager pm(&getContext(), moduleOp.getOperationName());
-  pm.addPass(createCSEPass());
-  pm.addPass(createCanonicalizerPass());
-  if (failed(runPipeline(pm, getOperation()))) {
-    signalPassFailure();
+  {
+    UnstructurePhaseTimer timer("CSE and canonicalize");
+    PassManager pm(&getContext(), moduleOp.getOperationName());
+    pm.addPass(createCSEPass());
+    pm.addPass(createCanonicalizerPass());
+    if (failed(runPipeline(pm, getOperation()))) {
+      signalPassFailure();
+    }
   }
 }
 

@@ -35,6 +35,30 @@ bool isSplat(Operation *op) {
   return (matchPattern(op, m_Constant(&constAttr)) && constAttr.isSplat());
 }
 
+bool hasReorderBroadcastCandidate(ModuleOp module) {
+  WalkResult result = module.walk([&](Operation *op) -> WalkResult {
+    // These operations own the canonicalization patterns registered below.
+    // Treat every instance as a candidate; the guard must be a conservative
+    // superset of the patterns that may rewrite.
+    if (isa<BroadcastOp, ExpandDimsOp>(op))
+      return WalkResult::interrupt();
+
+    // MoveSplatAfterElementwisePattern is the only remaining pattern that can
+    // match without a BroadcastOp or ExpandDimsOp in the module.
+    if (!op->hasTrait<OpTrait::Elementwise>() || !isMemoryEffectFree(op) ||
+        op->getNumOperands() == 0)
+      return WalkResult::advance();
+
+    for (Value operand : op->getOperands()) {
+      Operation *definingOp = operand.getDefiningOp();
+      if (!definingOp || !isSplat(definingOp))
+        return WalkResult::advance();
+    }
+    return WalkResult::interrupt();
+  });
+  return result.wasInterrupted();
+}
+
 // elementwise(splat(a), splat(b), ...) => splat(elementwise(a, b, ...))
 struct MoveSplatAfterElementwisePattern
     : public OpTraitRewritePattern<OpTrait::Elementwise> {
@@ -214,6 +238,9 @@ public:
     MLIRContext *context = &getContext();
     RewritePatternSet patterns(context);
     ModuleOp m = getOperation();
+
+    if (!hasReorderBroadcastCandidate(m))
+      return;
 
     BroadcastOp::getCanonicalizationPatterns(patterns, context);
     ExpandDimsOp::getCanonicalizationPatterns(patterns, context);

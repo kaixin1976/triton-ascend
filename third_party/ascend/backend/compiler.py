@@ -19,6 +19,7 @@
 # THE SOFTWARE.
 
 import ctypes
+import contextlib
 import functools
 import hashlib
 import glob
@@ -26,8 +27,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import warnings
 from dataclasses import InitVar, dataclass, field
 from pathlib import Path
@@ -45,15 +49,14 @@ from triton.backends.ascend.utils import (
     _check_bishengir_api_change,
     _check_bishengir_able_save_ir,
     _check_bishengir_is_regbased,
+    _get_bishengir_compile_capabilities,
     _enable_print_ub_bits,
     _enable_dump_memory_info,
     _enable_msdebug,
     _get_kernel_target,
     _get_npucompiler_path,
     _get_triton_adapter_opt_path,
-    _get_triton_mlir_opt_path,
     _get_triton_opt_path,
-    _get_bishengir_opt_path,
     _is_ascend_sanitizer_enabled,
     _is_debug_line_info_disabled,
     _is_auto_map_parallel_blocks_enabled,
@@ -81,7 +84,189 @@ from triton.backends.compiler import (
     BaseBackend,
     GPUTarget,
 )
-from triton.runtime.cache import get_dump_manager
+from triton.runtime.cache import get_cache_manager, get_dump_manager
+
+
+_COMPILER_STACKTRACE_ENV = "TRITON_ASCEND_COMPILER_STACKTRACE"
+_NPUBIN_TIMING_ENV = "TRITON_ASCEND_NPUBIN_TIMING"
+_NPUBIN_CACHE_ENV = "TRITON_ASCEND_NPUBIN_CACHE"
+_NPUBIN_CACHE_SCHEMA = 1
+_NPUBIN_CACHE_METADATA_KEYS = (
+    "bs_task_type",
+    "workspace_size",
+    "sync_block_lock_layout",
+    "lock_init_val",
+    "required_ub_bits",
+)
+_NPUBIN_CACHE_ENV_KEYS = (
+    "ASCEND_AICPU_PATH",
+    "ASCEND_HOME_PATH",
+    "ASCEND_OPP_PATH",
+    "ASCEND_TOOLKIT_HOME",
+    "BISHENGIR_PATH",
+    "CMAKE_PREFIX_PATH",
+    "CPATH",
+    "LD_LIBRARY_PATH",
+    "LIBRARY_PATH",
+    "PATH",
+)
+_NPUBIN_DEPENDENCY_TOOLS = (
+    "bisheng",
+    "hivmc",
+    "ld.lld",
+    "llvm-link",
+    "llvm-nm",
+)
+
+
+def _is_compiler_stacktrace_enabled() -> bool:
+    return os.getenv(_COMPILER_STACKTRACE_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+class _NpubinBoundaryTimer:
+    """Diagnostic-only timer for work around the external NPU compiler."""
+
+    def __init__(self, stage: str):
+        self.enabled = os.getenv(_NPUBIN_TIMING_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+        self.stage = stage
+        self.intervals = {}
+        self.start_ns = time.perf_counter_ns() if self.enabled else 0
+        self.last_ns = self.start_ns
+
+    def mark(self, name: str) -> None:
+        if not self.enabled:
+            return
+        now_ns = time.perf_counter_ns()
+        self.intervals[name] = (now_ns - self.last_ns) / 1_000_000
+        self.last_ns = now_ns
+
+    def finish(self, **details) -> None:
+        if not self.enabled:
+            return
+        payload = {
+            "stage": self.stage,
+            "total_ms": (time.perf_counter_ns() - self.start_ns) / 1_000_000,
+            "interval_ms": self.intervals,
+            **details,
+        }
+        print(f"[TRITON_ASCEND_NPUBIN_TIMING] {json.dumps(payload, sort_keys=True)}", file=sys.stderr, flush=True)
+
+
+def _file_identity(path: str) -> dict:
+    resolved = os.path.realpath(path)
+    stat = os.stat(resolved)
+    return {
+        "path": resolved,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+@functools.lru_cache(maxsize=8)
+def _npubin_dependency_tool_paths(path_env: str | None) -> tuple[str, ...]:
+    return tuple(
+        tool_path
+        for tool in _NPUBIN_DEPENDENCY_TOOLS
+        if (tool_path := shutil.which(tool, path=path_env)) is not None
+    )
+
+
+class _NpubinContentCache:
+    """Share deterministic NPUBIN results across equivalent specializations."""
+
+    _manifest_name = "npubin-cache.json"
+    _binary_name = "kernel.npubin"
+    _metadata_name = "metadata.json"
+
+    def __init__(self, linalg: str, compiler_path: str, compile_options, env, *, debug: bool):
+        setting = os.getenv(_NPUBIN_CACHE_ENV, "1").strip().lower()
+        self.enabled = setting not in ("0", "false", "no", "off")
+        always_compile = os.getenv("TRITON_ALWAYS_COMPILE", "0").strip().lower()
+        self.enabled = self.enabled and not debug and always_compile not in ("1", "true", "yes", "on")
+        self.manager = None
+        self.key = None
+        if not self.enabled:
+            return
+
+        dependencies = [_file_identity(compiler_path)]
+        for tool_path in _npubin_dependency_tool_paths(env.get("PATH")):
+            dependencies.append(_file_identity(tool_path))
+        for option in compile_options:
+            prefix = "--link-aicore-bitcode="
+            if option.startswith(prefix):
+                dependencies.append(_file_identity(option[len(prefix):]))
+        try:
+            cann_identity = get_cann_version_file_hash()
+        except (OSError, ValueError):
+            cann_identity = None
+        payload = {
+            "schema": _NPUBIN_CACHE_SCHEMA,
+            "ir_sha256": hashlib.sha256(linalg.encode("utf-8")).hexdigest(),
+            "compile_options": list(compile_options),
+            "dependencies": dependencies,
+            "cann_version_file_sha256": cann_identity,
+            "environment": {name: env.get(name) for name in _NPUBIN_CACHE_ENV_KEYS},
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        self.key = hashlib.sha256(encoded).hexdigest()
+        self.manager = get_cache_manager(self.key)
+
+    def load(self):
+        if self.manager is None:
+            return None
+        try:
+            group = self.manager.get_group(self._manifest_name) or {}
+            binary_path = group.get(self._binary_name)
+            metadata_path = group.get(self._metadata_name)
+            if binary_path is None or metadata_path is None:
+                return None
+            binary = Path(binary_path).read_bytes()
+            record = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+            if record.get("schema") != _NPUBIN_CACHE_SCHEMA or record.get("key") != self.key:
+                return None
+            if record.get("binary_size") != len(binary):
+                return None
+            if record.get("binary_sha256") != hashlib.sha256(binary).hexdigest():
+                return None
+            cached_metadata = record.get("metadata")
+            if not isinstance(cached_metadata, dict):
+                return None
+            return binary, cached_metadata
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+
+    @contextlib.contextmanager
+    def lock(self):
+        cache_dir = getattr(self.manager, "cache_dir", None)
+        if cache_dir is None:
+            yield
+            return
+        import fcntl
+        lock_path = os.path.join(cache_dir, "compile.lock")
+        with open(lock_path, "a+b") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    def store(self, binary: bytes, metadata) -> None:
+        if self.manager is None:
+            return
+        cached_metadata = {name: metadata[name] for name in _NPUBIN_CACHE_METADATA_KEYS if name in metadata}
+        record = {
+            "schema": _NPUBIN_CACHE_SCHEMA,
+            "key": self.key,
+            "binary_size": len(binary),
+            "binary_sha256": hashlib.sha256(binary).hexdigest(),
+            "metadata": cached_metadata,
+        }
+        binary_path = self.manager.put(binary, self._binary_name, binary=True)
+        metadata_path = self.manager.put(json.dumps(record, sort_keys=True), self._metadata_name, binary=False)
+        self.manager.put_group(
+            self._manifest_name,
+            {self._binary_name: binary_path, self._metadata_name: metadata_path},
+        )
 
 
 # TODO: materialize the concrete min shape
@@ -294,13 +479,63 @@ def _graph_optimize_kwargs(opt):
     return kwargs
 
 
+def _is_single_leaf_ttir_module(mod) -> bool:
+    """Return whether inlining and symbol DCE are provably no-ops."""
+    walk = getattr(mod, "walk", None)
+    if not callable(walk):
+        return False
+
+    function_count = 0
+    has_call = False
+
+    def inspect(op):
+        nonlocal function_count, has_call
+        name = op.get_name()
+        if name == "tt.func":
+            function_count += 1
+        elif name == "tt.call":
+            has_call = True
+
+    walk(inspect)
+    return function_count == 1 and not has_call
+
+
+def _get_auto_blockify_blacklist_reasons_from_module(mod):
+    """Scan only operations that can match the TTIR text blacklist."""
+    walk = getattr(mod, "walk", None)
+    if not callable(walk):
+        return _get_auto_blockify_blacklist_reasons(str(mod))
+
+    reasons = set()
+
+    def inspect(op):
+        name = op.get_name()
+        if name in ("tt.atomic_rmw", "tt.atomic_cas"):
+            reasons.add("atomic operations")
+        elif name == "tt.elementwise_inline_asm":
+            reasons.add("inline elementwise assembly")
+        elif name in ("tt.load", "tt.store"):
+            reasons.update(_get_auto_blockify_blacklist_reasons(str(op)))
+
+    walk(inspect)
+    reason_order = (
+        "atomic operations",
+        "inline elementwise assembly",
+        "loads with volatile",
+        "loads or stores with cache modifiers",
+    )
+    return [reason for reason in reason_order if reason in reasons]
+
+
 def make_ttir(mod, metadata, opt):
     if "hash" not in metadata:
         metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
     # the same optimize pass for triton-ir as all other backends
     pm = ir.pass_manager(mod.context)
     pm.enable_debug()
-    passes.common.add_inliner(pm)
+    single_leaf_module = _is_single_leaf_ttir_module(mod)
+    if not single_leaf_module:
+        passes.common.add_inliner(pm)
     # passes.ttir.add_rewrite_tensor_pointer(pm)
     passes.ttir.add_rewrite_tensor_descriptor_to_pointer(pm)
     passes.ttir.add_combine(pm)
@@ -308,7 +543,8 @@ def make_ttir(mod, metadata, opt):
     passes.ttir.add_reorder_broadcast(pm)
     passes.common.add_cse(pm)
     passes.common.add_licm(pm)
-    passes.common.add_symbol_dce(pm)
+    if not single_leaf_module:
+        passes.common.add_symbol_dce(pm)
     passes.ttir.add_loop_unroll(pm)
     if opt.enable_graph_optimize:
         ascend.passes.ttir.add_graph_optimize(pm, **_graph_optimize_kwargs(opt))
@@ -321,25 +557,59 @@ def make_ttir(mod, metadata, opt):
     return mod
 
 
+_CUSTOM_TO_TENSOR_RE = re.compile(
+    r'(?m)^(?P<indent>\s*)(?P<result>%[-.$\w]+)\s*=\s*'
+    r'bufferization\.to_tensor\s+(?P<operand>%[-.$\w]+)'
+    r'(?P<props>(?:\s+(?:restrict|writable))*)\s*:\s*'
+    r'(?P<input>.+?)\s+to\s+(?P<output>tensor<.+>)'
+    r'(?P<suffix>\s+loc\(.+\))?$'
+)
+
+
+def _serialize_ttadapter_for_npuir(mod):
+    """Use version-stable generic syntax for LLVM 22 to_tensor operations."""
+    text = str(mod)
+
+    def replace_to_tensor(match):
+        props = ", ".join(match.group("props").split())
+        properties = f" <{{{props}}}>" if props else ""
+        suffix = match.group("suffix") or ""
+        return (
+            f'{match.group("indent")}{match.group("result")} = '
+            f'"bufferization.to_tensor"({match.group("operand")})'
+            f'{properties} : ({match.group("input")}) -> '
+            f'{match.group("output")}{suffix}'
+        )
+
+    return _CUSTOM_TO_TENSOR_RE.sub(replace_to_tensor, text)
+
+
 def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
     # use triton_adapter to lower Triton-MLIR to linalg
-    # Get Triton-MLIR as string
-    ttir_code = str(mod)
+    # Normal compilation keeps the module in-process.  Materialize full TTIR
+    # text only for debug output; the safety scan below inspects candidate ops.
+    ttir_code = str(mod) if opt.debug else None
     auto_map_parallel_blocks_enabled = _is_auto_map_parallel_blocks_enabled()
     # This is compiler-derived safety metadata, never a user compile option.
     # Derive it even when the feature is currently disabled so a later runtime
     # environment change cannot enable AutoBlockify for unsafe TTIR.
-    blacklist_reasons = _get_auto_blockify_blacklist_reasons(ttir_code)
+    blacklist_reasons = _get_auto_blockify_blacklist_reasons_from_module(mod)
     has_auto_blockify_blacklist_op = bool(blacklist_reasons)
     metadata["has_auto_blockify_blacklist_op"] = has_auto_blockify_blacklist_op
     if auto_map_parallel_blocks_enabled and has_auto_blockify_blacklist_op and blacklist_reasons:
+        if ttir_code is None:
+            ttir_code = str(mod)
         kernel_name = re.search(r"tt\.func\spublic\s+@(\w+)", ttir_code).group(1)
         _warn_auto_blockify_disabled(kernel_name or "<unknown>", blacklist_reasons)
-    with tempfile.TemporaryDirectory() as tmpdir:
-        src_path = os.path.join(tmpdir, "kernel.ttir.mlir")
-        dst_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
-        Path(src_path).write_text(ttir_code)
-        triton_adapter_opt_path = _get_triton_adapter_opt_path()
+    # The adapter pipeline runs in-process.  Keep the temporary source/output
+    # names only for the debug command; normal compilation must not write a
+    # TTIR file that no subprocess consumes.
+    tempdir = tempfile.TemporaryDirectory() if opt.debug else contextlib.nullcontext(None)
+    with tempdir as tmpdir:
+        if opt.debug:
+            src_path = os.path.join(tmpdir, "kernel.ttir.mlir")
+            dst_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
+            Path(src_path).write_text(ttir_code)
 
         # Select analysis is a fixed lowering policy, not a user compile option.
         enable_select_analysis = True
@@ -375,7 +645,11 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         ascend.passes.ttir.add_triton_to_hfusion(pm, compile_on_910_95)
         ascend.passes.ttir.add_triton_to_llvm(pm)
         ascend.passes.ttir.add_bubble_up_operation(pm)
-        ascend.passes.ttir.add_triton_to_structure(pm, False, False)
+        # TritonToStructured has already reached a fixed point before the
+        # unstructure/HIVM lowering.  Running it again here repeats its greedy
+        # rewrites and CSE/canonicalizer cleanup, while TritonToLinalg owns the
+        # remaining conversion.  Keeping only the first invocation produces
+        # byte-identical adapter IR for the regression corpus.
         ascend.passes.ttir.add_triton_to_linalg(pm, False, named_ops, False, enable_select_analysis, compile_on_910_95,
                                                 compile_mode)
         # Restricted to 910_95/950. The merged buffer is written by two disjoint
@@ -432,87 +706,12 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
                                           set_workspace_multibuffer=set_workspace_multibuffer)
         _export_program_grid_metadata(mod, metadata)
 
+        ttadapter_text = _serialize_ttadapter_for_npuir(mod)
         if opt.debug:
             dump_manager = get_dump_manager(metadata["hash"])
-            dump_manager.put(str(mod), "kernel.ttadapter.mlir", binary=False)
+            dump_manager.put(ttadapter_text, "kernel.ttadapter.mlir", binary=False)
 
-        return str(mod)
-
-
-def linalg_to_bc_by_triton_mlir_opt(linalg: str, metadata, opt):
-    """
-    Convert Linalg IR to MLIR Bytecode format using triton-mlir-opt.
-    This function supports both MLIR and BishengIR ops.
-    Args:
-        linalg: Linalg IR in text format
-        metadata: Compilation metadata
-        opt: Compilation options
-    Returns:
-        Bytecode data as bytes (not file path, to avoid temp directory cleanup issues)
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        ttadapter_path = os.path.join(tmpdir, "kernel.ttadapter.mlir")
-        bc_path = os.path.join(tmpdir, "kernel.mlirbc")
-        Path(ttadapter_path).write_text(linalg)
-
-        triton_mlir_opt_path = _get_triton_mlir_opt_path()
-
-        # The --emit-bytecode flag ensures output is in BC format
-        subprocess.run([
-            triton_mlir_opt_path,
-            ttadapter_path,
-            "--emit-bytecode",
-            "-o",
-            bc_path,
-        ], check=True, capture_output=True, text=True)
-
-        # Read bytecode as binary before temp directory is cleaned up
-        with open(bc_path, "rb") as f:
-            bc_data = f.read()
-
-        if opt.debug:
-            dump_manager = get_dump_manager(metadata["hash"])
-            dump_manager.put(bc_data, "kernel.mlirbc", binary=True)
-
-        return bc_data
-
-
-def bc_to_linalg_by_bishengir_opt(bc_data: bytes, metadata, opt):
-    """
-    Convert MLIR Bytecode to MLIR text format using bishengir-opt.
-    Args:
-        bc_data: Bytecode data as bytes
-        metadata: Compilation metadata
-        opt: Compilation options
-    Returns:
-        MLIR text as string
-    """
-    with tempfile.TemporaryDirectory() as tmpdir:
-        bc_path = os.path.join(tmpdir, "kernel.mlirbc")
-        mlir_path = os.path.join(tmpdir, "kernel.mlir")
-
-        # Write bytecode data to temporary file
-        with open(bc_path, "wb") as f:
-            f.write(bc_data)
-
-        bishengir_opt_path, env = _get_bishengir_opt_path()
-
-        subprocess.run([
-            bishengir_opt_path,
-            bc_path,
-            "--mlir-print-debuginfo",
-            "-o",
-            mlir_path,
-        ], env=env, capture_output=True, check=True, text=True)
-
-        # Read the generated MLIR text
-        linalg_text = Path(mlir_path).read_text()
-
-        if opt.debug:
-            dump_manager = get_dump_manager(metadata["hash"])
-            dump_manager.put(linalg_text, "kernel.mlir", binary=False)
-
-        return linalg_text
+        return ttadapter_text
 
 
 def __get_metadata_attr_by_callback(lib, postfix: str, metadata, meta_key: str):
@@ -862,7 +1061,8 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if bisheng_options is not None:
             _compile_option_list += [f"--append-bisheng-options={bisheng_options}"]
         _compile_option_list += ["--mlir-print-ir-after-failure"]
-        _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
+        if _is_compiler_stacktrace_enabled():
+            _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
 
         vf_merge_level = metadata["vf_merge_level"]
         if vf_merge_level is not None:
@@ -922,25 +1122,36 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
 
 
 def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
+    boundary_timer = _NpubinBoundaryTimer("linalg_to_npubin_a2_a3")
     linalg, metadata = _parse_linalg_metadata(linalg, metadata)
+    boundary_timer.mark("parse_metadata")
     _finalize_program_launch_policy(metadata, opt)
+    boundary_timer.mark("finalize_launch_policy")
     with tempfile.TemporaryDirectory() as tmpdir:
+        boundary_timer.mark("create_tempdir")
         tmp_file_name = "kernel.mlir"
         ttadapter_path = os.path.join(tmpdir, tmp_file_name)
         Path(ttadapter_path).write_text(linalg)
+        boundary_timer.mark("write_input")
         bin_file = os.path.join(tmpdir, "kernel")
-        if _check_bishengir_api_change():
+        npu_compiler_path, env, capabilities = _get_bishengir_compile_capabilities(
+            "limit-auto-multi-buffer-buffer",
+            "reg-based",
+        )
+        output_api_changed, is_regbased = capabilities
+        boundary_timer.mark("probe_compiler_api")
+        if output_api_changed:
             bin_file_with_ext = "kernel.o"
         else:
             bin_file_with_ext = "kernel_reloc.o"
-        if _check_bishengir_is_regbased():
+        if is_regbased:
             bishengir_hivm_opt = "--reg-based=true"
         else:
             bishengir_hivm_opt = "--enable-hivm-compile=true"
         bin_path = os.path.join(tmpdir, bin_file_with_ext)
         callback_path = os.path.join(tmpdir, "libkernel.so")
         _compile_option_list = [
-            f"--target={NPUUtils().get_arch()}",
+            f"--target={metadata['target'].arch}",
         ]
 
         multibuffer = metadata.get("multibuffer")
@@ -1069,7 +1280,6 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
 
         if metadata["auto_blockify_enabled"]:
             _compile_option_list += ["--enable-auto-blockify-loop"]
-        npu_compiler_path, env = _get_npucompiler_path()
         if npu_compiler_path.endswith("bishengir-compile"):
             _compile_option_list += [
                 "--enable-hfusion-compile=true",
@@ -1078,48 +1288,94 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             ]
 
         _compile_option_list += ["--mlir-print-ir-after-failure"]
-        _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
+        if _is_compiler_stacktrace_enabled():
+            _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
 
         cmd_list = ([npu_compiler_path, ttadapter_path] + _compile_option_list + ["-o", bin_file])
+        boundary_timer.mark("assemble_command")
 
         if opt.debug or os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1":
             print_cmd_list = cmd_list.copy()
             print_cmd_list[1], print_cmd_list[-1] = _get_dump_paths(metadata["hash"], ttadapter_path, bin_path)
             print(f"[DEBUG] cmd_list: {shlex.join(print_cmd_list)}")
 
-        try:
-            ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        except subprocess.CalledProcessError as e:
-            if opt.debug:
-                _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
-            raise
+        content_cache = _NpubinContentCache(
+            linalg,
+            npu_compiler_path,
+            _compile_option_list,
+            env,
+            debug=opt.debug,
+        )
+        cached = content_cache.load()
+        boundary_timer.mark("content_cache_lookup")
+        ret = None
+        cache_hit = cached is not None
 
-        if opt.debug:
-            _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
+        if cached is None:
+            with content_cache.lock():
+                cached = content_cache.load()
+                boundary_timer.mark("content_cache_lock_and_recheck")
+                if cached is None:
+                    try:
+                        ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             check=True)
+                    except subprocess.CalledProcessError as e:
+                        if opt.debug:
+                            _save_npuir_debug_output(e.stdout, e.stderr, tmpdir, metadata["hash"])
+                        raise
+                    boundary_timer.mark("compiler_process")
 
-        stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''
-        match = re.search(r'UB\s+size\s*=\s*(\d+)\s*bits', stdout_str)
-        if match:
-            metadata["required_ub_bits"] = int(match.group(1))
+                    if opt.debug:
+                        _save_npuir_debug_output(ret.stdout, ret.stderr, tmpdir, metadata["hash"])
 
-        if not Path(bin_path).exists():
-            error_msg = ret.stderr.decode('utf-8') if ret.stderr else ''
-            print(f"[DEBUG] {bin_path} is not found")
-            print(f"[DEBUG] Stderr:\n{error_msg}")
-            raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
+                    stdout_str = ret.stdout.decode('utf-8') if ret.stdout else ''
+                    match = re.search(r'UB\s+size\s*=\s*(\d+)\s*bits', stdout_str)
+                    if match:
+                        metadata["required_ub_bits"] = int(match.group(1))
 
-        if opt.debug:
-            _dump_kernel_binary(metadata["hash"], bin_path)
+                    if not Path(bin_path).exists():
+                        error_msg = ret.stderr.decode('utf-8') if ret.stderr else ''
+                        print(f"[DEBUG] {bin_path} is not found")
+                        print(f"[DEBUG] Stderr:\n{error_msg}")
+                        raise subprocess.CalledProcessError(ret.returncode, cmd_list, ret.stdout, ret.stderr)
+                    boundary_timer.mark("parse_output")
 
-        if Path(callback_path).is_file():
-            lib = ctypes.CDLL(callback_path)
-            __get_metadata_attr_by_callback(lib, "_infer_task_type_function", metadata, "bs_task_type")
-            __get_metadata_attr_by_callback(lib, "_infer_workspace_shape_function", metadata, "workspace_size")
-            __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata,
-                                            "sync_block_lock_layout")
-            __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_init_function", metadata, "lock_init_val")
+                    if opt.debug:
+                        _dump_kernel_binary(metadata["hash"], bin_path)
 
-        return Path(bin_path).read_bytes()
+                    if Path(callback_path).is_file():
+                        lib = ctypes.CDLL(callback_path)
+                        __get_metadata_attr_by_callback(lib, "_infer_task_type_function", metadata, "bs_task_type")
+                        __get_metadata_attr_by_callback(lib, "_infer_workspace_shape_function", metadata,
+                                                        "workspace_size")
+                        __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_num_function", metadata,
+                                                        "sync_block_lock_layout")
+                        __get_metadata_attr_by_callback(lib, "_infer_sync_block_lock_init_function", metadata,
+                                                        "lock_init_val")
+                    boundary_timer.mark("metadata_callback")
+
+                    binary = Path(bin_path).read_bytes()
+                    boundary_timer.mark("read_binary")
+                    content_cache.store(binary, metadata)
+                    boundary_timer.mark("content_cache_store")
+                else:
+                    cache_hit = True
+
+        if cached is not None:
+            binary, cached_metadata = cached
+            metadata.update(cached_metadata)
+            boundary_timer.mark("content_cache_restore")
+    boundary_timer.mark("cleanup_tempdir")
+    boundary_timer.finish(
+        cache_hit=cache_hit,
+        content_cache_key=content_cache.key,
+        kernel_name=metadata.get("kernel_name", metadata.get("name")),
+        input_bytes=len(linalg.encode("utf-8")),
+        output_bytes=len(binary),
+        stdout_bytes=len(ret.stdout or b"") if ret is not None else 0,
+        stderr_bytes=len(ret.stderr or b"") if ret is not None else 0,
+    )
+    return binary
 
 
 def get_libdevice():
@@ -1183,8 +1439,7 @@ class NPUOptions:
     num_stages: int = 2
     # Ascend threads-per-warp is a backend capability, not a compile option.
     warp_size: int = field(default=32, init=False)
-    ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttadapter|mlirbc|bcmlir|npubin})
-
+    ir_override: Optional[str] = None  # filename of a user-defined IR (*.{ttir|ttadapter|npubin})
     # Deprecated constructor-only compatibility input.  The supplied value is
     # ignored and replaced with the lowering selector derived from GPUTarget.arch.
     compile_on_910_95: Optional[bool] = field(default=None, repr=False, kw_only=True)
@@ -1311,7 +1566,7 @@ class NPUOptions:
     simt_reorder_instruction: bool = field(default=False, init=False)
     storage_align: Optional[bool] = field(default=None, init=False)
     stream: Optional[int] = field(default=None, init=False)
-    use_bytecode: bool = field(default=True, init=False)
+    use_bytecode: bool = field(default=False, init=False)
 
     def __post_init__(self, arch, rule_mask):
         from triton.backends.ascend import _apply_ascend_patch
@@ -1510,8 +1765,7 @@ class AscendBackend(BaseBackend):
         super().__init__(target)
         if target.backend == "npu":
             self.binary_ext = "npubin"
-            # Include all binary file extensions (mlirbc is always emitted for normal kernels).
-            self.binary_extensions = {"npubin", "mlirbc"}
+            self.binary_extensions = {"npubin"}
 
     def parse_options(self, opts) -> Any:
         # TODO: get available targets when building options?
@@ -1590,9 +1844,6 @@ class AscendBackend(BaseBackend):
                 stages["npubin"] = (lambda src, metadata: ttir_to_npubin(src, metadata, options))
                 return
             stages["ttadapter"] = lambda src, metadata: ttir_to_linalg(src, metadata, options, named_ops=True)
-            # Normal kernels always convert Linalg IR to bytecode and back to MLIR text.
-            stages["mlirbc"] = lambda src, metadata: linalg_to_bc_by_triton_mlir_opt(src, metadata, options)
-            stages["bcmlir"] = lambda src, metadata: bc_to_linalg_by_bishengir_opt(src, metadata, options)
             if options.compile_on_910_95:
                 stages["npubin"] = (
                     lambda src, metadata: linalg_to_bin_enable_npu_compile_910_95(src, metadata, options))

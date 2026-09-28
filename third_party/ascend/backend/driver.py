@@ -19,6 +19,7 @@
 # THE SOFTWARE.
 
 import importlib.metadata
+import ctypes
 from pathlib import Path
 import tempfile
 import os
@@ -53,14 +54,27 @@ class NPUUtils(object):
         return cls.instance
 
     def __init__(self):
-        # NPUUtils is a singleton, but __init__ must refresh the cached shared
-        # object path on every construction. PyTorch Inductor may set
-        # TRITON_CACHE_DIR after the driver first initializes, so keeping the
-        # first path would make the launcher look for npu_utils.so in a newer
-        # cache root where it was never built.
-        self._cache_path = self._build_or_get_cached_so()
+        # NPUUtils is a singleton.  Launcher generation constructs it more than
+        # once per kernel, so rebuilding the cache key here repeatedly rereads
+        # npu_utils.cpp and package metadata even though the cache root is
+        # unchanged.  PyTorch Inductor can set TRITON_CACHE_DIR after driver
+        # initialization, therefore retain the refresh when the effective root
+        # changes (or when the cached file was removed).
+        cache_root = self._get_cache_root()
+        cache_path = getattr(self, "_cache_path", None)
+        if getattr(self, "_cache_root", None) != cache_root or not cache_path or not os.path.exists(cache_path):
+            self._cache_path = self._build_or_get_cached_so()
+            self._cache_root = cache_root
         if not hasattr(self, "npu_utils_mod"):
             self.npu_utils_mod = None
+
+    @staticmethod
+    def _get_cache_root():
+        explicit_root = os.getenv("TRITON_CACHE_DIR")
+        if explicit_root:
+            return os.path.realpath(explicit_root)
+        triton_home = os.getenv("TRITON_HOME", os.path.expanduser("~/"))
+        return os.path.realpath(os.path.join(triton_home, ".triton", "cache"))
 
     def get_so_path(self):
         if self._cache_path is None:
@@ -203,31 +217,133 @@ class NPUUtils(object):
 
 class NPULauncher(object):
 
+    @staticmethod
+    def _should_use_generic_launcher(signature):
+        has_tensor_desc = any(isinstance(ty, str) and ty.startswith("tensordesc") for ty in signature.values())
+        return (
+            os.getenv("TRITON_ASCEND_GENERIC_LAUNCHER", "true").lower() in ("1", "true", "yes", "on")
+            and not has_tensor_desc
+            and os.getenv("TRITON_REGISTER_TENSOR_MSPROF", "false").lower() not in ("1", "true")
+        )
+
     def __init__(self, src, metadata):
         self.compile_only = os.getenv("TRITON_COMPILE_ONLY", 'false').lower() in ('true', '1')
         self.src = src
         self.metadata = metadata
+        constants = self.src.constants if hasattr(self.src, "constants") else dict()
+        cst_key = lambda i: self.src.fn.arg_names.index(i) if isinstance(i, str) else i
+        self.constants = {cst_key(key): value for key, value in constants.items()}
+        self.signature = {cst_key(key): value for key, value in self.src.signature.items()}
+        self.use_generic_launcher = self._should_use_generic_launcher(self.signature)
         self.so_launcher_path = self._make_launcher_stub_path()
         # setup for remote run
         # TODO: use a var to pack all vars required to run on a remote machine
         self.mix_mode = metadata.mix_mode
         self.shared = metadata.shared
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("__triton_launcher", self.so_launcher_path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        cst_key = lambda i: self.src.fn.arg_names.index(i) if isinstance(i, str) else i
-        signature = {cst_key(key): value for key, value in self.src.signature.items()}
-        self.launch = wrap_handle_tensordesc(getattr(mod, "launch"), signature)
+        if self.use_generic_launcher:
+            self._generic_library = ctypes.CDLL(self.so_launcher_path)
+            self._generic_launch_c = self._generic_library.triton_launch_kernel
+            self._generic_launch_c.argtypes = [
+                ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_size_t), ctypes.c_int,
+            ]
+            self._generic_launch_c.restype = None
+            self.launch = self._launch_generic
+        else:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("__triton_launcher", self.so_launcher_path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            self.launch = wrap_handle_tensordesc(getattr(mod, "launch"), self.signature)
 
     def _make_launcher_stub_path(self):
         header_src = generate_npu_header_src()
-        constants = self.src.constants if hasattr(self.src, "constants") else dict()
-        cst_key = lambda i: self.src.fn.arg_names.index(i) if isinstance(i, str) else i
-        constants = {cst_key(key): value for key, value in constants.items()}
-        signature = {cst_key(key): value for key, value in self.src.signature.items()}
-        wrapper_src = make_launcher(constants, signature, self.metadata)
+        wrapper_constants = {} if self.use_generic_launcher else self.constants
+        wrapper_signature = {} if self.use_generic_launcher else self.signature
+        wrapper_src = make_launcher(wrapper_constants, wrapper_signature, self.metadata)
         return make_npu_launcher_stub(header_src, wrapper_src, self.metadata.debug)
+
+    @staticmethod
+    def _generic_scalar_type(ty):
+        if ty.startswith("*"):
+            return ctypes.c_void_p
+        return {
+            "i1": ctypes.c_int32,
+            "i8": ctypes.c_int8,
+            "i16": ctypes.c_int16,
+            "i32": ctypes.c_int32,
+            "i64": ctypes.c_int64,
+            "u1": ctypes.c_uint32,
+            "u8": ctypes.c_uint8,
+            "u16": ctypes.c_uint16,
+            "u32": ctypes.c_uint32,
+            "u64": ctypes.c_uint64,
+            "fp16": ctypes.c_float,
+            "bf16": ctypes.c_float,
+            "fp32": ctypes.c_float,
+            "f32": ctypes.c_float,
+            "fp64": ctypes.c_double,
+        }[ty]
+
+    @staticmethod
+    def _generic_pointer_value(value):
+        if value is None:
+            return 0
+        if isinstance(value, int):
+            return value
+        pointer = value.data_ptr()
+        if not isinstance(pointer, int):
+            raise TypeError("data_ptr method of Pointer object must return 64-bit int")
+        return pointer
+
+    def _launch_generic(self, *args, **kwargs):
+        if kwargs:
+            raise TypeError("generic NPU launcher does not accept keyword arguments")
+        if len(args) < _BASE_ARGS_FORMAT_LEN:
+            raise TypeError("generic NPU launcher received an incomplete launch tuple")
+        grid_x, grid_y, grid_z, stream, function = args[:5]
+        packed_metadata, launch_metadata, launch_enter_hook, launch_exit_hook = args[5:9]
+        kernel_values = args[9:]
+
+        if launch_enter_hook is not None:
+            launch_enter_hook(launch_metadata)
+
+        signature_items = list(self.signature.items())
+        if len(kernel_values) != len(signature_items):
+            raise TypeError(
+                f"generic NPU launcher expected {len(signature_items)} kernel arguments, "
+                f"got {len(kernel_values)}"
+            )
+        storage = []
+        for (index, ty), value in zip(signature_items, kernel_values):
+            if index in self.constants or ty == "constexpr":
+                continue
+            ctype = self._generic_scalar_type(ty)
+            if ty.startswith("*"):
+                value = self._generic_pointer_value(value)
+            storage.append(ctype(value))
+
+        count = len(storage)
+        pointer_array = ((ctypes.c_void_p * count)(*(ctypes.addressof(value) for value in storage))
+                         if count else None)
+        size_array = ((ctypes.c_size_t * count)(*(ctypes.sizeof(value) for value in storage))
+                      if count else None)
+        kernel_name = packed_metadata["kernel_name"].encode("utf-8")
+        self._generic_launch_c(
+            kernel_name,
+            ctypes.c_void_p(function),
+            ctypes.c_void_p(stream),
+            int(grid_x), int(grid_y), int(grid_z),
+            None, None, 0, None,
+            pointer_array, size_array, count,
+        )
+
+        if launch_exit_hook is not None:
+            launch_exit_hook(launch_metadata)
+        return None
 
     def get_launcher_so_path(self):
         return self.so_launcher_path

@@ -71,6 +71,14 @@ public:
   virtual GraphOptimizationRuleId getId() const = 0;
   virtual AnalysisRequirement getAnalysisRequirements() const = 0;
 
+  // Cheap structural gate evaluated before constructing optional analyses.
+  // Returning false must prove that this rule cannot produce a candidate for
+  // the current IR epoch.
+  virtual bool mayHaveCandidates(GraphOptimizationContext &context) const {
+    static_cast<void>(context);
+    return true;
+  }
+
   // Candidate discovery may inspect analyses but must not mutate IR.
   virtual LogicalResult
   findCandidates(GraphOptimizationContext &context,

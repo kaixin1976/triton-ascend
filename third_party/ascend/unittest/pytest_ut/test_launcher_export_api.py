@@ -1,9 +1,10 @@
 import importlib.util
+import ctypes
 import sys
 from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -93,6 +94,44 @@ def test_make_launcher_exposes_triton_launch_kernel(
     assert 'std::vector<char> launch_args(total_size, 0);' in src
     assert 'memcpy(launch_args.data() + grid_offset, &gridX, sizeof(int32_t));' in src
     _mock_ffts.assert_called_once_with("Ascend910B3")
+
+
+def test_generic_launcher_scalar_types_match_generated_cpp_abi():
+    assert driver.NPULauncher._generic_scalar_type("i1") is ctypes.c_int32
+    assert driver.NPULauncher._generic_scalar_type("i16") is ctypes.c_int16
+    assert driver.NPULauncher._generic_scalar_type("u64") is ctypes.c_uint64
+    assert driver.NPULauncher._generic_scalar_type("fp16") is ctypes.c_float
+    assert driver.NPULauncher._generic_scalar_type("fp64") is ctypes.c_double
+    assert driver.NPULauncher._generic_scalar_type("*fp32") is ctypes.c_void_p
+
+
+def test_generic_launcher_fallback_matrix():
+    signature = {0: "*fp32", 1: "i32"}
+    with patch.dict("os.environ", {}, clear=True):
+        assert driver.NPULauncher._should_use_generic_launcher(signature)
+        assert not driver.NPULauncher._should_use_generic_launcher({0: "tensordesc<block>"})
+    with patch.dict("os.environ", {"TRITON_ASCEND_GENERIC_LAUNCHER": "0"}, clear=True):
+        assert not driver.NPULauncher._should_use_generic_launcher(signature)
+    with patch.dict("os.environ", {"TRITON_REGISTER_TENSOR_MSPROF": "1"}, clear=True):
+        assert not driver.NPULauncher._should_use_generic_launcher(signature)
+
+
+def test_generic_launcher_skips_constants_without_shifting_runtime_values():
+    launcher = object.__new__(driver.NPULauncher)
+    launcher.signature = {0: "*fp32", 1: "i32", 2: "fp32"}
+    launcher.constants = {1: 7}
+    launcher._generic_launch_c = MagicMock()
+
+    launcher._launch_generic(
+        2, 3, 1, 0x1000, 0x2000,
+        {"kernel_name": "test_kernel"}, None, None, None,
+        0x3000, 7, 1.25,
+    )
+
+    call = launcher._generic_launch_c.call_args.args
+    assert call[0] == b"test_kernel"
+    assert call[-1] == 2
+    assert list(call[-2]) == [ctypes.sizeof(ctypes.c_void_p), ctypes.sizeof(ctypes.c_float)]
 
 
 @patch.object(driver, "NPUUtils")
@@ -556,6 +595,7 @@ def test_argument_packing_differs_between_launch_paths(
 @patch.object(driver, "make_npu_launcher_stub", return_value="/tmp/fake_launcher.so")
 @patch.object(driver, "make_launcher", return_value="// wrapper src")
 @patch.object(driver, "generate_npu_header_src", return_value="// header src")
+@patch.dict("os.environ", {"TRITON_ASCEND_GENERIC_LAUNCHER": "0"})
 def test_npu_launcher_exposes_launcher_so_path(
     mock_header_src,
     mock_wrapper_src,

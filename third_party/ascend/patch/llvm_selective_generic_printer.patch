@@ -1,0 +1,107 @@
+diff --git a/mlir/include/mlir/IR/OperationSupport.h b/mlir/include/mlir/IR/OperationSupport.h
+index 1ff7c56ddca3..9724bc9d76df 100644
+--- a/mlir/include/mlir/IR/OperationSupport.h
++++ b/mlir/include/mlir/IR/OperationSupport.h
+@@ -26,12 +26,14 @@
+ #include "mlir/Support/InterfaceSupport.h"
+ #include "llvm/ADT/BitmaskEnum.h"
+ #include "llvm/ADT/PointerUnion.h"
++#include "llvm/ADT/SmallVector.h"
+ #include "llvm/ADT/STLFunctionalExtras.h"
+ #include "llvm/Support/ErrorHandling.h"
+ #include "llvm/Support/PointerLikeTypeTraits.h"
+ #include "llvm/Support/TrailingObjects.h"
+ #include <memory>
+ #include <optional>
++#include <string>
+ 
+ namespace llvm {
+ class BitVector;
+@@ -1208,6 +1210,10 @@ public:
+   /// Always print operations in the generic form.
+   OpPrintingFlags &printGenericOpForm(bool enable = true);
+ 
++  /// Print operations with the given registered name in the generic form,
++  /// while retaining custom assembly for all other operations.
++  OpPrintingFlags &printGenericOpFormFor(StringRef operationName);
++
+   /// Skip printing regions.
+   OpPrintingFlags &skipRegions(bool skip = true);
+ 
+@@ -1254,6 +1260,9 @@ public:
+   /// Return if operations should be printed in the generic form.
+   bool shouldPrintGenericOpForm() const;
+ 
++  /// Return if an operation name should be printed in the generic form.
++  bool shouldPrintGenericOpForm(StringRef operationName) const;
++
+   /// Return if regions should be skipped.
+   bool shouldSkipRegions() const;
+ 
+@@ -1285,6 +1294,10 @@ private:
+   /// is larger than the upper limit.
+   int64_t elementsAttrHexElementLimit = 100;
+ 
++  /// Registered operation names whose version-independent generic assembly
++  /// form should be used.
++  llvm::SmallVector<std::string, 1> genericOpFormNames;
++
+   /// Print debug information.
+   bool printDebugInfoFlag : 1;
+   bool printDebugInfoPrettyFormFlag : 1;
+diff --git a/mlir/lib/IR/AsmPrinter.cpp b/mlir/lib/IR/AsmPrinter.cpp
+index 3d19c5ad8fbc..fc11e62dcc04 100644
+--- a/mlir/lib/IR/AsmPrinter.cpp
++++ b/mlir/lib/IR/AsmPrinter.cpp
+@@ -278,6 +278,14 @@ OpPrintingFlags &OpPrintingFlags::printGenericOpForm(bool enable) {
+   return *this;
+ }
+ 
++OpPrintingFlags &
++OpPrintingFlags::printGenericOpFormFor(StringRef operationName) {
++  if (operationName.empty())
++    return *this;
++  genericOpFormNames.emplace_back(operationName);
++  return *this;
++}
++
+ /// Always skip Regions.
+ OpPrintingFlags &OpPrintingFlags::skipRegions(bool skip) {
+   skipRegionsFlag = skip;
+@@ -361,6 +369,16 @@ bool OpPrintingFlags::shouldPrintGenericOpForm() const {
+   return printGenericOpFormFlag;
+ }
+ 
++bool OpPrintingFlags::shouldPrintGenericOpForm(
++    StringRef operationName) const {
++  if (printGenericOpFormFlag)
++    return true;
++  for (const std::string &name : genericOpFormNames)
++    if (operationName == name)
++      return true;
++  return false;
++}
++
+ /// Return if Region should be skipped.
+ bool OpPrintingFlags::shouldSkipRegions() const { return skipRegionsFlag; }
+ 
+@@ -706,7 +724,8 @@ public:
+       initializer.visit(op->getLoc(), /*canBeDeferred=*/true);
+ 
+     // If requested, always print the generic form.
+-    if (!printerFlags.shouldPrintGenericOpForm()) {
++    if (!printerFlags.shouldPrintGenericOpForm(
++            op->getName().getStringRef())) {
+       op->getName().printAssembly(op, *this, /*defaultDialect=*/"");
+       return;
+     }
+@@ -3687,7 +3706,8 @@ void OperationPrinter::printUserIDs(Operation *user, bool prefixComma) {
+ 
+ void OperationPrinter::printCustomOrGenericOp(Operation *op) {
+   // If requested, always print the generic form.
+-  if (!printerFlags.shouldPrintGenericOpForm()) {
++  if (!printerFlags.shouldPrintGenericOpForm(
++          op->getName().getStringRef())) {
+     // Check to see if this is a known operation. If so, use the registered
+     // custom printer hook.
+     if (auto opInfo = op->getRegisteredInfo()) {

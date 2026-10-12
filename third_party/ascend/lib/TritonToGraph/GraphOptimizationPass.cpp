@@ -171,7 +171,8 @@ void GraphOptimizePass::runOnOperation() {
   // Simplify tensor values before constructing any graph analyses so layout
   // rules observe the reduced workload, without retaining stale graph state.
   RewritePatternSet patterns(&getContext());
-  patterns.add<narrow_unsigned_tensor::Narrow>(&getContext());
+  patterns.add<narrow_unsigned_tensor::Narrow,
+               narrow_unsigned_tensor::SinkTruncation>(&getContext());
   if (compileOn91095)
     patterns.add<FoldHistogramParking>(&getContext());
   if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {

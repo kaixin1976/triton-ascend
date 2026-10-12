@@ -34,6 +34,18 @@ inline Type i32Type(Type type, PatternRewriter &rewriter) {
   return rewriter.getI32Type();
 }
 
+inline bool isTruncatableArithmetic(Operation *op) {
+  // Sinking a truncation through a shared producer would duplicate arithmetic
+  // while retaining the original i64 operation for its other users.
+  if (!op || !op->hasOneUse())
+    return false;
+  if (auto add = dyn_cast<arith::AddIOp>(op))
+    return add.getOverflowFlags() == arith::IntegerOverflowFlags::none;
+  if (auto sub = dyn_cast<arith::SubIOp>(op))
+    return sub.getOverflowFlags() == arith::IntegerOverflowFlags::none;
+  return false;
+}
+
 // Compute the low 32 bits without materializing wide bitwise temporaries.
 // Truncation commutes with these operations, but not with right shift.
 inline Value lowBits(Value value, PatternRewriter &rewriter,
@@ -62,9 +74,31 @@ inline Value lowBits(Value value, PatternRewriter &rewriter,
       return rewriter.create<SplatOp>(
           loc, type, lowBits(op.getSrc(), rewriter, depth + 1));
     Operation *op = value.getDefiningOp();
-    if (op && isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp>(op)) {
+    if (op && (isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp>(op) ||
+               isTruncatableArithmetic(op))) {
+      uint64_t lhsBits = 0;
+      uint64_t rhsBits = 0;
+      const bool lhsConstant = constant(op->getOperand(0), lhsBits);
+      const bool rhsConstant = constant(op->getOperand(1), rhsBits);
+      const uint64_t lhsLowBits = lhsBits & UINT32_MAX;
+      const uint64_t rhsLowBits = rhsBits & UINT32_MAX;
+      if (isa<arith::AndIOp>(op)) {
+        if (lhsConstant && lhsLowBits == UINT32_MAX)
+          return lowBits(op->getOperand(1), rewriter, depth + 1);
+        if (rhsConstant && rhsLowBits == UINT32_MAX)
+          return lowBits(op->getOperand(0), rewriter, depth + 1);
+      } else if (isa<arith::OrIOp, arith::XOrIOp>(op)) {
+        if (lhsConstant && lhsLowBits == 0)
+          return lowBits(op->getOperand(1), rewriter, depth + 1);
+        if (rhsConstant && rhsLowBits == 0)
+          return lowBits(op->getOperand(0), rewriter, depth + 1);
+      }
       Value lhs = lowBits(op->getOperand(0), rewriter, depth + 1);
       Value rhs = lowBits(op->getOperand(1), rewriter, depth + 1);
+      if (isa<arith::AddIOp>(op))
+        return rewriter.create<arith::AddIOp>(loc, lhs, rhs);
+      if (isa<arith::SubIOp>(op))
+        return rewriter.create<arith::SubIOp>(loc, lhs, rhs);
       if (isa<arith::AndIOp>(op))
         return rewriter.create<arith::AndIOp>(loc, lhs, rhs);
       if (isa<arith::OrIOp>(op))
@@ -142,6 +176,33 @@ struct Narrow : RewritePattern {
       return failure();
     }
     rewriter.replaceOpWithNewOp<arith::ExtUIOp>(op, type, result);
+    return success();
+  }
+};
+
+// Keep a low-bit consumer in i32 instead of forcing the narrowed producer back
+// to i64. This removes chains such as
+//
+//   i32 -> extui i64 -> subi i64 -> trunci i32
+//
+// while preserving the original modulo-2^32 result. The i64 arithmetic is
+// retained when it has another consumer or carries an overflow promise.
+struct SinkTruncation : OpRewritePattern<arith::TruncIOp> {
+  explicit SinkTruncation(MLIRContext *context)
+      : OpRewritePattern<arith::TruncIOp>(context, 2) {}
+
+  LogicalResult matchAndRewrite(arith::TruncIOp op,
+                                PatternRewriter &rewriter) const override {
+    auto inputType = dyn_cast<RankedTensorType>(op.getIn().getType());
+    auto resultType = dyn_cast<RankedTensorType>(op.getType());
+    if (!inputType || !resultType ||
+        !inputType.getElementType().isInteger(64) ||
+        !resultType.getElementType().isInteger(32) ||
+        inputType.getShape() != resultType.getShape() ||
+        !isTruncatableArithmetic(op.getIn().getDefiningOp()))
+      return failure();
+
+    rewriter.replaceOp(op, lowBits(op.getIn(), rewriter));
     return success();
   }
 };

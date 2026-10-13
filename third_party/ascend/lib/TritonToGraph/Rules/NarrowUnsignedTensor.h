@@ -7,6 +7,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include <cstdint>
 
 namespace mlir::triton {
 namespace narrow_unsigned_tensor {
@@ -28,10 +29,48 @@ inline bool isU32(Value value) {
   return constant(value, bits) && bits <= UINT32_MAX;
 }
 
-inline Type i32Type(Type type, PatternRewriter &rewriter) {
+inline Type i32Type(Type type, RewriterBase &rewriter) {
   if (auto tensor = dyn_cast<RankedTensorType>(type))
     return tensor.clone(rewriter.getI32Type());
   return rewriter.getI32Type();
+}
+
+// Build a narrowed bitwise node while eliminating identities that generic
+// arith folding does not currently recognize for dense tensor splats.
+inline Value createBitwise(Operation *source, Value lhs, Value rhs,
+                           RewriterBase &rewriter, Location location) {
+  uint64_t lhsBits = 0;
+  uint64_t rhsBits = 0;
+  const bool lhsConstant = constant(lhs, lhsBits);
+  const bool rhsConstant = constant(rhs, rhsBits);
+
+  if (isa<arith::AndIOp>(source)) {
+    if (lhsConstant && lhsBits == UINT32_MAX)
+      return rhs;
+    if (rhsConstant && rhsBits == UINT32_MAX)
+      return lhs;
+    if (lhsConstant && lhsBits == 0)
+      return lhs;
+    if (rhsConstant && rhsBits == 0)
+      return rhs;
+    return rewriter.createOrFold<arith::AndIOp>(location, lhs, rhs);
+  }
+  if (isa<arith::OrIOp>(source)) {
+    if (lhsConstant && lhsBits == 0)
+      return rhs;
+    if (rhsConstant && rhsBits == 0)
+      return lhs;
+    if (lhsConstant && lhsBits == UINT32_MAX)
+      return lhs;
+    if (rhsConstant && rhsBits == UINT32_MAX)
+      return rhs;
+    return rewriter.createOrFold<arith::OrIOp>(location, lhs, rhs);
+  }
+  if (lhsConstant && lhsBits == 0)
+    return rhs;
+  if (rhsConstant && rhsBits == 0)
+    return lhs;
+  return rewriter.createOrFold<arith::XOrIOp>(location, lhs, rhs);
 }
 
 inline bool isTruncatableArithmetic(Operation *op) {
@@ -46,10 +85,36 @@ inline bool isTruncatableArithmetic(Operation *op) {
   return false;
 }
 
+// Materialize the low 32 bits at this value without distributing the
+// truncation into its producer graph. This is important for TopK's bitonic
+// network: expanding through its XOR chain replaces one truncation with many
+// trunc/xor operations and regresses the generated kernel.
+inline Value truncateHere(Value value, RewriterBase &rewriter) {
+  Location loc = value.getLoc();
+  Type type = i32Type(value.getType(), rewriter);
+  if (value.getType() == type)
+    return value;
+  if (auto ext = value.getDefiningOp<arith::ExtUIOp>())
+    if (ext.getIn().getType() == type)
+      return ext.getIn();
+  if (auto ext = value.getDefiningOp<arith::ExtSIOp>())
+    if (ext.getIn().getType() == type)
+      return ext.getIn();
+  uint64_t bits;
+  if (constant(value, bits)) {
+    auto attr =
+        rewriter.getIntegerAttr(rewriter.getI32Type(), bits & UINT32_MAX);
+    if (auto tensor = dyn_cast<RankedTensorType>(type))
+      return rewriter.create<arith::ConstantOp>(
+          loc, type, DenseElementsAttr::get(tensor, attr));
+    return rewriter.create<arith::ConstantOp>(loc, attr);
+  }
+  return rewriter.create<arith::TruncIOp>(loc, type, value);
+}
+
 // Compute the low 32 bits without materializing wide bitwise temporaries.
 // Truncation commutes with these operations, but not with right shift.
-inline Value lowBits(Value value, PatternRewriter &rewriter,
-                     unsigned depth = 0) {
+inline Value lowBits(Value value, RewriterBase &rewriter, unsigned depth = 0) {
   Location loc = value.getLoc();
   Type type = i32Type(value.getType(), rewriter);
   if (value.getType() == type)
@@ -74,8 +139,7 @@ inline Value lowBits(Value value, PatternRewriter &rewriter,
       return rewriter.create<SplatOp>(
           loc, type, lowBits(op.getSrc(), rewriter, depth + 1));
     Operation *op = value.getDefiningOp();
-    if (op && (isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp>(op) ||
-               isTruncatableArithmetic(op))) {
+    if (op && isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp>(op)) {
       uint64_t lhsBits = 0;
       uint64_t rhsBits = 0;
       const bool lhsConstant = constant(op->getOperand(0), lhsBits);
@@ -84,9 +148,9 @@ inline Value lowBits(Value value, PatternRewriter &rewriter,
       const uint64_t rhsLowBits = rhsBits & UINT32_MAX;
       if (isa<arith::AndIOp>(op)) {
         if (lhsConstant && lhsLowBits == UINT32_MAX)
-          return lowBits(op->getOperand(1), rewriter, depth + 1);
+          return truncateHere(op->getOperand(1), rewriter);
         if (rhsConstant && rhsLowBits == UINT32_MAX)
-          return lowBits(op->getOperand(0), rewriter, depth + 1);
+          return truncateHere(op->getOperand(0), rewriter);
       } else if (isa<arith::OrIOp, arith::XOrIOp>(op)) {
         if (lhsConstant && lhsLowBits == 0)
           return lowBits(op->getOperand(1), rewriter, depth + 1);
@@ -95,18 +159,47 @@ inline Value lowBits(Value value, PatternRewriter &rewriter,
       }
       Value lhs = lowBits(op->getOperand(0), rewriter, depth + 1);
       Value rhs = lowBits(op->getOperand(1), rewriter, depth + 1);
-      if (isa<arith::AddIOp>(op))
-        return rewriter.create<arith::AddIOp>(loc, lhs, rhs);
-      if (isa<arith::SubIOp>(op))
-        return rewriter.create<arith::SubIOp>(loc, lhs, rhs);
-      if (isa<arith::AndIOp>(op))
-        return rewriter.create<arith::AndIOp>(loc, lhs, rhs);
-      if (isa<arith::OrIOp>(op))
-        return rewriter.create<arith::OrIOp>(loc, lhs, rhs);
-      return rewriter.create<arith::XOrIOp>(loc, lhs, rhs);
+      return createBitwise(op, lhs, rhs, rewriter, loc);
     }
   }
   return rewriter.create<arith::TruncIOp>(loc, type, value);
+}
+
+// Return low bits only when they are already materialized as i32 (or are a
+// constant). In particular, do not recursively reopen a bitwise DAG here:
+// TopK's bitonic network is large enough that moving its truncation boundary
+// by one level makes downstream layout analysis pathologically expensive.
+inline bool canMaterializeLowBits(Value value) {
+  if (getElementTypeOrSelf(value.getType()).isInteger(32))
+    return true;
+  if (auto ext = value.getDefiningOp<arith::ExtUIOp>())
+    return getElementTypeOrSelf(ext.getIn().getType()).isInteger(32);
+  if (auto ext = value.getDefiningOp<arith::ExtSIOp>())
+    return getElementTypeOrSelf(ext.getIn().getType()).isInteger(32);
+  uint64_t bits;
+  return constant(value, bits);
+}
+
+inline Value materializedLowBits(Value value, RewriterBase &rewriter) {
+  Type type = i32Type(value.getType(), rewriter);
+  if (value.getType() == type)
+    return value;
+  if (auto ext = value.getDefiningOp<arith::ExtUIOp>())
+    if (ext.getIn().getType() == type)
+      return ext.getIn();
+  if (auto ext = value.getDefiningOp<arith::ExtSIOp>())
+    if (ext.getIn().getType() == type)
+      return ext.getIn();
+
+  uint64_t bits;
+  if (!constant(value, bits))
+    return {};
+  auto attr =
+      rewriter.getIntegerAttr(rewriter.getI32Type(), bits & UINT32_MAX);
+  if (auto tensor = dyn_cast<RankedTensorType>(type))
+    return rewriter.create<arith::ConstantOp>(
+        value.getLoc(), type, DenseElementsAttr::get(tensor, attr));
+  return rewriter.create<arith::ConstantOp>(value.getLoc(), attr);
 }
 
 struct Narrow : RewritePattern {
@@ -202,7 +295,18 @@ struct SinkTruncation : OpRewritePattern<arith::TruncIOp> {
         !isTruncatableArithmetic(op.getIn().getDefiningOp()))
       return failure();
 
-    rewriter.replaceOp(op, lowBits(op.getIn(), rewriter));
+    Operation *producer = op.getIn().getDefiningOp();
+    if (!canMaterializeLowBits(producer->getOperand(0)) ||
+        !canMaterializeLowBits(producer->getOperand(1)))
+      return failure();
+    Value lhs = materializedLowBits(producer->getOperand(0), rewriter);
+    Value rhs = materializedLowBits(producer->getOperand(1), rewriter);
+    assert(lhs && rhs && "prechecked low bits must materialize");
+
+    if (isa<arith::AddIOp>(producer))
+      rewriter.replaceOpWithNewOp<arith::AddIOp>(op, lhs, rhs);
+    else
+      rewriter.replaceOpWithNewOp<arith::SubIOp>(op, lhs, rhs);
     return success();
   }
 };

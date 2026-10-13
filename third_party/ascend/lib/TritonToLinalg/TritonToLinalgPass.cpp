@@ -42,6 +42,7 @@
 #include "ascend/include/TritonToLinalg/UseAnalysis.h"
 #include "ascend/include/TritonToStructured/CannonicalizerConverter.h"
 #include "ascend/include/TritonToUnstructure/UnstructureConversionPass.h"
+#include "ascend/include/Utils/DebugUtils.h"
 #include "ascend/include/Utils/InterleaveOptimization.h"
 
 #include "bishengir/Dialect/HFusion/IR/HFusion.h"
@@ -56,6 +57,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Tools/Sys/GetEnv.hpp"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
@@ -1686,6 +1688,22 @@ void TritonToLinalgPass::runOnOperation() {
 
   auto moduleOp = getOperation();
 
+  // Remember whether the input carries concrete source locations before
+  // conversion creates helper operations with synthetic NameLocs. If Triton
+  // intentionally omitted file/line/column information
+  // (TRITON_DISABLE_LINE_INFO), there is no source location to recover at the
+  // end of this pass.
+  bool inputHasSourceLocation = false;
+  if (!triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO")) {
+    moduleOp.walk([&](Operation *op) {
+      if (triton::debug::unwrapToUserFileLineCol(op->getLoc())) {
+        inputHasSourceLocation = true;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+  }
+
   // Validate the CFO handoff before descriptor conversion, canonicalization,
   // or any other IR mutation can erase malformed metadata with dead code.
   if (failed(validatePointerDescriptorHandoffMetadata(moduleOp))) {
@@ -2280,28 +2298,34 @@ void TritonToLinalgPass::runOnOperation() {
                                    1)); // 64: 64位整型
   }
 
-  // Fix the Location info
-  moduleOp.walk([&](Operation *op) {
-    auto loc = op->getLoc();
-    if (isa<UnknownLoc>(loc)) {
-      llvm::SmallPtrSet<Operation *, 16> stopOps;
-      traverseForwardUpdateUserChainIf(
-          op,
-          /*conditionFn*/
-          [](Operation *curOp) { return false; },
-          /*stopFn*/
-          [](Operation *curOp) { return !isa<UnknownLoc>(curOp->getLoc()); },
-          /*actionFn*/
-          nullptr, stopOps);
-      if (stopOps.empty()) {
-        op->emitWarning() << *op << " and its users all have no location!";
-      } else {
-        Operation *goodOp = *stopOps.begin();
-        op->setLoc(goodOp->getLoc());
+  // Fix location information only when the input actually carries source
+  // locations. TRITON_DISABLE_LINE_INFO deliberately omits concrete source
+  // locations, so there is nothing useful to propagate. Trying to search the
+  // complete user graph for every operation is both pointless and, for highly
+  // branching DAGs such as TopK, potentially very expensive.
+  if (inputHasSourceLocation) {
+    moduleOp.walk([&](Operation *op) {
+      auto loc = op->getLoc();
+      if (isa<UnknownLoc>(loc)) {
+        llvm::SmallPtrSet<Operation *, 16> stopOps;
+        traverseForwardUpdateUserChainIf(
+            op,
+            /*conditionFn*/
+            [](Operation *curOp) { return false; },
+            /*stopFn*/
+            [](Operation *curOp) { return !isa<UnknownLoc>(curOp->getLoc()); },
+            /*actionFn*/
+            nullptr, stopOps);
+        if (stopOps.empty()) {
+          op->emitWarning() << *op << " and its users all have no location!";
+        } else {
+          Operation *goodOp = *stopOps.begin();
+          op->setLoc(goodOp->getLoc());
+        }
       }
-    }
-    return WalkResult::advance();
-  });
+      return WalkResult::advance();
+    });
+  }
 }
 
 std::unique_ptr<OperationPass<ModuleOp>>

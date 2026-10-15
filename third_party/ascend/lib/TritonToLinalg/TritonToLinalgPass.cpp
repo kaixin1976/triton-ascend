@@ -1278,6 +1278,8 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::GroupedDotConverter>(patterns.getContext());
   patterns.add<TTOpConverters::GroupedDotSwiGLUMxConverter>(
       patterns.getContext());
+  patterns.add<TTOpConverters::GroupedFfnSwiGLUMxConverter>(
+      patterns.getContext());
   patterns.add<TTOpConverters::DotScaledConverter>(patterns.getContext());
   patterns.add<TTOpConverters::PtrToIntConverter>(patterns.getContext());
   patterns.add<TTOpConverters::IntToPtrConverter>(typeConverter,
@@ -1528,6 +1530,11 @@ void TritonToLinalgPass::runOnOperation() {
   });
   moduleOp.walk(
       [&](triton::ascend::GroupedDotSwiGLUMxOp groupedDotSwiGLUMxOp) {
+        existDot = true;
+        return WalkResult::interrupt();
+      });
+  moduleOp.walk(
+      [&](triton::ascend::GroupedFfnSwiGLUMxOp groupedFfnSwiGLUMxOp) {
         existDot = true;
         return WalkResult::interrupt();
       });

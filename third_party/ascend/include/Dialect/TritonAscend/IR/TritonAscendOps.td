@@ -660,7 +660,8 @@ def GroupedDotSwiGLUMxOp : TT_Ascend_Op<"grouped_dot_swiglu_mx", [
         I64Attr:$num_experts,
         I64Attr:$max_tokens,
         I64Attr:$out_features,
-        I64Attr:$in_features
+        I64Attr:$in_features,
+        I64Attr:$control_workers
     );
 
     let assemblyFormat = [{
@@ -669,6 +670,56 @@ def GroupedDotSwiGLUMxOp : TT_Ascend_Op<"grouped_dot_swiglu_mx", [
         `:` type($weights) `,` type($tokens) `,` type($token_scale) `,`
         type($weight_scale) `,` type($tokens_per_expert) `,` type($output) `,`
         type($output_scale)
+    }];
+
+    let hasVerifier = 1;
+}
+
+//
+// Grouped FP8 FFN with an on-chip SwiGLU/MX handoff
+//
+def GroupedFfnSwiGLUMxOp : TT_Ascend_Op<"grouped_ffn_swiglu_mx", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+]> {
+    let summary = "Dynamic-M FP8 grouped FFN with an on-chip GMM1-to-GMM2 handoff";
+    let description = [{
+        Computes a complete expert FFN over `tokens[M_max, H]`,
+        `gate_up_weights[E, 2I, H]`, and `down_weights[E, H, I]`.
+        GMM1 is followed by SwiGLU and MX quantization, and the quantized
+        activation is handed directly to GMM2, using BF16
+        `workspace[M_max, H]` only for the cross-core activation staging
+        fallback. The final result is BF16 `output[M_max, H]`.
+
+        MX scales use groups of 32. The first native implementation is
+        intentionally specialized for an intermediate size divisible by 256
+        so the compiler template can use bounded L1 activation slots.
+    }];
+
+    let arguments = (ins
+        TT_Ptr:$gate_up_weights,
+        TT_Ptr:$tokens,
+        TT_Ptr:$token_scale,
+        TT_Ptr:$gate_up_weight_scale,
+        TT_Ptr:$down_weights,
+        TT_Ptr:$down_weight_scale,
+        TT_Ptr:$tokens_per_expert,
+        TT_Ptr:$workspace,
+        TT_Ptr:$output,
+        I64Attr:$num_experts,
+        I64Attr:$max_tokens,
+        I64Attr:$hidden_features,
+        I64Attr:$intermediate_features,
+        I64Attr:$control_workers
+    );
+
+    let assemblyFormat = [{
+        $gate_up_weights `,` $tokens `,` $token_scale `,`
+        $gate_up_weight_scale `,` $down_weights `,` $down_weight_scale `,`
+        $tokens_per_expert `,` $workspace `,` $output attr-dict
+        `:` type($gate_up_weights) `,` type($tokens) `,` type($token_scale) `,`
+        type($gate_up_weight_scale) `,` type($down_weights) `,`
+        type($down_weight_scale) `,` type($tokens_per_expert) `,`
+        type($workspace) `,` type($output)
     }];
 
     let hasVerifier = 1;

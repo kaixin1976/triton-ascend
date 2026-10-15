@@ -940,20 +940,49 @@ void init_ascend_ir(py::module &&m) {
              Value &tokenScale, Value &weightScale, Value &tokensPerExpert,
              Value &output, Value &outputScale, int64_t numExperts,
              int64_t maxTokens, int64_t outFeatures,
-             int64_t inFeatures) -> void {
+             int64_t inFeatures, int64_t controlWorkers) -> void {
             auto &builder = self.getBuilder();
             self.create<triton::ascend::GroupedDotSwiGLUMxOp>(
                 weights, tokens, tokenScale, weightScale, tokensPerExpert,
                 output, outputScale, builder.getI64IntegerAttr(numExperts),
                 builder.getI64IntegerAttr(maxTokens),
                 builder.getI64IntegerAttr(outFeatures),
-                builder.getI64IntegerAttr(inFeatures));
+                builder.getI64IntegerAttr(inFeatures),
+                builder.getI64IntegerAttr(controlWorkers));
           },
           py::arg("weights"), py::arg("tokens"), py::arg("token_scale"),
           py::arg("weight_scale"), py::arg("tokens_per_expert"),
           py::arg("output"), py::arg("output_scale"),
           py::arg("num_experts"), py::arg("max_tokens"),
-          py::arg("out_features"), py::arg("in_features"))
+          py::arg("out_features"), py::arg("in_features"),
+          py::arg("control_workers"))
+      .def(
+          "create_grouped_ffn_swiglu_mx",
+          [](AscendNPUIROpBuilder &self, Value &gateUpWeights, Value &tokens,
+             Value &tokenScale, Value &gateUpWeightScale, Value &downWeights,
+             Value &downWeightScale, Value &tokensPerExpert, Value &workspace,
+             Value &output,
+             int64_t numExperts, int64_t maxTokens, int64_t hiddenFeatures,
+             int64_t intermediateFeatures, int64_t controlWorkers) -> void {
+            auto &builder = self.getBuilder();
+            self.create<triton::ascend::GroupedFfnSwiGLUMxOp>(
+                gateUpWeights, tokens, tokenScale, gateUpWeightScale,
+                downWeights, downWeightScale, tokensPerExpert, workspace,
+                output,
+                builder.getI64IntegerAttr(numExperts),
+                builder.getI64IntegerAttr(maxTokens),
+                builder.getI64IntegerAttr(hiddenFeatures),
+                builder.getI64IntegerAttr(intermediateFeatures),
+                builder.getI64IntegerAttr(controlWorkers));
+          },
+          py::arg("gate_up_weights"), py::arg("tokens"),
+          py::arg("token_scale"), py::arg("gate_up_weight_scale"),
+          py::arg("down_weights"), py::arg("down_weight_scale"),
+          py::arg("tokens_per_expert"), py::arg("workspace"),
+          py::arg("output"),
+          py::arg("num_experts"), py::arg("max_tokens"),
+          py::arg("hidden_features"), py::arg("intermediate_features"),
+          py::arg("control_workers"))
       // Add sort
       .def("create_sort",
            [](AscendNPUIROpBuilder &self, Value src, int64_t dim,

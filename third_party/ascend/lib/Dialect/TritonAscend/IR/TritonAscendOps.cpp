@@ -171,6 +171,8 @@ LogicalResult GroupedDotSwiGLUMxOp::verify() {
   if (getOutFeatures() % 32 != 0 || getInFeatures() % 32 != 0)
     return emitOpError(
         "N and K must be divisible by the MX scale group size 32");
+  if (getControlWorkers() < 0)
+    return emitOpError("control_workers must be non-negative");
   return success();
 }
 
@@ -191,6 +193,82 @@ void GroupedDotSwiGLUMxOp::getEffects(
   effects.emplace_back(MemoryEffects::Write::get(), &getOutputMutable(),
                        triton::GlobalMemory::get());
   effects.emplace_back(MemoryEffects::Write::get(), &getOutputScaleMutable(),
+                       triton::GlobalMemory::get());
+}
+
+LogicalResult GroupedFfnSwiGLUMxOp::verify() {
+  auto gateUpTy = cast<triton::PointerType>(getGateUpWeights().getType());
+  auto tokensTy = cast<triton::PointerType>(getTokens().getType());
+  auto tokenScaleTy = cast<triton::PointerType>(getTokenScale().getType());
+  auto gateUpScaleTy =
+      cast<triton::PointerType>(getGateUpWeightScale().getType());
+  auto downTy = cast<triton::PointerType>(getDownWeights().getType());
+  auto downScaleTy =
+      cast<triton::PointerType>(getDownWeightScale().getType());
+  auto countsTy = cast<triton::PointerType>(getTokensPerExpert().getType());
+  auto workspaceTy = cast<triton::PointerType>(getWorkspace().getType());
+  auto outputTy = cast<triton::PointerType>(getOutput().getType());
+
+  Type dataType = gateUpTy.getPointeeType();
+  if (!isa<Float8E4M3FNType, Float8E5M2Type>(dataType) ||
+      tokensTy.getPointeeType() != dataType ||
+      downTy.getPointeeType() != dataType)
+    return emitOpError(
+        "tokens, gate_up_weights and down_weights must have the same FP8 "
+        "pointee type");
+  if (!workspaceTy.getPointeeType().isBF16() ||
+      !outputTy.getPointeeType().isBF16())
+    return emitOpError("workspace and output must point to BF16");
+  auto isByteType = [](Type type) {
+    auto intType = dyn_cast<IntegerType>(type);
+    return intType && intType.getWidth() == 8;
+  };
+  if (!isByteType(tokenScaleTy.getPointeeType()) ||
+      !isByteType(gateUpScaleTy.getPointeeType()) ||
+      !isByteType(downScaleTy.getPointeeType()))
+    return emitOpError("all MX scale operands must point to 8-bit integers");
+  if (!countsTy.getPointeeType().isIntOrIndex())
+    return emitOpError("tokens_per_expert pointer must have an integer pointee");
+  if (getNumExperts() <= 0 || getMaxTokens() <= 0 ||
+      getHiddenFeatures() <= 0 || getIntermediateFeatures() <= 0)
+    return emitOpError("E, M_max, H, and I must all be positive");
+  if (getHiddenFeatures() % 32 != 0 || getIntermediateFeatures() != 1024)
+    return emitOpError(
+        "H must be divisible by 32 and the initial native ABI requires "
+        "I=1024");
+  if (getControlWorkers() < 0)
+    return emitOpError("control_workers must be non-negative");
+  return success();
+}
+
+void GroupedFfnSwiGLUMxOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Read::get(),
+                       &getGateUpWeightsMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getTokensMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getTokenScaleMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(),
+                       &getGateUpWeightScaleMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(), &getDownWeightsMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(),
+                       &getDownWeightScaleMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Read::get(),
+                       &getTokensPerExpertMutable(),
+                       triton::GlobalMemory::get());
+  if (getControlWorkers() > 0)
+    effects.emplace_back(MemoryEffects::Write::get(),
+                         &getTokensPerExpertMutable(),
+                         triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getWorkspaceMutable(),
+                       triton::GlobalMemory::get());
+  effects.emplace_back(MemoryEffects::Write::get(), &getOutputMutable(),
                        triton::GlobalMemory::get());
 }
 

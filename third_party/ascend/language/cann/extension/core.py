@@ -723,6 +723,7 @@ def grouped_dot_swiglu_mx(
         output: tl.tensor, output_scale: tl.tensor,
         num_experts: tl.constexpr, max_tokens: tl.constexpr,
         out_features: tl.constexpr, in_features: tl.constexpr,
+        control_workers: tl.constexpr = 0,
         _semantic=None) -> None:
     """Run FP8 grouped matmul, SwiGLU and MX output quantization in one op."""
     operands = {
@@ -767,6 +768,87 @@ def grouped_dot_swiglu_mx(
     if shape[2] % 32 or shape[3] % 32:
         raise ValueError(
             "grouped_dot_swiglu_mx N and K must be divisible by 32")
+    control_workers = _unwrap_if_constexpr(control_workers)
+    if not isinstance(control_workers, int) or control_workers < 0:
+        raise ValueError(
+            "grouped_dot_swiglu_mx control_workers must be non-negative")
     semantic.grouped_dot_swiglu_mx(
         weights, tokens, token_scale, weight_scale, tokens_per_expert,
-        output, output_scale, *shape, _semantic=_semantic)
+        output, output_scale, *shape, control_workers,
+        _semantic=_semantic)
+
+
+@builtin
+def grouped_ffn_swiglu_mx(
+        gate_up_weights: tl.tensor, tokens: tl.tensor,
+        token_scale: tl.tensor, gate_up_weight_scale: tl.tensor,
+        down_weights: tl.tensor, down_weight_scale: tl.tensor,
+        tokens_per_expert: tl.tensor, workspace: tl.tensor,
+        output: tl.tensor,
+        num_experts: tl.constexpr, max_tokens: tl.constexpr,
+        hidden_features: tl.constexpr, intermediate_features: tl.constexpr,
+        control_workers: tl.constexpr = 0,
+        _semantic=None) -> None:
+    """Run a complete FP8 grouped FFN with an on-chip activation handoff."""
+    operands = {
+        "gate_up_weights": gate_up_weights,
+        "tokens": tokens,
+        "token_scale": token_scale,
+        "gate_up_weight_scale": gate_up_weight_scale,
+        "down_weights": down_weights,
+        "down_weight_scale": down_weight_scale,
+        "tokens_per_expert": tokens_per_expert,
+        "workspace": workspace,
+        "output": output,
+    }
+    for name, operand in operands.items():
+        if not isinstance(operand, tl.tensor) or not operand.type.is_ptr():
+            raise TypeError(
+                f"grouped_ffn_swiglu_mx operand `{name}` must be a scalar "
+                f"pointer, got {getattr(operand, 'type', type(operand))}")
+
+    data_types = (
+        gate_up_weights.type.element_ty,
+        tokens.type.element_ty,
+        down_weights.type.element_ty,
+    )
+    if (not data_types[0].is_fp8() or data_types[0] != data_types[1] or
+            data_types[1] != data_types[2]):
+        raise TypeError(
+            "grouped_ffn_swiglu_mx tokens and both weights must have the "
+            "same FP8 pointee dtype")
+    if (workspace.type.element_ty != tl.bfloat16 or
+            output.type.element_ty != tl.bfloat16):
+        raise TypeError(
+            "grouped_ffn_swiglu_mx workspace and output must point to BF16")
+    for name, operand in (
+            ("token_scale", token_scale),
+            ("gate_up_weight_scale", gate_up_weight_scale),
+            ("down_weight_scale", down_weight_scale)):
+        dtype = operand.type.element_ty
+        if not dtype.is_int() or dtype.primitive_bitwidth != 8:
+            raise TypeError(
+                f"grouped_ffn_swiglu_mx {name} must point to an 8-bit integer")
+    if not tokens_per_expert.type.element_ty.is_int():
+        raise TypeError(
+            "grouped_ffn_swiglu_mx tokens_per_expert must point to an "
+            "integer dtype")
+
+    shape = tuple(_unwrap_if_constexpr(dim) for dim in (
+        num_experts, max_tokens, hidden_features, intermediate_features))
+    if any(not isinstance(dim, int) or dim <= 0 for dim in shape):
+        raise ValueError(
+            "grouped_ffn_swiglu_mx E, M_max, H, and I must be positive")
+    if shape[2] % 32 or shape[3] != 1024:
+        raise ValueError(
+            "grouped_ffn_swiglu_mx H must be divisible by 32 and I must be "
+            "1024")
+    control_workers = _unwrap_if_constexpr(control_workers)
+    if not isinstance(control_workers, int) or control_workers < 0:
+        raise ValueError(
+            "grouped_ffn_swiglu_mx control_workers must be a non-negative integer")
+    semantic.grouped_ffn_swiglu_mx(
+        gate_up_weights, tokens, token_scale, gate_up_weight_scale,
+        down_weights, down_weight_scale, tokens_per_expert, workspace, output,
+        *shape, control_workers,
+        _semantic=_semantic)

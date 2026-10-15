@@ -1,4 +1,4 @@
-﻿# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -234,7 +234,7 @@ def ttir_to_linalg(mod, metadata, opt, *, named_ops=False):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         if distributed is not None:
-            distributed.ascend_passes.ttgpuir.add_convert_triton_distributed_to_hivm(pm)
+            distributed.ascend_passes.ttgpuir.add_convert_triton_distributed_to_hivm(pm, opt.core_ratio)
 
         ascend.passes.ttir.add_triton_control_flow_opt(pm)
         ascend.passes.ttir.add_triton_to_structure(pm, False, False)
@@ -607,6 +607,18 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         disable_tightly_coupled_buffer_reuse = metadata["disable_tightly_coupled_buffer_reuse"]
         if disable_tightly_coupled_buffer_reuse:
             _compile_option_list += ["--disable-tightly-coupled-buffer-reuse"]
+
+        protect_async_tightly_coupled_copy_sources = metadata[
+            "protect_async_tightly_coupled_copy_sources"
+        ]
+        if protect_async_tightly_coupled_copy_sources:
+            _compile_option_list += ["--protect-async-tightly-coupled-copy-sources"]
+
+        disable_hivm_delayed_cross_core_gss = metadata[
+            "disable_hivm_delayed_cross_core_gss"
+        ]
+        if disable_hivm_delayed_cross_core_gss:
+            _compile_option_list += ["--enable-hivm-delayed-cross-core-gss=false"]
 
         _compile_option_list += [
             f"--enable-auto-bind-sub-block={get_auto_bind_sub_block_option(metadata)}",
@@ -1058,6 +1070,8 @@ class NPUOptions:
     enable_preload: bool = None
     enable_auto_bind_sub_block: bool = None
     disable_tightly_coupled_buffer_reuse: bool = False
+    protect_async_tightly_coupled_copy_sources: bool = False
+    disable_hivm_delayed_cross_core_gss: bool = False
     enable_hivm_auto_cv_balance: bool = None
     sync_solver: bool = None
     unit_flag: bool = None
@@ -1097,6 +1111,7 @@ class NPUOptions:
     # Canonical modes: SIMD (D), SIMD with template-SIMT (P), and pure-SIMT
     # (T). ``unstructured_in_simt`` is an equivalent P spelling.
     compile_mode: str = "simd_simt_template"
+    core_ratio: str = ""
     simt_stack_limit: int = None
     # take effect on the reorder instruction pattern for SIMT. The pattern is disabled by default.
     enable_simt_reorder_instruction: bool = False

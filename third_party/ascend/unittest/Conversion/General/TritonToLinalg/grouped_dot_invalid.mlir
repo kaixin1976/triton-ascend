@@ -26,7 +26,8 @@ module {
         %weights, %tokens, %token_scale, %weight_scale, %counts, %output,
         %output_scale {
           num_experts = 8 : i64, max_tokens = 384 : i64,
-          out_features = 1024 : i64, in_features = 4096 : i64
+          out_features = 1024 : i64, in_features = 4096 : i64,
+          control_workers = 0 : i64
         } : !tt.ptr<f16>, !tt.ptr<f16>, !tt.ptr<i8>, !tt.ptr<i8>,
             !tt.ptr<i64>, !tt.ptr<f16>, !tt.ptr<i8>
     tt.return
@@ -46,7 +47,8 @@ module {
         %weights, %tokens, %token_scale, %weight_scale, %counts, %output,
         %output_scale {
           num_experts = 8 : i64, max_tokens = 384 : i64,
-          out_features = 1000 : i64, in_features = 4096 : i64
+          out_features = 1000 : i64, in_features = 4096 : i64,
+          control_workers = 0 : i64
         } : !tt.ptr<f8E4M3FN>, !tt.ptr<f8E4M3FN>, !tt.ptr<i8>,
             !tt.ptr<i8>, !tt.ptr<i64>, !tt.ptr<f8E4M3FN>, !tt.ptr<i8>
     tt.return

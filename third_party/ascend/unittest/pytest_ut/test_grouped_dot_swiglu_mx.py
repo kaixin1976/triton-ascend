@@ -23,6 +23,18 @@ def grouped_dot_swiglu_mx_kernel(
         output, output_scale, E, M_MAX, N, K)
 
 
+@triton.jit
+def grouped_ffn_swiglu_mx_kernel(
+        gate_up_weights, tokens, token_scale, gate_up_weight_scale,
+        down_weights, down_weight_scale, tokens_per_expert, output,
+        E: tl.constexpr, M_MAX: tl.constexpr, H: tl.constexpr,
+        I: tl.constexpr):
+    al.grouped_ffn_swiglu_mx(
+        gate_up_weights, tokens, token_scale, gate_up_weight_scale,
+        down_weights, down_weight_scale, tokens_per_expert, output, output,
+        E, M_MAX, H, I)
+
+
 def compile_to_linalg():
     src = ASTSource(
         grouped_dot_swiglu_mx_kernel,
@@ -58,6 +70,39 @@ def test_grouped_dot_swiglu_mx_typed_lowering():
     assert "memref<8x2048x128xi8>" in linalg
     assert "memref<384x1024xf8E4M3FN>" in linalg
     assert "memref<384x32xi8>" in linalg
+    assert "tensor.empty" not in linalg
+
+
+def test_grouped_ffn_swiglu_mx_typed_lowering():
+    src = ASTSource(
+        grouped_ffn_swiglu_mx_kernel,
+        {
+            "gate_up_weights": "*fp8e5",
+            "tokens": "*fp8e5",
+            "token_scale": "*i8",
+            "gate_up_weight_scale": "*i8",
+            "down_weights": "*fp8e5",
+            "down_weight_scale": "*i8",
+            "tokens_per_expert": "*i32",
+            "output": "*bf16",
+        },
+        {"E": 8, "M_MAX": 384, "H": 4096, "I": 1024},
+    )
+    context = ir.context()
+    ir.load_dialects(context)
+    ascend_ir.load_dialects(context)
+    ascend.load_dialects(context)
+    options = NPUOptions()
+    ttir = ast_to_ttir(
+        grouped_ffn_swiglu_mx_kernel, src, context, options, {}, {})
+    metadata = {**options.__dict__}
+    ttir_text = str(ttir)
+    linalg = str(ttir_to_linalg(ttir, metadata, options, named_ops=True))
+    assert "ascend.grouped_ffn_swiglu_mx" in ttir_text
+    assert "post_vector_func = \"swiglu_mx_ffn\"" in linalg
+    assert "memref<8x2048x4096xf8E5M2>" in linalg
+    assert "memref<8x4096x1024xf8E5M2>" in linalg
+    assert "memref<384x4096xbf16>" in linalg
     assert "tensor.empty" not in linalg
 
 

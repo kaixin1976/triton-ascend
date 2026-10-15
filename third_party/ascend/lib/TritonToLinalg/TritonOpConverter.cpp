@@ -3006,8 +3006,25 @@ LogicalResult GroupedDotSwiGLUMxConverter::matchAndRewrite(
       adaptor.getTokenScale(), {m, k / 32}, "token_scale");
   FailureOr<Value> weightScale = createStaticView(
       adaptor.getWeightScale(), {e, 2 * n, k / 32}, "weight_scale");
+  const int64_t controlWorkers = op.getControlWorkers();
+  int64_t countExtent = e;
+  if (controlWorkers > 0) {
+    auto countType = cast<MemRefType>(adaptor.getTokensPerExpert().getType())
+                         .getElementType();
+    auto countIntType = dyn_cast<IntegerType>(countType);
+    if (!countIntType || (countIntType.getWidth() != 32 &&
+                          countIntType.getWidth() != 64)) {
+      op.emitOpError("controlled counts require int32 or int64 storage");
+      return failure();
+    }
+    const int64_t cachelineElements = 64 / (countIntType.getWidth() / 8);
+    const int64_t controlBase =
+        ((e + cachelineElements - 1) / cachelineElements) *
+        cachelineElements;
+    countExtent = controlBase + controlWorkers * cachelineElements;
+  }
   FailureOr<Value> counts = createStaticView(
-      adaptor.getTokensPerExpert(), {e}, "tokens_per_expert");
+      adaptor.getTokensPerExpert(), {countExtent}, "tokens_per_expert");
   FailureOr<Value> output =
       createStaticView(adaptor.getOutput(), {m, n}, "output");
   FailureOr<Value> outputScale = createStaticView(
@@ -3024,6 +3041,96 @@ LogicalResult GroupedDotSwiGLUMxConverter::matchAndRewrite(
       hivm::DescaleModeAttr{});
   fused->setAttr("post_vector_func",
                  rewriter.getStringAttr("swiglu_mx_quant"));
+  rewriter.eraseOp(op);
+  return success();
+}
+
+LogicalResult GroupedFfnSwiGLUMxConverter::matchAndRewrite(
+    triton::ascend::GroupedFfnSwiGLUMxOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  auto createStaticView = [&](Value source, ArrayRef<int64_t> shape,
+                              StringRef name) -> FailureOr<Value> {
+    auto sourceTy = dyn_cast<MemRefType>(source.getType());
+    if (!sourceTy) {
+      op.emitOpError() << name << " must lower to a memref, got "
+                       << source.getType();
+      return failure();
+    }
+
+    SmallVector<int64_t> strides(shape.size(), 1);
+    for (int64_t i = static_cast<int64_t>(shape.size()) - 2; i >= 0; --i)
+      strides[i] = strides[i + 1] * shape[i + 1];
+    auto viewTy = MemRefType::get(shape, sourceTy.getElementType(),
+                                  MemRefLayoutAttrInterface{},
+                                  sourceTy.getMemorySpace());
+    SmallVector<int64_t> offsets{0};
+    Value view = rewriter.create<memref::ReinterpretCastOp>(
+        op.getLoc(), viewTy, source, ValueRange{}, ValueRange{}, ValueRange{},
+        offsets, shape, strides);
+    return view;
+  };
+
+  const int64_t e = op.getNumExperts();
+  const int64_t m = op.getMaxTokens();
+  const int64_t h = op.getHiddenFeatures();
+  const int64_t i = op.getIntermediateFeatures();
+  FailureOr<Value> gateUp = createStaticView(
+      adaptor.getGateUpWeights(), {e, 2 * i, h}, "gate_up_weights");
+  FailureOr<Value> tokens =
+      createStaticView(adaptor.getTokens(), {m, h}, "tokens");
+  FailureOr<Value> tokenScale = createStaticView(
+      adaptor.getTokenScale(), {m, h / 32}, "token_scale");
+  FailureOr<Value> gateUpScale = createStaticView(
+      adaptor.getGateUpWeightScale(), {e, 2 * i, h / 32},
+      "gate_up_weight_scale");
+  FailureOr<Value> down = createStaticView(
+      adaptor.getDownWeights(), {e, h, i}, "down_weights");
+  FailureOr<Value> downScale = createStaticView(
+      adaptor.getDownWeightScale(), {e, h, i / 32}, "down_weight_scale");
+  const int64_t controlWorkers = op.getControlWorkers();
+  int64_t countExtent = e;
+  if (controlWorkers > 0) {
+    auto countType = cast<MemRefType>(adaptor.getTokensPerExpert().getType())
+                         .getElementType();
+    auto countIntType = dyn_cast<IntegerType>(countType);
+    if (!countIntType || (countIntType.getWidth() != 32 &&
+                          countIntType.getWidth() != 64)) {
+      op.emitOpError("controlled counts require int32 or int64 storage");
+      return failure();
+    }
+    const int64_t cachelineElements = 64 / (countIntType.getWidth() / 8);
+    const int64_t controlBase =
+        ((e + cachelineElements - 1) / cachelineElements) *
+        cachelineElements;
+    countExtent = controlBase + controlWorkers * cachelineElements;
+  }
+  FailureOr<Value> counts = createStaticView(
+      adaptor.getTokensPerExpert(), {countExtent}, "tokens_per_expert");
+  FailureOr<Value> workspace =
+      createStaticView(adaptor.getWorkspace(), {m, h}, "workspace");
+  FailureOr<Value> output =
+      createStaticView(adaptor.getOutput(), {m, h}, "output");
+  if (failed(gateUp) || failed(tokens) || failed(tokenScale) ||
+      failed(gateUpScale) || failed(down) || failed(downScale) ||
+      failed(counts) || failed(workspace) || failed(output))
+    return failure();
+
+  auto fused = rewriter.create<hivm::MixGroupMatmulOp>(
+      op.getLoc(), TypeRange{}, *gateUp, *tokens, *counts, *workspace,
+      ValueRange{*tokenScale, *gateUpScale, *down, *downScale}, ValueRange{},
+      ValueRange{*output}, Value{}, Value{}, Value{}, Value{}, UnitAttr{}, UnitAttr{},
+      hivm::DescaleModeAttr{});
+  fused->setAttr("post_vector_func",
+                 rewriter.getStringAttr("swiglu_mx_ffn"));
+  if (controlWorkers > 0) {
+    // The controlled native FFN waits for a worker-private GM epoch before
+    // reading its token payload, token scales, and grouped counts.  Keep
+    // those inputs out of GraphSyncSolver's coarse cross-core RAW model so
+    // the explicit epoch protocol can overlap Dispatch with the native MIX
+    // op.  Weight inputs and the BF16 output retain their normal effects.
+    fused->setAttr("hivm.externally_synchronized_inputs",
+                   rewriter.getDenseI32ArrayAttr({1, 2, 3}));
+  }
   rewriter.eraseOp(op);
   return success();
 }

@@ -1603,6 +1603,8 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::GroupedDotConverter>(patterns.getContext());
   patterns.add<TTOpConverters::GroupedDotSwiGLUMxConverter>(
       patterns.getContext());
+  patterns.add<TTOpConverters::GroupedFfnSwiGLUMxConverter>(
+      patterns.getContext());
   patterns.add<TTOpConverters::DotScaledConverter>(patterns.getContext());
   patterns.add<TTOpConverters::PtrToIntConverter>(patterns.getContext());
   patterns.add<TTOpConverters::IntToPtrConverter>(typeConverter,
@@ -1855,7 +1857,8 @@ void TritonToLinalgPass::runOnOperation() {
   moduleOp.walk([&](Operation *op) {
     if (isa<triton::DotOp, triton::DotScaledOp, triton::ascend::DotOp,
             triton::ascend::GroupedDotOp,
-            triton::ascend::GroupedDotSwiGLUMxOp, hfusion::Conv1DOp,
+            triton::ascend::GroupedDotSwiGLUMxOp,
+            triton::ascend::GroupedFfnSwiGLUMxOp, hfusion::Conv1DOp,
             hfusion::Conv2DOp>(op)) {
       existDot = true;
       return WalkResult::interrupt();

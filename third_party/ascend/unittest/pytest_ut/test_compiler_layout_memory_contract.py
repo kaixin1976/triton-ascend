@@ -61,6 +61,45 @@ def _stub_graph_ub_budget_bytes_for_arch(arch):
     return _stub_ub_size_in_kbytes_for_arch(arch) * 1024 * 80 // 100
 
 
+@pytest.mark.parametrize(
+    "required_bits,arch,explicit_policy,multibuffer,num_stages,expected_policy",
+    [
+        (2 * 1024 * 1024, "Ascend950PR_9579", None, True, 2, None),
+        (4 * 1024 * 1024, "Ascend950PR_9579", None, True, 2, "no-l0c"),
+        (4 * 1024 * 1024, "Ascend950PR_9579", "no-limit", True, 2, "no-limit"),
+        (4 * 1024 * 1024, "Ascend950PR_9579", None, False, 2, None),
+        (4 * 1024 * 1024, "Ascend950PR_9579", None, True, 1, None),
+        (4 * 1024 * 1024, "Ascend910B", None, True, 2, None),
+    ],
+)
+def test_graph_l0c_pressure_selects_no_l0c(
+    compiler_module,
+    monkeypatch,
+    required_bits,
+    arch,
+    explicit_policy,
+    multibuffer,
+    num_stages,
+    expected_policy,
+):
+    def get_attr(_mod, name):
+        if name == compiler_module._L0C_DOUBLE_BUFFER_REQUIRED_BITS_ATTR:
+            return required_bits
+        return -1
+
+    monkeypatch.setattr(compiler_module, "_get_then_remove_rc", get_attr)
+    metadata = {
+        "limit_auto_multi_buffer_of_local_buffer": explicit_policy,
+        "multibuffer": multibuffer,
+        "num_stages": num_stages,
+    }
+    opt = SimpleNamespace(target_arch=arch, debug=False)
+
+    compiler_module._adjust_metadata_by_module_result(None, metadata, opt)
+
+    assert metadata["limit_auto_multi_buffer_of_local_buffer"] == expected_policy
+
+
 class _FakeModule:
 
     def __init__(self, events):
@@ -100,6 +139,7 @@ def compiler_module():
     utils_name = "triton.backends.ascend.utils"
     driver_name = "triton.backends.ascend.driver"
     cache_name = "triton.runtime.cache"
+    program_grid_name = "triton.backends.ascend.program_grid"
 
     def return_false(*_args, **_kwargs):
         return False
@@ -173,6 +213,7 @@ def compiler_module():
     previous_utils = sys.modules.get(utils_name)
     previous_driver = sys.modules.get(driver_name)
     previous_cache = sys.modules.get(cache_name)
+    previous_program_grid = sys.modules.get(program_grid_name)
     sys.modules[utils_name] = utils_stub
     sys.modules[driver_name] = driver_stub
     sys.modules[cache_name] = cache_stub
@@ -181,6 +222,12 @@ def compiler_module():
     previous_debug_line_rewriter = sys.modules.get(debug_line_rewriter_name)
     sys.modules.pop(debug_line_rewriter_name, None)
     try:
+        program_grid_path = compiler_path.with_name("program_grid.py")
+        program_grid_spec = importlib.util.spec_from_file_location(program_grid_name, program_grid_path)
+        program_grid = importlib.util.module_from_spec(program_grid_spec)
+        assert program_grid_spec is not None and program_grid_spec.loader is not None
+        sys.modules[program_grid_name] = program_grid
+        program_grid_spec.loader.exec_module(program_grid)
         debug_line_rewriter_path = compiler_path.with_name("debug_line_rewriter.py")
         debug_line_rewriter_spec = importlib.util.spec_from_file_location(debug_line_rewriter_name,
                                                                           debug_line_rewriter_path)
@@ -210,6 +257,10 @@ def compiler_module():
             sys.modules.pop(cache_name, None)
         else:
             sys.modules[cache_name] = previous_cache
+        if previous_program_grid is None:
+            sys.modules.pop(program_grid_name, None)
+        else:
+            sys.modules[program_grid_name] = previous_program_grid
     return module
 
 

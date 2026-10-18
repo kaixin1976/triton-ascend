@@ -86,6 +86,10 @@ from triton.backends.compiler import (
 from triton.runtime.cache import get_dump_manager
 
 
+_L0C_DOUBLE_BUFFER_REQUIRED_BITS_ATTR = "triton_ascend.l0c_double_buffer_required_bits"
+_A5_L0C_CAPACITY_BITS = 256 * 1024 * 8
+
+
 # TODO: materialize the concrete min shape
 def min_dot_size(target: GPUTarget):
     return lambda lhsType, rhsType: (1, 1, 1)
@@ -249,6 +253,18 @@ def _finalize_program_launch_policy(metadata, opt):
 
 
 def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
+    required_l0c_bits = _get_then_remove_rc(mod, _L0C_DOUBLE_BUFFER_REQUIRED_BITS_ATTR)
+    user_l0c_policy = metadata.get("limit_auto_multi_buffer_of_local_buffer")
+    num_stages = metadata.get("num_stages")
+    auto_multibuffer_enabled = metadata.get("multibuffer", True) and num_stages != 1
+    is_a5 = _is_a5_target_arch(opt.target_arch)
+    if (required_l0c_bits > _A5_L0C_CAPACITY_BITS and user_l0c_policy is None and auto_multibuffer_enabled
+            and is_a5):
+        metadata["limit_auto_multi_buffer_of_local_buffer"] = "no-l0c"
+        if opt.debug:
+            print(f"[DEBUG] L0C double buffer requires {required_l0c_bits} bits, "
+                  f"exceeding A5 capacity {_A5_L0C_CAPACITY_BITS}; selecting no-l0c")
+
     rc = _get_then_remove_rc(mod, "triton_ascend.dynamic_cv_pipeline.rc")
     if rc == 3:
         metadata["disable_vf_operand_substitution"] = True
@@ -837,6 +853,19 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if set_workspace_multibuffer is not None:
             _compile_option_list += \
                 [f"--set-workspace-multibuffer={set_workspace_multibuffer}"]
+
+        # Keep the A5 mixed-kernel path consistent with A2/A3: these options
+        # are part of NPUOptions and the autotuner search space, but were
+        # previously dropped before invoking bishengir-compile on A5.
+        tile_mix_vector_loop = metadata["tile_mix_vector_loop"]
+        if tile_mix_vector_loop is not None:
+            _compile_option_list += \
+                [f"--tile-mix-vector-loop={tile_mix_vector_loop}"]
+
+        tile_mix_cube_loop = metadata["tile_mix_cube_loop"]
+        if tile_mix_cube_loop is not None:
+            _compile_option_list += \
+                [f"--tile-mix-cube-loop={tile_mix_cube_loop}"]
 
         auto_multi_buffer = metadata["limit_auto_multi_buffer_of_local_buffer"]
         if auto_multi_buffer is None:

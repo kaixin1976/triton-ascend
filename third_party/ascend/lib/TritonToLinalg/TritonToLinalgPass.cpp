@@ -43,6 +43,7 @@
 #include "ascend/include/TritonToUnstructure/UnstructureConversionPass.h"
 #include "ascend/include/Utils/InterleaveOptimization.h"
 
+#include "bishengir/Dialect/HACC/IR/HACC.h"
 #include "bishengir/Dialect/HFusion/IR/HFusion.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -71,6 +72,7 @@
 #include "mlir/IR/BuiltinTypeInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Visitors.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -88,6 +90,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/LogicalResult.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <limits>
@@ -102,6 +105,409 @@ int nd2nzFlag = 0;
 bool compileOn91095Flag = false;
 bool existDotFlag = false;
 triton::ascend::CompileMode compileModeFlag = triton::ascend::CompileMode::Simd;
+constexpr llvm::StringLiteral kDotPadOnlyK = "dot_pad_only_k";
+constexpr llvm::StringLiteral kL0CDoubleBufferRequiredBits =
+    "triton_ascend.l0c_double_buffer_required_bits";
+constexpr llvm::StringLiteral kContiguousMFastPid =
+    "triton_ascend.contiguous_mfast_pid";
+constexpr uint64_t kLargeTailDotMacs = 1'000'000'000;
+constexpr uint64_t kDegenerateDotMacs = 32'000'000;
+constexpr uint64_t kA5L0CAlignmentBits = 4096;
+
+struct DotProblemShape {
+  int64_t m;
+  int64_t n;
+  int64_t k;
+  int64_t blockM;
+  int64_t blockN;
+  int64_t blockK;
+};
+
+struct MaskUpperBounds {
+  SmallVector<std::optional<int64_t>, 2> values = {std::nullopt,
+                                                    std::nullopt};
+  bool conflict = false;
+};
+
+static std::optional<int64_t> getSplatInteger(Value value) {
+  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return std::nullopt;
+  if (auto integer = dyn_cast<IntegerAttr>(constant.getValue()))
+    return integer.getInt();
+  auto dense = dyn_cast<DenseIntElementsAttr>(constant.getValue());
+  if (!dense || !dense.isSplat())
+    return std::nullopt;
+  return dense.getSplatValue<APInt>().getSExtValue();
+}
+
+// Recover a load mask's per-axis static upper bounds from the canonical
+// arange/cmpi -> expand_dims -> broadcast graph emitted by Triton. Unknown or
+// conflicting graphs deliberately fail closed so an explicit compile_hint is
+// still required for non-canonical kernels.
+static void collectMaskUpperBounds(Value value, ArrayRef<unsigned> axisMap,
+                                   MaskUpperBounds &bounds) {
+  if (auto andOp = value.getDefiningOp<arith::AndIOp>()) {
+    collectMaskUpperBounds(andOp.getLhs(), axisMap, bounds);
+    collectMaskUpperBounds(andOp.getRhs(), axisMap, bounds);
+    return;
+  }
+  if (auto broadcast = value.getDefiningOp<triton::BroadcastOp>()) {
+    auto srcType = dyn_cast<RankedTensorType>(broadcast.getSrc().getType());
+    if (srcType && srcType.getRank() == static_cast<int64_t>(axisMap.size()))
+      collectMaskUpperBounds(broadcast.getSrc(), axisMap, bounds);
+    return;
+  }
+  if (auto expand = value.getDefiningOp<triton::ExpandDimsOp>()) {
+    auto dstType = dyn_cast<RankedTensorType>(expand.getResult().getType());
+    unsigned axis = expand.getAxis();
+    if (!dstType || dstType.getRank() != static_cast<int64_t>(axisMap.size()) ||
+        axis >= axisMap.size())
+      return;
+    SmallVector<unsigned> srcAxisMap;
+    srcAxisMap.reserve(axisMap.size() - 1);
+    for (auto [index, mappedAxis] : llvm::enumerate(axisMap)) {
+      if (index != axis)
+        srcAxisMap.push_back(mappedAxis);
+    }
+    collectMaskUpperBounds(expand.getSrc(), srcAxisMap, bounds);
+    return;
+  }
+  auto cmp = value.getDefiningOp<arith::CmpIOp>();
+  if (!cmp || axisMap.size() != 1 ||
+      (cmp.getPredicate() != arith::CmpIPredicate::slt &&
+       cmp.getPredicate() != arith::CmpIPredicate::ult))
+    return;
+  auto upperBound = getSplatInteger(cmp.getRhs());
+  unsigned axis = axisMap.front();
+  if (!upperBound || *upperBound <= 0 || axis >= bounds.values.size())
+    return;
+  if (bounds.values[axis] && bounds.values[axis] != upperBound) {
+    bounds.conflict = true;
+    return;
+  }
+  bounds.values[axis] = upperBound;
+}
+
+static std::optional<MaskUpperBounds>
+getMaskUpperBounds(triton::LoadOp load) {
+  auto maskType = dyn_cast<RankedTensorType>(load.getMask().getType());
+  if (!maskType || maskType.getRank() != 2)
+    return std::nullopt;
+  MaskUpperBounds bounds;
+  SmallVector<unsigned, 2> axisMap = {0, 1};
+  collectMaskUpperBounds(load.getMask(), axisMap, bounds);
+  if (bounds.conflict || !bounds.values[0] || !bounds.values[1])
+    return std::nullopt;
+  return bounds;
+}
+
+static std::optional<DotProblemShape>
+getDotProblemShape(triton::DotOp dot, triton::LoadOp aLoad,
+                   triton::LoadOp bLoad) {
+  auto aType = dyn_cast<RankedTensorType>(dot.getA().getType());
+  auto bType = dyn_cast<RankedTensorType>(dot.getB().getType());
+  if (!aType || !bType || aType.getRank() != 2 || bType.getRank() != 2 ||
+      aType.getShape()[1] != bType.getShape()[0])
+    return std::nullopt;
+  auto aBounds = getMaskUpperBounds(aLoad);
+  auto bBounds = getMaskUpperBounds(bLoad);
+  if (!aBounds || !bBounds ||
+      aBounds->values[1] != bBounds->values[0])
+    return std::nullopt;
+  return DotProblemShape{*aBounds->values[0], *bBounds->values[1],
+                         *aBounds->values[1], aType.getShape()[0],
+                         bType.getShape()[1], aType.getShape()[1]};
+}
+
+static bool hasAtLeastMacs(const DotProblemShape &shape, uint64_t threshold) {
+  uint64_t required = threshold;
+  for (int64_t dimension : {shape.m, shape.n, shape.k}) {
+    if (dimension <= 0)
+      return false;
+    uint64_t value = static_cast<uint64_t>(dimension);
+    required = required / value + (required % value != 0);
+  }
+  return required <= 1;
+}
+
+static bool dependsOn(Value root, Value source) {
+  DenseSet<Value> visited;
+  SmallVector<Value> worklist{root};
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (value == source)
+      return true;
+    if (!visited.insert(value).second)
+      continue;
+    Operation *definingOp = value.getDefiningOp();
+    if (!definingOp)
+      continue;
+    llvm::append_range(worklist, definingOp->getOperands());
+  }
+  return false;
+}
+
+static Value getTiledAxisIndex(Value coordinates, int64_t blockSize) {
+  auto add = coordinates.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return {};
+  for (Value operand : add->getOperands()) {
+    auto splat = operand.getDefiningOp<triton::SplatOp>();
+    if (!splat)
+      continue;
+    auto multiply = splat.getSrc().getDefiningOp<arith::MulIOp>();
+    if (!multiply)
+      continue;
+    auto lhs = getSplatInteger(multiply.getLhs());
+    auto rhs = getSplatInteger(multiply.getRhs());
+    if (lhs && *lhs == blockSize && !rhs)
+      return multiply.getRhs();
+    if (rhs && *rhs == blockSize && !lhs)
+      return multiply.getLhs();
+  }
+  return {};
+}
+
+static Value findMaskedAxisIndex(Value mask, int64_t upperBound,
+                                 int64_t blockSize) {
+  DenseSet<Value> visited;
+  SmallVector<Value> worklist{mask};
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    if (!visited.insert(value).second)
+      continue;
+    if (auto compare = value.getDefiningOp<arith::CmpIOp>()) {
+      if ((compare.getPredicate() == arith::CmpIPredicate::slt ||
+           compare.getPredicate() == arith::CmpIPredicate::ult) &&
+          getSplatInteger(compare.getRhs()) == upperBound) {
+        auto coordinatesType =
+            dyn_cast<RankedTensorType>(compare.getLhs().getType());
+        if (coordinatesType && coordinatesType.getRank() == 1 &&
+            coordinatesType.getShape()[0] == blockSize) {
+          if (Value index =
+                  getTiledAxisIndex(compare.getLhs(), blockSize))
+            return index;
+        }
+      }
+    }
+    Operation *definingOp = value.getDefiningOp();
+    if (!definingOp)
+      continue;
+    llvm::append_range(worklist, definingOp->getOperands());
+  }
+  return {};
+}
+
+static bool isAscend950PR(ModuleOp moduleOp) {
+  auto target = moduleOp->getAttrOfType<hacc::TargetAttr>(hacc::TargetAttr::name);
+  return target && target.getTarget().getValue().starts_with("Ascend950PR");
+}
+
+// Large, tail-heavy FP16 MM benefits from assigning a contiguous range of
+// M-fast tiles to each A5 Cube core. Convert the two mask-proven tile indices
+// to a plain M-fast order and attach a contract consumed by AutoBlockify. The
+// latter distributes contiguous program-ID ranges instead of its default
+// cyclic order. The mapping remains a bijection over the original
+// one-dimensional launch grid, so the operator and launch ABI do not change.
+static void applyContiguousMFastPidOrder(ModuleOp moduleOp) {
+  if (!isAscend950PR(moduleOp) || moduleOp->hasAttr(kContiguousMFastPid))
+    return;
+
+  SmallVector<triton::GetProgramIdOp> programIds;
+  moduleOp.walk([&](triton::GetProgramIdOp programId) {
+    programIds.push_back(programId);
+  });
+  if (programIds.size() != 1 || programIds.front().getAxisAsInt() != 0)
+    return;
+  triton::GetProgramIdOp programId = programIds.front();
+  auto pidType = dyn_cast<IntegerType>(programId.getType());
+  if (!pidType || pidType.getWidth() != 32)
+    return;
+
+  struct Candidate {
+    DotProblemShape shape;
+    Value oldM;
+    Value oldN;
+  };
+  std::optional<Candidate> candidate;
+  bool ambiguous = false;
+  moduleOp.walk([&](triton::DotOp dot) {
+    auto aLoad = dot.getA().getDefiningOp<triton::LoadOp>();
+    auto bLoad = dot.getB().getDefiningOp<triton::LoadOp>();
+    auto aType = dyn_cast<RankedTensorType>(dot.getA().getType());
+    auto bType = dyn_cast<RankedTensorType>(dot.getB().getType());
+    if (!aLoad || !bLoad || !aType || !bType ||
+        !aType.getElementType().isF16() ||
+        !bType.getElementType().isF16())
+      return;
+    auto shape = getDotProblemShape(dot, aLoad, bLoad);
+    if (!shape || shape->m < 4095 || shape->n < 4095 || shape->k < 1023 ||
+        shape->k >= 2048 || shape->blockM < 256 || shape->blockN < 192 ||
+        shape->m % shape->blockM == 0 || shape->n % shape->blockN == 0 ||
+        shape->k % shape->blockK == 0)
+      return;
+    int64_t gridM = (shape->m + shape->blockM - 1) / shape->blockM;
+    int64_t gridN = (shape->n + shape->blockN - 1) / shape->blockN;
+    if (gridM <= 0 || gridN <= 0 ||
+        gridM > std::numeric_limits<int32_t>::max() / gridN ||
+        gridM * gridN < 28 * 8)
+      return;
+    Value oldM = findMaskedAxisIndex(aLoad.getMask(), shape->m,
+                                     shape->blockM);
+    Value oldN = findMaskedAxisIndex(bLoad.getMask(), shape->n,
+                                     shape->blockN);
+    if (!oldM || !oldN || oldM == oldN ||
+        !dependsOn(oldM, programId.getResult()) ||
+        !dependsOn(oldN, programId.getResult()))
+      return;
+    if (candidate) {
+      ambiguous = true;
+      return;
+    }
+    candidate = Candidate{*shape, oldM, oldN};
+  });
+  if (!candidate || ambiguous)
+    return;
+
+  const DotProblemShape &shape = candidate->shape;
+  int64_t gridM = (shape.m + shape.blockM - 1) / shape.blockM;
+  OpBuilder builder(programId);
+  builder.setInsertionPointAfter(programId);
+  Location loc = programId.getLoc();
+  Value cGridM = builder.create<arith::ConstantIntOp>(loc, gridM, 32);
+  Value newM =
+      builder.create<arith::RemSIOp>(loc, programId.getResult(), cGridM);
+  Value newN =
+      builder.create<arith::DivSIOp>(loc, programId.getResult(), cGridM);
+
+  candidate->oldM.replaceAllUsesWith(newM);
+  candidate->oldN.replaceAllUsesWith(newN);
+  moduleOp->setAttr(kContiguousMFastPid, builder.getUnitAttr());
+}
+
+// A5 measurements show that removing full-tile fills pays off for large tail
+// matmuls and sufficiently large M=1/N=1 matmuls, while adding 1-2 us to small
+// matmuls. Keep this graph rule conservative; autotuning remains responsible
+// for tile selection and L0C policies not implied by accumulator capacity.
+static bool shouldApplyDotPadOnlyK(const DotProblemShape &shape) {
+  bool hasTail = shape.m % shape.blockM != 0 ||
+                 shape.n % shape.blockN != 0 ||
+                 shape.k % shape.blockK != 0;
+  bool isDegenerate = shape.m == 1 || shape.n == 1;
+  if (isDegenerate)
+    return hasAtLeastMacs(shape, kDegenerateDotMacs);
+  return hasTail && hasAtLeastMacs(shape, kLargeTailDotMacs);
+}
+
+// Record the largest per-dot L0C requirement for a two-buffer accumulator.
+// The A5 backend consumes this compiler-derived value after the pass and
+// compares it with the target L0C capacity. Keep the value rather than the
+// final policy in IR so explicit user options retain priority in Python.
+static void recordL0CDoubleBufferRequirement(ModuleOp moduleOp) {
+  uint64_t maxRequiredBits = 0;
+  moduleOp.walk([&](triton::DotOp dot) {
+    auto accumulatorType = dyn_cast<RankedTensorType>(dot.getC().getType());
+    if (!accumulatorType || accumulatorType.getRank() != 2 ||
+        !accumulatorType.hasStaticShape())
+      return;
+    Type elementType = accumulatorType.getElementType();
+    if (!elementType.isIntOrFloat())
+      return;
+    int64_t blockM = accumulatorType.getShape()[0];
+    int64_t blockN = accumulatorType.getShape()[1];
+    if (blockM <= 0 || blockN <= 0)
+      return;
+
+    uint64_t elementBits = elementType.getIntOrFloatBitWidth();
+    uint64_t m = static_cast<uint64_t>(blockM);
+    uint64_t n = static_cast<uint64_t>(blockN);
+    if (m > std::numeric_limits<uint64_t>::max() / n ||
+        m * n > std::numeric_limits<uint64_t>::max() / elementBits)
+      return;
+    uint64_t singleBufferBits = m * n * elementBits;
+    if (singleBufferBits > std::numeric_limits<uint64_t>::max() -
+                               (kA5L0CAlignmentBits - 1))
+      return;
+    singleBufferBits =
+        ((singleBufferBits + kA5L0CAlignmentBits - 1) /
+         kA5L0CAlignmentBits) *
+        kA5L0CAlignmentBits;
+    if (singleBufferBits >
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) / 2)
+      return;
+    maxRequiredBits = std::max(maxRequiredBits, singleBufferBits * 2);
+  });
+
+  if (maxRequiredBits == 0)
+    return;
+  Builder builder(moduleOp.getContext());
+  moduleOp->setAttr(kL0CDoubleBufferRequiredBits,
+                    builder.getI64IntegerAttr(maxRequiredBits));
+}
+
+// Mark private zero-padded dot operands before memory conversion separates the
+// loads from their consumers. This is equivalent to the existing explicit
+// `compile_hint(..., "dot_pad_only_k")` path: NormalizeMatmul may then remove
+// the full-tile fill and use the valid K extent for the reduction.
+static void markZeroPaddedDotOperands(ModuleOp moduleOp) {
+  SmallVector<triton::LoadOp> loadsToMark;
+  moduleOp.walk([&](triton::DotOp dot) {
+    auto getEligibleLoad = [](Value operand) -> triton::LoadOp {
+      auto load = operand.getDefiningOp<triton::LoadOp>();
+      if (!load || !load.getMask() || !load.getOther() ||
+          !operand.hasOneUse() ||
+          (!matchPattern(load.getOther(), m_Zero()) &&
+           !matchPattern(load.getOther(), m_AnyZeroFloat())))
+        return {};
+      return load;
+    };
+    auto aLoad = getEligibleLoad(dot.getA());
+    auto bLoad = getEligibleLoad(dot.getB());
+    if (!aLoad || !bLoad)
+      return;
+    auto shape = getDotProblemShape(dot, aLoad, bLoad);
+    if (!shape || !shouldApplyDotPadOnlyK(*shape))
+      return;
+    loadsToMark.push_back(aLoad);
+    loadsToMark.push_back(bLoad);
+  });
+
+  for (triton::LoadOp load : loadsToMark) {
+    OpBuilder builder(load);
+    builder.setInsertionPointAfter(load);
+    auto mark =
+        builder.create<annotation::MarkOp>(load.getLoc(), load.getResult());
+    mark->setAttr(kDotPadOnlyK, builder.getUnitAttr());
+  }
+}
+
+// A dot RHS may acquire an implicit transpose during conversion. Keep this
+// load-specific hint on the value produced by the load so NormalizeMatmul can
+// still find the load writer and remove its full-tile zero fill.
+static void moveDotPadOnlyKBeforeTranspose(ModuleOp moduleOp) {
+  SmallVector<annotation::MarkOp> marksToMove;
+  moduleOp.walk([&](annotation::MarkOp mark) {
+    if (mark->hasAttr(kDotPadOnlyK) &&
+        mark->getOperand(0).getDefiningOp<linalg::TransposeOp>())
+      marksToMove.push_back(mark);
+  });
+
+  for (annotation::MarkOp mark : marksToMove) {
+    auto transpose = mark->getOperand(0).getDefiningOp<linalg::TransposeOp>();
+    Value input = transpose.getInput();
+    bool alreadyMarked = llvm::any_of(input.getUsers(), [](Operation *user) {
+      return user->hasAttr(kDotPadOnlyK);
+    });
+    if (!alreadyMarked) {
+      OpBuilder builder(transpose);
+      builder.setInsertionPoint(transpose);
+      auto moved = builder.create<annotation::MarkOp>(mark.getLoc(), input);
+      moved->setAttr(kDotPadOnlyK, builder.getUnitAttr());
+    }
+    mark.erase();
+  }
+}
 
 static bool containsTritonPointer(Type type) {
   if (isa<triton::PointerType>(type))
@@ -1677,6 +2083,9 @@ void TritonToLinalgPass::runOnOperation() {
   }
 
   auto moduleOp = getOperation();
+  applyContiguousMFastPidOrder(moduleOp);
+  recordL0CDoubleBufferRequirement(moduleOp);
+  markZeroPaddedDotOperands(moduleOp);
 
   // Validate the CFO handoff before any rewrite can erase malformed metadata.
   if (failed(validatePointerDescriptorHandoffMetadata(moduleOp))) {
@@ -1937,6 +2346,8 @@ LogicalResult TritonToLinalgPass::finalizeLoweredModule(ModuleOp moduleOp,
   if (failed(runPipeline(pm, getOperation()))) {
     signalPassFailure();
   }
+
+  moveDotPadOnlyKBeforeTranspose(moduleOp);
 
   specializeFullRowCopies(moduleOp);
 

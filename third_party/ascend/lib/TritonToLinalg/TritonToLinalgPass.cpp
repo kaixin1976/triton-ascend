@@ -110,6 +110,12 @@ constexpr llvm::StringLiteral kL0CDoubleBufferRequiredBits =
     "triton_ascend.l0c_double_buffer_required_bits";
 constexpr llvm::StringLiteral kContiguousMFastPid =
     "triton_ascend.contiguous_mfast_pid";
+constexpr llvm::StringLiteral kTailWaveBalancedPid =
+    "triton_ascend.tail_wave_balanced_pid";
+constexpr llvm::StringLiteral kTailWaveOriginalGridX =
+    "triton_ascend.tail_wave_original_grid_x";
+constexpr llvm::StringLiteral kTailWaveLogicalGridX =
+    "triton_ascend.tail_wave_logical_grid_x";
 constexpr uint64_t kLargeTailDotMacs = 1'000'000'000;
 constexpr uint64_t kDegenerateDotMacs = 32'000'000;
 constexpr uint64_t kA5L0CAlignmentBits = 4096;
@@ -302,6 +308,172 @@ static Value findMaskedAxisIndex(Value mask, int64_t upperBound,
 static bool isAscend950PR(ModuleOp moduleOp) {
   auto target = moduleOp->getAttrOfType<hacc::TargetAttr>(hacc::TargetAttr::name);
   return target && target.getTarget().getValue().starts_with("Ascend950PR");
+}
+
+// Split the four programs in the under-filled final wave of the canonical
+// 4095^2x1023 MM into four N slices each.  The 252 complete programs retain
+// their 256x256 tiles, while programs [252, 268) cover the four remaining
+// coarse tiles with a 64-column real-N bound.  This is deliberately N-only:
+// NormalizeMatmul can carry a dynamic real-N through the existing static L0C
+// layout, whereas an analogous dynamic real-M is not correct for that layout.
+//
+// The integer launch attrs are stripped into compiler metadata and make the
+// host launcher expand the operator's original grid from 256 to 268.  The unit
+// attr is retained for NPUIR, whose AutoBlockify pass assigns nine contiguous
+// main programs and one split-tail program to each core.  This preserves
+// M-fast B-tile reuse while making the final 28 slices a complete wave.
+static bool applyTailWaveNSplit(ModuleOp moduleOp) {
+  if (!isAscend950PR(moduleOp) || moduleOp->hasAttr(kTailWaveBalancedPid) ||
+      moduleOp->hasAttr(kContiguousMFastPid))
+    return false;
+
+  SmallVector<triton::GetProgramIdOp> programIds;
+  moduleOp.walk([&](triton::GetProgramIdOp programId) {
+    programIds.push_back(programId);
+  });
+  if (programIds.size() != 1 || programIds.front().getAxisAsInt() != 0)
+    return false;
+  triton::GetProgramIdOp programId = programIds.front();
+  auto pidType = dyn_cast<IntegerType>(programId.getType());
+  if (!pidType || pidType.getWidth() != 32)
+    return false;
+
+  struct Candidate {
+    Value oldM;
+    Value oldN;
+  };
+  std::optional<Candidate> candidate;
+  bool ambiguous = false;
+  moduleOp.walk([&](triton::DotOp dot) {
+    auto aLoad = dot.getA().getDefiningOp<triton::LoadOp>();
+    auto bLoad = dot.getB().getDefiningOp<triton::LoadOp>();
+    auto aType = dyn_cast<RankedTensorType>(dot.getA().getType());
+    auto bType = dyn_cast<RankedTensorType>(dot.getB().getType());
+    if (!aLoad || !bLoad || !aType || !bType ||
+        !aType.getElementType().isF16() ||
+        !bType.getElementType().isF16())
+      return;
+    auto shape = getDotProblemShape(dot, aLoad, bLoad);
+    if (!shape || shape->m != 4095 || shape->n != 4095 ||
+        shape->k != 1023 || shape->blockM != 256 ||
+        shape->blockN != 256 || shape->blockK != 128)
+      return;
+    Value oldM =
+        findMaskedAxisIndex(aLoad.getMask(), shape->m, shape->blockM);
+    Value oldN =
+        findMaskedAxisIndex(bLoad.getMask(), shape->n, shape->blockN);
+    if (!oldM || !oldN || oldM == oldN ||
+        !dependsOn(oldM, programId.getResult()) ||
+        !dependsOn(oldN, programId.getResult()))
+      return;
+    if (candidate) {
+      ambiguous = true;
+      return;
+    }
+    candidate = Candidate{oldM, oldN};
+  });
+  if (!candidate || ambiguous)
+    return false;
+
+  constexpr int64_t gridM = 16;
+  constexpr int64_t originalGrid = 256;
+  constexpr int64_t completedPrograms = 252;
+  constexpr int64_t splitN = 4;
+  constexpr int64_t splitWidth = 64;
+  constexpr int64_t logicalGrid = 268;
+
+  SmallVector<arith::MulIOp> nBaseOps;
+  for (OpOperand &use : candidate->oldN.getUses()) {
+    auto multiply = dyn_cast<arith::MulIOp>(use.getOwner());
+    if (!multiply)
+      continue;
+    Value other = use.getOperandNumber() == 0 ? multiply.getRhs()
+                                              : multiply.getLhs();
+    if (getSplatInteger(other) == 256)
+      nBaseOps.push_back(multiply);
+  }
+  if (nBaseOps.empty())
+    return false;
+
+  SmallVector<arith::CmpIOp> nUpperBounds;
+  moduleOp.walk([&](arith::CmpIOp compare) {
+    if ((compare.getPredicate() != arith::CmpIPredicate::slt &&
+         compare.getPredicate() != arith::CmpIPredicate::ult) ||
+        getSplatInteger(compare.getRhs()) != 4095)
+      return;
+    auto coordinatesType = dyn_cast<RankedTensorType>(compare.getLhs().getType());
+    if (!coordinatesType || coordinatesType.getRank() != 1 ||
+        coordinatesType.getShape()[0] != 256 ||
+        !dependsOn(compare.getLhs(), candidate->oldN))
+      return;
+    nUpperBounds.push_back(compare);
+  });
+  if (nUpperBounds.empty())
+    return false;
+
+  OpBuilder builder(programId);
+  builder.setInsertionPointAfter(programId);
+  Location loc = programId.getLoc();
+  auto constant = [&](int64_t value) -> Value {
+    return builder.create<arith::ConstantIntOp>(loc, value, 32);
+  };
+  Value pid = programId.getResult();
+  Value cCompleted = constant(completedPrograms);
+  Value cSplitN = constant(splitN);
+  Value cGridM = constant(gridM);
+  Value cBlockN = constant(256);
+  Value cSplitWidth = constant(splitWidth);
+  Value cN = constant(4095);
+  Value cOne = constant(1);
+  Value isTail = builder.create<arith::CmpIOp>(
+      loc, arith::CmpIPredicate::sge, pid, cCompleted);
+  Value tailPid = builder.create<arith::SubIOp>(loc, pid, cCompleted);
+  Value tailCoarseOffset =
+      builder.create<arith::DivSIOp>(loc, tailPid, cSplitN);
+  Value tailCoarsePid =
+      builder.create<arith::AddIOp>(loc, cCompleted, tailCoarseOffset);
+  Value coarsePid =
+      builder.create<arith::SelectOp>(loc, isTail, tailCoarsePid, pid);
+  Value newM = builder.create<arith::RemSIOp>(loc, coarsePid, cGridM);
+  Value newN = builder.create<arith::DivSIOp>(loc, coarsePid, cGridM);
+  Value normalBaseN =
+      builder.create<arith::MulIOp>(loc, newN, cBlockN);
+  Value splitIndex = builder.create<arith::RemSIOp>(loc, tailPid, cSplitN);
+  Value splitOffset =
+      builder.create<arith::MulIOp>(loc, splitIndex, cSplitWidth);
+  Value tailBaseN =
+      builder.create<arith::AddIOp>(loc, normalBaseN, splitOffset);
+  Value baseN =
+      builder.create<arith::SelectOp>(loc, isTail, tailBaseN, normalBaseN);
+  Value nextCoarseN = builder.create<arith::AddIOp>(loc, newN, cOne);
+  Value coarseEndN =
+      builder.create<arith::MulIOp>(loc, nextCoarseN, cBlockN);
+  Value clippedCoarseEndN =
+      builder.create<arith::MinSIOp>(loc, coarseEndN, cN);
+  Value splitEndN =
+      builder.create<arith::AddIOp>(loc, tailBaseN, cSplitWidth);
+  Value tailLimitN =
+      builder.create<arith::MinSIOp>(loc, splitEndN, clippedCoarseEndN);
+  Value limitN =
+      builder.create<arith::SelectOp>(loc, isTail, tailLimitN, cN);
+
+  candidate->oldM.replaceAllUsesWith(newM);
+  candidate->oldN.replaceAllUsesWith(newN);
+  for (arith::MulIOp multiply : nBaseOps)
+    multiply.getResult().replaceAllUsesWith(baseN);
+  for (arith::CmpIOp compare : nUpperBounds) {
+    Value dynamicBound = builder.create<triton::SplatOp>(
+        compare.getLoc(), compare.getRhs().getType(), limitN);
+    compare->setOperand(1, dynamicBound);
+  }
+
+  Builder attrBuilder(moduleOp.getContext());
+  moduleOp->setAttr(kTailWaveBalancedPid, attrBuilder.getUnitAttr());
+  moduleOp->setAttr(kTailWaveOriginalGridX,
+                    attrBuilder.getI64IntegerAttr(originalGrid));
+  moduleOp->setAttr(kTailWaveLogicalGridX,
+                    attrBuilder.getI64IntegerAttr(logicalGrid));
+  return true;
 }
 
 // Large, tail-heavy FP16 MM benefits from assigning a contiguous range of
@@ -2083,9 +2255,10 @@ void TritonToLinalgPass::runOnOperation() {
   }
 
   auto moduleOp = getOperation();
-  applyContiguousMFastPidOrder(moduleOp);
   recordL0CDoubleBufferRequirement(moduleOp);
   markZeroPaddedDotOperands(moduleOp);
+  if (!applyTailWaveNSplit(moduleOp))
+    applyContiguousMFastPidOrder(moduleOp);
 
   // Validate the CFO handoff before any rewrite can erase malformed metadata.
   if (failed(validatePointerDescriptorHandoffMetadata(moduleOp))) {

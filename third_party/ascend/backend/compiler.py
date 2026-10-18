@@ -87,6 +87,8 @@ from triton.runtime.cache import get_dump_manager
 
 
 _L0C_DOUBLE_BUFFER_REQUIRED_BITS_ATTR = "triton_ascend.l0c_double_buffer_required_bits"
+_TAIL_WAVE_ORIGINAL_GRID_X_ATTR = "triton_ascend.tail_wave_original_grid_x"
+_TAIL_WAVE_LOGICAL_GRID_X_ATTR = "triton_ascend.tail_wave_logical_grid_x"
 _A5_L0C_CAPACITY_BITS = 256 * 1024 * 8
 
 
@@ -248,12 +250,40 @@ def _finalize_program_launch_policy(metadata, opt):
     if auto_blockify_enabled and ptsm_cap_authorized:
         raise RuntimeError("AutoBlockify and persistent-grid cap cannot both be enabled")
 
+    tail_wave_original_grid_x = metadata.get("tail_wave_original_grid_x", 0)
+    tail_wave_logical_grid_x = metadata.get("tail_wave_logical_grid_x", 0)
+    if not isinstance(tail_wave_original_grid_x, int) or not isinstance(tail_wave_logical_grid_x, int):
+        raise RuntimeError("tail-wave launch metadata must be integers")
+    tail_wave_enabled = tail_wave_original_grid_x > 0 or tail_wave_logical_grid_x > 0
+    if tail_wave_enabled:
+        if tail_wave_original_grid_x <= 0 or tail_wave_logical_grid_x <= tail_wave_original_grid_x:
+            raise RuntimeError("invalid tail-wave launch metadata")
+        if mapping_applied or row_coalescing_applied or ptsm_cap_authorized:
+            raise RuntimeError("tail-wave expansion conflicts with another program-grid mapping")
+        if not auto_blockify_enabled:
+            raise RuntimeError("tail-wave expansion requires AutoBlockify")
+
     metadata["auto_blockify_enabled"] = auto_blockify_enabled
     metadata["ptsm_cap_authorized"] = ptsm_cap_authorized
 
 
 def _adjust_metadata_by_module_result(mod, metadata, opt, **kwargs):
     required_l0c_bits = _get_then_remove_rc(mod, _L0C_DOUBLE_BUFFER_REQUIRED_BITS_ATTR)
+    tail_wave_original_grid_x = _get_then_remove_rc(mod, _TAIL_WAVE_ORIGINAL_GRID_X_ATTR)
+    tail_wave_logical_grid_x = _get_then_remove_rc(mod, _TAIL_WAVE_LOGICAL_GRID_X_ATTR)
+    has_tail_wave_original = tail_wave_original_grid_x != -1
+    has_tail_wave_logical = tail_wave_logical_grid_x != -1
+    if has_tail_wave_original != has_tail_wave_logical:
+        raise RuntimeError("incomplete tail-wave launch contract")
+    if has_tail_wave_original:
+        if (tail_wave_original_grid_x <= 0 or
+                tail_wave_logical_grid_x <= tail_wave_original_grid_x):
+            raise RuntimeError("invalid tail-wave launch grid")
+        metadata["tail_wave_original_grid_x"] = tail_wave_original_grid_x
+        metadata["tail_wave_logical_grid_x"] = tail_wave_logical_grid_x
+    else:
+        metadata["tail_wave_original_grid_x"] = 0
+        metadata["tail_wave_logical_grid_x"] = 0
     user_l0c_policy = metadata.get("limit_auto_multi_buffer_of_local_buffer")
     num_stages = metadata.get("num_stages")
     auto_multibuffer_enabled = metadata.get("multibuffer", True) and num_stages != 1
@@ -1383,6 +1413,10 @@ class NPUOptions:
     graph_optimize_rule_mask: int = field(default=DEFAULT_GRAPH_OPTIMIZATION_RULE_MASK, init=False)
     graph_optimize_ub_capacity_bytes: Optional[int] = field(default=None, init=False)
     has_auto_blockify_blacklist_op: Optional[bool] = field(default=None, init=False)
+    # Compiler-derived launch contract for MM tail-wave expansion.  Zero means
+    # absent; users cannot set either value through compile options.
+    tail_wave_original_grid_x: int = field(default=0, init=False)
+    tail_wave_logical_grid_x: int = field(default=0, init=False)
     inter_cache_num: Optional[int] = field(default=None, init=False)
     intra_cache_num: Optional[int] = field(default=None, init=False)
     kernel_name: str = field(default="triton_", init=False)

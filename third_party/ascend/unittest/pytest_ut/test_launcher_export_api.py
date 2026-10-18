@@ -48,6 +48,8 @@ def _make_metadata():
         program_grid_mapping_applied=False,
         auto_blockify_enabled=False,
         ptsm_cap_authorized=False,
+        tail_wave_original_grid_x=0,
+        tail_wave_logical_grid_x=0,
     )
 
 
@@ -93,6 +95,36 @@ def test_make_launcher_exposes_triton_launch_kernel(
     assert 'std::vector<char> launch_args(total_size, 0);' in src
     assert 'memcpy(launch_args.data() + grid_offset, &gridX, sizeof(int32_t));' in src
     _mock_ffts.assert_called_once_with("Ascend910B3")
+
+
+@patch.object(driver, "NPUUtils")
+@patch.object(driver, "force_disable_ffts", return_value=False)
+@patch.object(driver, "is_ffts_supported", return_value=True)
+@patch.object(driver, "get_backend_func", side_effect=_mock_backend_func)
+def test_make_launcher_expands_tail_wave_grid_before_packing(
+    _mock_backend_func_patch,
+    _mock_ffts,
+    _mock_disable_ffts,
+    mock_npu_utils,
+):
+    mock_npu_utils.return_value.get_aivector_core_num.return_value = 56
+    mock_npu_utils.return_value.get_aicore_num.return_value = 28
+    metadata = _make_metadata()
+    metadata.mix_mode = "mix"
+    metadata.auto_blockify_enabled = True
+    metadata.tail_wave_original_grid_x = 256
+    metadata.tail_wave_logical_grid_x = 280
+
+    src = driver.make_launcher(
+        constants={},
+        signature={0: "*fp16", 1: "*fp16", 2: "*fp16"},
+        metadata=metadata,
+    )
+
+    assert src.count("if (gridX != 256 || gridY != 1 || gridZ != 1)") == 2
+    assert src.count("gridX = 280;") == 2
+    assert src.count("blockNum = std::min(blockNum, (uint32_t)28);") == 2
+    assert src.index("gridX = 280;") < src.index("memcpy(launch_args.data() + grid_offset, &gridX")
 
 
 @patch.object(driver, "NPUUtils")

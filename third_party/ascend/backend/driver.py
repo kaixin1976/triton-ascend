@@ -1077,6 +1077,32 @@ static void release_npu_tensor_handle(void* handle) {{
 
     launcher_cap_enabled = auto_blockify_enabled
 
+    tail_wave_original_grid_x = getattr(metadata, "tail_wave_original_grid_x", 0)
+    tail_wave_logical_grid_x = getattr(metadata, "tail_wave_logical_grid_x", 0)
+    if (not isinstance(tail_wave_original_grid_x, int) or
+            not isinstance(tail_wave_logical_grid_x, int)):
+        raise RuntimeError("tail-wave launch metadata must be integers")
+    tail_wave_enabled = tail_wave_original_grid_x > 0 or tail_wave_logical_grid_x > 0
+    if tail_wave_enabled:
+        if tail_wave_original_grid_x <= 0 or tail_wave_logical_grid_x <= tail_wave_original_grid_x:
+            raise RuntimeError("invalid tail-wave launch metadata")
+        if mapping_applied or row_coalescing_applied or ptsm_cap_authorized:
+            raise RuntimeError("tail-wave expansion conflicts with another program-grid mapping")
+        if not auto_blockify_enabled:
+            raise RuntimeError("tail-wave expansion requires AutoBlockify")
+        tail_wave_grid_expand = f"""
+  // TritonToLinalg split the final MM wave into additional logical N slices.
+  // Keep the public operator grid unchanged and expand only this compiled
+  // kernel's device-visible logical grid before argument packing.
+  if (gridX != {tail_wave_original_grid_x} || gridY != 1 || gridZ != 1) {{
+    fprintf(stderr, "Error: tail-wave kernel expected grid=({tail_wave_original_grid_x},1,1), got (%d,%d,%d).\\n",
+            gridX, gridY, gridZ);
+    return;
+  }}
+  gridX = {tail_wave_logical_grid_x};"""
+    else:
+        tail_wave_grid_expand = ""
+
     program_grid_finalization = ""
     if program_grid_transforms is not None:
         finalization_lines = [
@@ -1257,6 +1283,7 @@ static void release_npu_tensor_handle(void* handle) {{
         _launch_preamble = f"""
   void* workspace_addr_ptr = nullptr;
   void* workspace_handle = nullptr;
+  {tail_wave_grid_expand}
   {coalesce_grid_div}
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
   {get_backend_func("pre_launch", True)}
@@ -1276,6 +1303,7 @@ static void release_npu_tensor_handle(void* handle) {{
         _launch_preamble = f"""
   void* workspace_addr_ptr = nullptr;
   void* workspace_handle = nullptr;
+  {tail_wave_grid_expand}
 {_program_grid_launch_preamble}
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
   {get_backend_func("pre_launch", True)}
@@ -1290,6 +1318,7 @@ static void release_npu_tensor_handle(void* handle) {{
         _python_launch_preamble = f"""
   void* workspace_addr_ptr = nullptr;
   void* workspace_handle = nullptr;
+  {tail_wave_grid_expand}
 {_program_grid_launch_preamble}
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
   {get_backend_func("pre_launch", True)}

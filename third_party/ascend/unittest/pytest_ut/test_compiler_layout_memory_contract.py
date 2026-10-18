@@ -100,6 +100,49 @@ def test_graph_l0c_pressure_selects_no_l0c(
     assert metadata["limit_auto_multi_buffer_of_local_buffer"] == expected_policy
 
 
+@pytest.mark.parametrize(
+    "original,logical,error",
+    [
+        (256, 280, None),
+        (-1, -1, None),
+        (256, -1, "incomplete tail-wave launch contract"),
+        (-1, 280, "incomplete tail-wave launch contract"),
+        (256, 256, "invalid tail-wave launch grid"),
+    ],
+)
+def test_tail_wave_grid_contract_is_exported(
+    compiler_module,
+    monkeypatch,
+    original,
+    logical,
+    error,
+):
+    def get_attr(_mod, name):
+        values = {
+            compiler_module._L0C_DOUBLE_BUFFER_REQUIRED_BITS_ATTR: -1,
+            compiler_module._TAIL_WAVE_ORIGINAL_GRID_X_ATTR: original,
+            compiler_module._TAIL_WAVE_LOGICAL_GRID_X_ATTR: logical,
+        }
+        return values.get(name, -1)
+
+    monkeypatch.setattr(compiler_module, "_get_then_remove_rc", get_attr)
+    metadata = {
+        "limit_auto_multi_buffer_of_local_buffer": None,
+        "multibuffer": True,
+        "num_stages": 2,
+    }
+    opt = SimpleNamespace(target_arch="Ascend950PR_9589", debug=False)
+
+    if error:
+        with pytest.raises(RuntimeError, match=error):
+            compiler_module._adjust_metadata_by_module_result(None, metadata, opt)
+        return
+
+    compiler_module._adjust_metadata_by_module_result(None, metadata, opt)
+    assert metadata["tail_wave_original_grid_x"] == (0 if original == -1 else original)
+    assert metadata["tail_wave_logical_grid_x"] == (0 if logical == -1 else logical)
+
+
 class _FakeModule:
 
     def __init__(self, events):

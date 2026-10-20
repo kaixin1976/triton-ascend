@@ -575,6 +575,26 @@ def _check_bishengir_api_change() -> bool:
         return False
 
 
+@functools.lru_cache(None)
+def _check_bishengir_supports_optimized_metaop() -> bool:
+    bishengir_path, env = _get_npucompiler_path()
+    if not _is_valid_bishengir_path(bishengir_path):
+        print(f"ERROR: Invalid bishengir path format: {bishengir_path}")
+        return False
+    try:
+        result = subprocess.run(
+            [bishengir_path, "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        return result.returncode == 0 and "enable-optimized-metaop" in result.stdout
+    except Exception as e:
+        print(f"ERROR: {e}")
+        return False
+
+
 def _check_bishengir_is_regbased() -> bool:
     bishengir_path, _ = _get_npucompiler_path()
     if not _is_valid_bishengir_path(bishengir_path):

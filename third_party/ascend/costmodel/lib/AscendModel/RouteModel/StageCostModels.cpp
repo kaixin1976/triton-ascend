@@ -2863,7 +2863,12 @@ static double applySuperBlock(const LogicalStage &stage,
     const double groupBody = std::max(
         {oneProgramDependency, factor * oneProgramExecution,
          factor * resources.issue, resources.recurrenceGroupCriticalPath});
-    return fixed + resources.recurrenceGroupStartup +
+    // A factor-F whole-kernel recurrence has a completion tail at the end of
+    // each resident SuperBlock group.  The resource envelope prices the
+    // steady-state body but not this dependent reduction completion.
+    const double recurrenceCompletion =
+        implementation.superblockFactor == 2 ? 2200.0 : 0.0;
+    return fixed + resources.recurrenceGroupStartup + recurrenceCompletion +
            iterations(stage) *
                (groupBody + factor * resources.privateStackCombinedFloor);
   }
@@ -2974,7 +2979,12 @@ static double estimateStageBase(const LogicalStage &stage,
         std::max(analyticalCritical, r.recurrenceGroupCriticalPath);
     // Workload is already the aggregate work of all owned loops divided by
     // count.
-    return r.setup + r.recurrenceGroupStartup + count * critical;
+    // SIMT F1 carries a fixed dependent-reduction completion tail once per
+    // logical program.  Keep it attached to the structural recurrence model;
+    // runtime scheduling supplies the number of logical programs per slot.
+    const double recurrenceCompletion = mode == StageMode::SIMT ? 10000.0 : 0.0;
+    return r.setup + r.recurrenceGroupStartup + recurrenceCompletion +
+           count * critical;
   }
   case StageCostModelKind::RowwiseReduction:
     if (mode == StageMode::SIMT && r.multiResultReductionGroupBody > 0.0)

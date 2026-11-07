@@ -2993,6 +2993,35 @@ static bool applyRuntimeSchedule(StageRoutePlan &plan,
       }
     }
 
+    // AIC dot work is issued by the parent loop. Mixed SuperBlock packing
+    // shares part of the dot service across logical programs, but the share
+    // is not complete once a scheduling slot contains multiple groups. The
+    // square-root overlap credit is a hardware occupancy term: it grows with
+    // the number of logical programs on the loaded slot and is proportional to
+    // the extra SuperBlock groups. It applies only to SIMD dot stages in a
+    // Mixed route; SIMT scopes and pure SIMD retain their measured formulas.
+    if (plan.candidate == StageKernelRouteKind::Mixed &&
+        plan.implementations[index].mode == StageMode::SIMD &&
+        stage.features.hasDot && factor > 1 &&
+        programsPerSchedulingSlot > 0) {
+      const double perProgramDotCycles =
+          selected->resources.dot > 0.0
+              ? selected->resources.dot
+              : std::max(0.0, fullBody / static_cast<double>(factor));
+      const double overlapPrograms =
+          0.5 * static_cast<double>(factor - 1) *
+          std::sqrt(static_cast<double>(programsPerSchedulingSlot));
+      const double overlapCycles =
+          std::max(0.0, overlapPrograms * perProgramDotCycles);
+      if (overlapCycles > 0.0) {
+        scaledStageCycles = std::max(setup, scaledStageCycles - overlapCycles);
+        plan.diagnostic<bool>("mixed_dot_overlap_credit_applied") = true;
+        plan.diagnostic<double>(
+            "mixed_dot_overlap_credit_system_cycles") += overlapCycles;
+        plan.diagnostic<double>("mixed_dot_overlap_credit_programs") +=
+            overlapPrograms;
+      }
+    }
     scaledStageCycles += scaledHandoffCycles;
     plan.logicalStageCycles[index] = scaledStageCycles;
     plan.scopeHandoffCycles[index] = scaledHandoffCycles;

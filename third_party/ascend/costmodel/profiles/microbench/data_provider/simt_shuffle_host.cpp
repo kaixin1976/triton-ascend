@@ -107,14 +107,22 @@ static long long minimum(const char *fn, rtStream_t stream, void *dout, int K,
   return result;
 }
 
-static double cyclesPerIter(const char *fn, rtStream_t stream, void *dout,
-                            int nwarp, int mode) {
+struct SlopeResult {
+  double cyclesPerIteration;
+  double holdoutRelativeError;
+};
+
+static SlopeResult cyclesPerIter(const char *fn, rtStream_t stream, void *dout,
+                                 int nwarp, int mode) {
   const int K = 20;
   const int I1 = 256;
+  const int IH = 512;
   const int I2 = 1024;
   long long c1 = minimum(fn, stream, dout, K, nwarp, I1, mode);
+  long long ch = minimum(fn, stream, dout, K, nwarp, IH, mode);
   long long c2 = minimum(fn, stream, dout, K, nwarp, I2, mode);
-  return (double)(c2 - c1) / ((double)(I2 - I1) * K);
+  double predicted = c1 + (double)(c2 - c1) * (IH - I1) / (I2 - I1);
+  return {(double)(c2 - c1) / ((double)(I2 - I1) * K), (predicted - ch) / ch};
 }
 
 int main() {
@@ -127,19 +135,21 @@ int main() {
   rtStream_t stream;
   check(rtStreamCreate(&stream, 0), "stream");
   void *dout = nullptr;
-  check(rtMalloc(&dout, 32 + 1024 * sizeof(float), RT_MEMORY_HBM, 0),
+  check(rtMalloc(&dout, 32 + 2048 * sizeof(float), RT_MEMORY_HBM, 0),
         "allocate");
 
   runK(fn, stream, dout, 2, 4, 16, 0);
   printf("SIMT __shfl_up dependent and ILP4 throughput\n");
   printf("warps,dependent_cycles,dependent_warp_shuffles_per_cycle,"
-         "ilp4_cycles,ilp4_warp_shuffles_per_cycle\n");
-  for (int warps : {1, 2, 4, 8, 16, 32}) {
-    double depCycles = cyclesPerIter(fn, stream, dout, warps, 0);
-    double ilpCycles = cyclesPerIter(fn, stream, dout, warps, 1);
-    printf("%d,%.6f,%.6f,%.6f,%.6f\n", warps, depCycles,
-           (double)warps / depCycles, ilpCycles,
-           (double)warps * 4.0 / ilpCycles);
+         "dependent_holdout_relative_error,ilp4_cycles,"
+         "ilp4_warp_shuffles_per_cycle,ilp4_holdout_relative_error\n");
+  for (int warps : {1, 2, 4, 8, 16, 32, 64}) {
+    SlopeResult dep = cyclesPerIter(fn, stream, dout, warps, 0);
+    SlopeResult ilp = cyclesPerIter(fn, stream, dout, warps, 1);
+    printf("%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n", warps, dep.cyclesPerIteration,
+           (double)warps / dep.cyclesPerIteration, dep.holdoutRelativeError,
+           ilp.cyclesPerIteration, (double)warps * 4.0 / ilp.cyclesPerIteration,
+           ilp.holdoutRelativeError);
   }
 
   check(rtFree(dout), "free");

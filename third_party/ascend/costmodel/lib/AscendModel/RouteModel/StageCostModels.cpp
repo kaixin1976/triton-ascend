@@ -73,6 +73,17 @@ static double selectWarpCurveValue(const std::map<int64_t, double> &curve,
   return selected->second;
 }
 
+/// Resolve a curve that is only calibrated from its first key onward.  Unlike
+/// occupancy curves with full low-factor coverage, generated-memory curves
+/// must not extrapolate their first measured point down to unmeasured factors.
+static double
+selectMeasuredWarpCurveValue(const std::map<int64_t, double> &curve,
+                             double fallback, int64_t warpCount) {
+  if (curve.empty() || warpCount < curve.begin()->first)
+    return fallback;
+  return selectWarpCurveValue(curve, fallback, warpCount);
+}
+
 /// Resolve occupancy-sensitive SIMT rates for one concrete implementation.
 static StageModeProfile
 resolveModeProfile(const HardwareProfile &hardware,
@@ -103,12 +114,27 @@ resolveModeProfile(const HardwareProfile &hardware,
   resolved.shuffleLanesPerCycle =
       selectWarpCurveValue(resolved.shuffleLanesPerCycleByWarpCount,
                            resolved.shuffleLanesPerCycle, activeWarps);
+  resolved.prefixScanStepLatencyCycles =
+      selectWarpCurveValue(resolved.prefixScanStepLatencyCyclesByWarpCount,
+                           resolved.prefixScanStepLatencyCycles, activeWarps);
   resolved.loadWarpInstructionsPerCycle =
       selectWarpCurveValue(resolved.loadWarpInstructionsPerCycleByWarpCount,
                            resolved.loadWarpInstructionsPerCycle, activeWarps);
   resolved.storeWarpInstructionsPerCycle =
       selectWarpCurveValue(resolved.storeWarpInstructionsPerCycleByWarpCount,
                            resolved.storeWarpInstructionsPerCycle, activeWarps);
+  resolved.sharedLocalLoadInstructionsPerCycle = selectMeasuredWarpCurveValue(
+      resolved.sharedLocalLoadInstructionsPerCycleByWarpCount,
+      resolved.sharedLocalLoadInstructionsPerCycle, activeWarps);
+  resolved.sharedLocalStoreInstructionsPerCycle = selectMeasuredWarpCurveValue(
+      resolved.sharedLocalStoreInstructionsPerCycleByWarpCount,
+      resolved.sharedLocalStoreInstructionsPerCycle, activeWarps);
+  resolved.privateStackLoadInstructionsPerCycle = selectMeasuredWarpCurveValue(
+      resolved.privateStackLoadInstructionsPerCycleByWarpCount,
+      resolved.privateStackLoadInstructionsPerCycle, activeWarps);
+  resolved.privateStackStoreInstructionsPerCycle = selectMeasuredWarpCurveValue(
+      resolved.privateStackStoreInstructionsPerCycleByWarpCount,
+      resolved.privateStackStoreInstructionsPerCycle, activeWarps);
   // The occupancy sweep executes an accumulator-feedback dot chain.
   if (dependentDotRecurrence)
     resolved.dotFlopsPerCycle =
@@ -2374,11 +2400,25 @@ mapWorkload(const LogicalStage &stage, const StageModeProfile &profile,
       auto geometry =
           rowwiseReductionGeometry(stage, work, referenceOperations);
       auto factorSurface = surfaces->find(superblockFactor);
+      bool usesLowerFactorBound = false;
+      // Do not let an uncalibrated larger factor fall through to the generic
+      // analytical reduction formula: that formula is not completion
+      // inclusive and can therefore make F8/F16 look cheaper than a measured
+      // F4 body.  Retain the largest measured body as a conservative lower
+      // bound.  Missing factors inside the calibrated range remain unknown.
+      if (factorSurface == surfaces->end() && !surfaces->empty() &&
+          superblockFactor > surfaces->rbegin()->first) {
+        factorSurface = std::prev(surfaces->end());
+        usesLowerFactorBound = true;
+      }
       if (geometry && factorSurface != surfaces->end()) {
         auto body = interpolateBoundedRowExtentSurface(
             factorSurface->second, geometry->first, geometry->second);
-        if (body)
+        if (body) {
           resources.rowwiseReductionGroupBody = *body;
+          resources.rowwiseReductionGroupLowerFactorBound =
+              usesLowerFactorBound;
+        }
       }
     }
     if (!simd && stage.costModelKind == StageCostModelKind::RowwiseReduction &&
@@ -2881,9 +2921,17 @@ static double applySuperBlock(const LogicalStage &stage,
        stage.costModelKind == StageCostModelKind::IndirectGatherMemory) &&
       (resources.continuousLoadGroup > 0.0 ||
        resources.continuousStoreGroup > 0.0 ||
-       resources.indirectLoadGroup > 0.0)) {
-    // Measured envelopes already cover F programs.
+       resources.indirectLoadGroup > 0.0 ||
+       resources.stridedShortLoadCompletion > 0.0 ||
+       resources.stridedShortStoreCompletion > 0.0)) {
+    // Measured group envelopes already cover all active warps.  In
+    // particular, the SIMT StridedShort formulas take activeWarpCount as an
+    // input, so multiplying their completion by F again would turn a linear
+    // resident-warp service into an artificial F^2 cost.  Scale only the
+    // residual per-program work, then restore the aggregate completion.
     auto grouped = resources;
+    grouped.load -= resources.stridedShortLoadCompletion;
+    grouped.store -= resources.stridedShortStoreCompletion;
     for (double *term :
          {&grouped.scalar, &grouped.load, &grouped.store, &grouped.sharedLayout,
           &grouped.compute, &grouped.operationCompletion, &grouped.predicate,
@@ -2891,6 +2939,8 @@ static double applySuperBlock(const LogicalStage &stage,
           &grouped.sort, &grouped.shuffle, &grouped.dot,
           &grouped.privateStackCombinedFloor, &grouped.issue})
       *term *= factor;
+    grouped.load += resources.stridedShortLoadCompletion;
+    grouped.store += resources.stridedShortStoreCompletion;
     return estimateStage(stage, profile, implementation.mode, grouped);
   }
   const double body = std::max(0.0, stageCycles - fixed);
@@ -3833,6 +3883,17 @@ bool StageModeProfile::isValid(StageMode mode) const {
       validPositiveKeyTree(indirectStoreSystemCyclesBySegments, positiveLeaf);
   const bool validDotWarpCurve =
       validPositiveKeyTree(dotFlopsPerCycleByWarpCount, positiveLeaf);
+  const bool validDependentShuffleLatencyCurve = validPositiveKeyTree(
+      prefixScanStepLatencyCyclesByWarpCount, positiveLeaf);
+  const bool validGeneratedTrafficCurves =
+      validPositiveKeyTree(sharedLocalLoadInstructionsPerCycleByWarpCount,
+                           positiveLeaf) &&
+      validPositiveKeyTree(sharedLocalStoreInstructionsPerCycleByWarpCount,
+                           positiveLeaf) &&
+      validPositiveKeyTree(privateStackLoadInstructionsPerCycleByWarpCount,
+                           positiveLeaf) &&
+      validPositiveKeyTree(privateStackStoreInstructionsPerCycleByWarpCount,
+                           positiveLeaf);
   if (dotPhysicalResourceFormula) {
     if (mode != StageMode::SIMD || dotPhysicalResourceTarget.empty() ||
         dotPhysicalResourceLoweringContract.empty() ||
@@ -3876,9 +3937,11 @@ bool StageModeProfile::isValid(StageMode mode) const {
                   return entry.first > 0 && std::isfinite(entry.second) &&
                          entry.second > 0.0;
                 });
-  return validDotWarpCurve && validIndirectCurve && validIndirectElementCurve &&
-         validIndirectStoreCurve && validIndirectStartupCurve &&
-         validStoreService && validGridStrideCompositionResidual &&
+  return validDotWarpCurve && validDependentShuffleLatencyCurve &&
+         validGeneratedTrafficCurves && validIndirectCurve &&
+         validIndirectElementCurve && validIndirectStoreCurve &&
+         validIndirectStartupCurve && validStoreService &&
+         validGridStrideCompositionResidual &&
          validSingleResultRowReductionRecurrenceCompletion &&
          validFactorSurfaces(
              twoPassRowwiseCompletionResidualByFactorExtentAndProgramsPerSlot) &&
@@ -4199,9 +4262,12 @@ StageCostEvaluator::evaluate(const StagePartition &partition,
           resources->multiResultReductionGroupBody > 0.0 ||
           resources->rowwiseReductionGroupBody > 0.0 ||
           resources->continuousLoadGroup > 0.0 ||
-          resources->continuousStoreGroup > 0.0)
-        cost.formulaEvidence = "factor_specific_measured_group_curve";
-      else if (resources->storeLayoutService > 0.0)
+          resources->continuousStoreGroup > 0.0) {
+        cost.formulaEvidence =
+            resources->rowwiseReductionGroupLowerFactorBound
+                ? "factor_specific_measured_group_curve_lower_factor_bound"
+                : "factor_specific_measured_group_curve";
+      } else if (resources->storeLayoutService > 0.0)
         cost.formulaEvidence =
             "layout_store_service_floor_startup_uncalibrated";
       else if (stage.features.hasIndirectMemory) {

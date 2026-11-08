@@ -441,6 +441,152 @@ def test_simt_stack_limit_is_not_a_compile_option(compiler_module):
         compiler_module.NPUOptions(arch="Ascend910_9581", simt_stack_limit=8192)
 
 
+def test_generated_memory_curves_diagnose_lds_sts_and_price_ldk_stk(compiler_module, monkeypatch):
+    profile_dir = Path(__file__).resolve().parents[2] / "costmodel" / "profiles"
+    monkeypatch.setattr(compiler_module, "_costmodel_profiles_dir", lambda: profile_dir)
+
+    all_curves = compiler_module._generated_vector_traffic_throughput_curves("Ascend950PR_9579")
+    assert set(all_curves) == {"shared_local", "private_stack"}
+    for name, traffic in all_curves.items():
+        assert set(traffic) == {"load", "store"}
+        expected_warps = {1, 2, 4, 8, 16, 32, 64} if name == "shared_local" else {8, 16, 32, 64}
+        assert set(traffic["load"]) == expected_warps
+        assert set(traffic["store"]) == expected_warps
+    curves = all_curves["private_stack"]
+    assert compiler_module._private_stack_dependent_load_group_cycles("Ascend950PR_9579") == pytest.approx(
+        1.0 / curves["load"][8])
+
+    resource = {
+        "simt_memory_disassembly": {
+            "static_shared_local_instructions": {
+                "once_before": {"load": 2, "store": 1},
+                "per_persistent_iteration": {"load": 3, "store": 2},
+                "once_after": {"load": 1, "store": 0},
+            }, "static_private_stack_instructions": {
+                "once_before": {"load": 1, "store": 2},
+                "per_persistent_iteration": {"load": 2, "store": 1},
+                "once_after": {"load": 3, "store": 0},
+            }
+        }
+    }
+    generated = compiler_module._backend_generated_vector_traffic_charge(resource, {"runtime_loop_iteration_count": 3},
+                                                                         factor=8, num_warps=1,
+                                                                         throughput_curves=all_curves)
+    assert generated["shared_local"]["load"]["static_instructions"] == 12
+    assert generated["shared_local"]["store"]["static_instructions"] == 7
+    assert generated["private_stack"]["load"]["static_instructions"] == 10
+    assert generated["private_stack"]["store"]["static_instructions"] == 5
+    assert generated["shared_local"]["load"]["system_cycles"] == pytest.approx(12 * 8 /
+                                                                               all_curves["shared_local"]["load"][8])
+    assert generated["shared_local"]["store"]["system_cycles"] == pytest.approx(7 * 8 /
+                                                                                all_curves["shared_local"]["store"][8])
+    assert generated["shared_local"]["charged_system_cycles"] == 0
+    assert generated["system_cycles"] == pytest.approx(10 / curves["load"][8] + 5 / curves["store"][8])
+
+    for factor in (8, 16, 32, 64):
+        charge = compiler_module._backend_private_stack_charge(resource, {"runtime_loop_iteration_count": 3},
+                                                               factor=factor, num_warps=1, throughput_curves=curves)
+        assert charge["active_warp_count"] == factor
+        assert charge["load"]["static_instructions"] == 10
+        assert charge["store"]["static_instructions"] == 5
+        assert charge["load"]["instructions_per_system_cycle"] == curves["load"][factor]
+        assert charge["store"]["instructions_per_system_cycle"] == curves["store"][factor]
+        assert charge["load"]["system_cycles"] == pytest.approx(10 / curves["load"][factor])
+        assert charge["store"]["system_cycles"] == pytest.approx(5 / curves["store"][factor])
+        assert charge["system_cycles"] == pytest.approx(10 / curves["load"][factor] + 5 / curves["store"][factor])
+
+
+def test_simt_disassembly_separates_shared_local_and_private_stack_regions(compiler_module):
+    disassembly = """
+0000000000000100 <probe_vf_simt_simt_entry>:
+ 100: 00000000 LDS.b32 R1, [R2]
+ 108: 00000000 LDK.NMFV.b32 R3, [R4]
+ 110: 00000000 STS.b32 R1, [R2]
+ 118: 00000000 STK.NMFV.b32 R3, [R4]
+ 150: 00000000 BRANCH <probe_vf_simt_simt_entry+0x10> wait:0b0000000 stall:1
+ 160: 00000000 LDS.b32 R5, [R6]
+ 168: 00000000 LDK.NMFV.b32 R7, [R8]
+"""
+
+    facts = compiler_module._parse_simt_private_stack_disassembly(disassembly)
+
+    assert facts["schema_version"] == 2
+    assert facts["static_shared_local_instructions"] == {
+        "once_before": {"load": 1, "store": 0},
+        "per_persistent_iteration": {"load": 0, "store": 1},
+        "once_after": {"load": 1, "store": 0},
+    }
+    assert facts["static_private_stack_instructions"] == {
+        "once_before": {"load": 1, "store": 0},
+        "per_persistent_iteration": {"load": 0, "store": 1},
+        "once_after": {"load": 1, "store": 0},
+    }
+    assert facts["static_shared_local_totals"] == {"load": 2, "store": 1}
+    assert facts["static_private_stack_totals"] == {"load": 2, "store": 1}
+
+
+def _factor_route_report(scores):
+    return json.dumps({
+        "stage_model": {
+            "all_simt_factor_routes": {
+                str(factor): {
+                    "legal": True,
+                    "total_system_cycles": score,
+                    "runtime_full_group_count": 1,
+                    "runtime_tail_program_count": 0,
+                }
+                for factor, score in scores.items()
+            }
+        }
+    })
+
+
+def test_backend_feedback_rejects_first_small_spill_frame(compiler_module):
+    report = _factor_route_report({32: 4468.0, 64: 3709.0})
+    resources = {
+        32: {"stack_size_bytes": 0, "used_registers": 26},
+        64: {
+            "stack_size_bytes": 32,
+            "used_registers": 16,
+            "regalloc_generated_instructions": 26,
+        },
+    }
+
+    chosen, feedback, updated = compiler_module._select_backend_resource_aware_factor(report, resources, 64)
+
+    assert chosen == 32
+    assert feedback["policy"] == "relative_register_and_stack_allocation_cliff_v3"
+    assert feedback["rejected_factors"] == [64]
+    assert feedback["comparisons"] == [{
+        "factor": 64,
+        "dominated_by_factor": 32,
+        "reason": "register_allocation_cliff",
+        "used_registers": 16,
+        "reference_used_registers": 26,
+        "stack_size_bytes": 32,
+        "reference_stack_size_bytes": 0,
+        "regalloc_generated_instructions": 26,
+    }]
+    assert json.loads(updated)["selected_superblock_factor"] == 32
+
+
+@pytest.mark.parametrize("resource", [
+    {"stack_size_bytes": 32, "used_registers": 16},
+    {"stack_size_bytes": 32, "used_registers": 24, "regalloc_generated_instructions": 26},
+])
+def test_backend_feedback_does_not_reject_small_stack_without_complete_spill_evidence(compiler_module, resource):
+    report = _factor_route_report({32: 4468.0, 64: 3709.0})
+    resources = {
+        32: {"stack_size_bytes": 0, "used_registers": 26},
+        64: resource,
+    }
+
+    chosen, feedback, _ = compiler_module._select_backend_resource_aware_factor(report, resources, 64)
+
+    assert chosen == 64
+    assert feedback["rejected_factors"] == []
+
+
 def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op):
     commands = []
     parsed_metadata = defaultdict(

@@ -1454,6 +1454,8 @@ llvm::json::Object StageResourceCycles::toJSON() const {
   result["scan_formula_instances_per_iteration"] = std::move(scanFormulas);
   result["rowwise_additional_load_setups_owned_once"] =
       rowwiseAdditionalLoadSetupsOwnedOnce;
+  result["rowwise_reduction_group_lower_factor_bound"] =
+      rowwiseReductionGroupLowerFactorBound;
   result["dot_component_private_stack_floor_applied"] =
       dotComponentPrivateStackFloorApplied;
   result["dot_physical_resource_formula_applied"] =
@@ -1478,9 +1480,11 @@ llvm::json::Object StageResourceCycles::toCompactJSON() const {
   for (const auto &[key, value] : keyedValues())
     if (value > 0.0)
       result[key] = value;
-  const std::array<std::pair<llvm::StringRef, bool>, 5> flags = {{
+  const std::array<std::pair<llvm::StringRef, bool>, 6> flags = {{
       {"rowwise_additional_load_setups_owned_once",
        rowwiseAdditionalLoadSetupsOwnedOnce},
+      {"rowwise_reduction_group_lower_factor_bound",
+       rowwiseReductionGroupLowerFactorBound},
       {"dot_component_private_stack_floor_applied",
        dotComponentPrivateStackFloorApplied},
       {"has_single_physical_program_atomic_rate",

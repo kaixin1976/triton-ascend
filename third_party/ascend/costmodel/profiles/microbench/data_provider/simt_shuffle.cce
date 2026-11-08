@@ -6,7 +6,7 @@
 using DT = float;
 
 template <typename T>
-__simt_vf__ LAUNCH_BOUND(1024) __aiv__ __attribute__((always_inline)) static void
+__simt_vf__ LAUNCH_BOUND(2048) __aiv__ __attribute__((always_inline)) static void
 simt_shuffle_core(__ubuf__ T *sink, int nlane, int nwarp, int iters,
                   int mode) {
   int lane = threadIdx.x;

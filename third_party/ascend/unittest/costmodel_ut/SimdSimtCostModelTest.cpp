@@ -145,6 +145,43 @@ TEST(SimdSimtCostModelTest, StageHasOnlySimdOrSimtImplementations) {
             StageMode::SIMT);
 }
 
+TEST(SimdSimtCostModelTest,
+     RowwiseReductionHigherFactorKeepsCalibratedLowerBound) {
+  auto profile = hardwareProfile();
+  profile.baseSimtWarpCount = 4;
+  profile.superblockUsefulFactorLimit = 16;
+  profile.simt.rowwiseReductionGroupBaseWarpCount = 4;
+  profile.simt.rowwiseReductionGroupReferenceOperations = 1;
+  profile.simt.rowwiseReductionGroupEvidence = "unit-test";
+  profile.simt.rowwiseReductionGroupCyclesByFactorRowsAndExtent[4][16][128] =
+      1727.0;
+
+  auto stage = logicalStage("rowwise", StageCostModelKind::RowwiseReduction);
+  stage.features.hasReduction = true;
+  stage.legalSimtFactors = {4, 8, 16};
+  stage.workload.reductionOperations = 1;
+  stage.workload.reductionGeometryCounts[{16, 128, 32}] = 1;
+
+  auto table = evaluateOneStage(stage, profile);
+  ASSERT_TRUE(static_cast<bool>(table))
+      << (table ? "" : llvm::toString(table.takeError()));
+  for (const auto &cost : table->stages.front().implementations) {
+    if (cost.implementation.mode != StageMode::SIMT)
+      continue;
+    EXPECT_DOUBLE_EQ(cost.resources.rowwiseReductionGroupBody, 1727.0);
+    if (cost.implementation.superblockFactor == 4) {
+      EXPECT_FALSE(cost.resources.rowwiseReductionGroupLowerFactorBound);
+      EXPECT_EQ(cost.formulaEvidence, "factor_specific_measured_group_curve+"
+                                      "bounded_ttir_row_extent_surface");
+    } else {
+      EXPECT_TRUE(cost.resources.rowwiseReductionGroupLowerFactorBound);
+      EXPECT_EQ(cost.formulaEvidence,
+                "factor_specific_measured_group_curve_lower_factor_bound+"
+                "bounded_ttir_row_extent_surface");
+    }
+  }
+}
+
 TEST(SimdSimtCostModelTest, SimdPricesShortAxesPerSegmentAndElementWidth) {
   auto simdCost = [](int64_t elementBits, int64_t contiguousElements,
                      double segmentCount) {
@@ -968,6 +1005,118 @@ TEST(SimdSimtCostModelTest, RecurrenceAccumulatesCriticalPathAndTraffic) {
     FAIL() << llvm::toString(table.takeError());
   EXPECT_GT(table->stages[0].implementations[0].totalCycles, 100.0);
   EXPECT_GT(table->stages[0].implementations[0].resources.criticalPath, 0.0);
+}
+
+TEST(SimdSimtCostModelTest,
+     GeneratedMemoryTrafficSelectsPhysicalWarpCountCurves) {
+  auto profile = hardwareProfile();
+  profile.baseSimtWarpCount = 1;
+  profile.maximumSimtEstimationFactor = 64;
+  profile.simt.sharedLocalLoadInstructionsPerCycle = 4.0;
+  profile.simt.sharedLocalStoreInstructionsPerCycle = 2.0;
+  profile.simt.privateStackLoadInstructionsPerCycle = 1.0;
+  profile.simt.privateStackStoreInstructionsPerCycle = 0.5;
+  profile.simt.sharedLocalLoadInstructionsPerCycleByWarpCount = {
+      {8, 0.25}, {16, 0.5}, {32, 1.0}, {64, 2.0}};
+  profile.simt.sharedLocalStoreInstructionsPerCycleByWarpCount = {
+      {8, 0.125}, {16, 0.25}, {32, 0.5}, {64, 1.0}};
+  profile.simt.privateStackLoadInstructionsPerCycleByWarpCount = {
+      {8, 0.2}, {16, 0.4}, {32, 0.8}, {64, 1.6}};
+  profile.simt.privateStackStoreInstructionsPerCycleByWarpCount = {
+      {8, 0.1}, {16, 0.2}, {32, 0.4}, {64, 0.8}};
+
+  LogicalStage stage =
+      logicalStage("generated_memory", StageCostModelKind::ScalarIssue,
+                   StageScheduleKind::StraightLine);
+  stage.simdLegal = false;
+  stage.legalSimtFactors = {1, 8, 16, 32, 64};
+  stage.workload.sharedLocalLoadInstructions = 64.0;
+  stage.workload.sharedLocalStoreInstructions = 32.0;
+  stage.workload.privateStackLoadInstructions = 16.0;
+  stage.workload.privateStackStoreInstructions = 8.0;
+
+  auto table = evaluateOneStage(stage, profile);
+  ASSERT_TRUE(static_cast<bool>(table));
+  const auto &costs = table->stages.front().implementations;
+  ASSERT_EQ(costs.size(), 5u);
+  EXPECT_DOUBLE_EQ(costs[0].resources.sharedLocalLoad, 16.0);
+  EXPECT_DOUBLE_EQ(costs[0].resources.sharedLocalStore, 16.0);
+  EXPECT_DOUBLE_EQ(costs[0].resources.privateStackLoad, 16.0);
+  EXPECT_DOUBLE_EQ(costs[0].resources.privateStackStore, 16.0);
+  for (size_t index = 1; index < costs.size(); ++index) {
+    const double scale = static_cast<double>(int64_t{1} << (index - 1));
+    EXPECT_DOUBLE_EQ(costs[index].resources.sharedLocalLoad, 256.0 / scale);
+    EXPECT_DOUBLE_EQ(costs[index].resources.sharedLocalStore, 256.0 / scale);
+    EXPECT_DOUBLE_EQ(costs[index].resources.privateStackLoad, 80.0 / scale);
+    EXPECT_DOUBLE_EQ(costs[index].resources.privateStackStore, 80.0 / scale);
+  }
+}
+
+TEST(SimdSimtCostModelTest,
+     DependentShuffleLatencySelectsPhysicalWarpCountCurve) {
+  auto profile = hardwareProfile();
+  profile.baseSimtWarpCount = 1;
+  profile.maximumSimtEstimationFactor = 64;
+  profile.simt.prefixScanStepLatencyCyclesByWarpCount = {
+      {16, 10.0}, {32, 20.0}, {64, 40.0}};
+
+  LogicalStage stage =
+      logicalStage("dependent_shuffle", StageCostModelKind::RowwiseReduction,
+                   StageScheduleKind::StraightLine);
+  stage.simdLegal = false;
+  stage.features.hasReduction = true;
+  stage.legalSimtFactors = {16, 32, 64};
+  stage.workload.operationCounts.clear();
+  stage.workload.issueElements = 0.0;
+  stage.workload.reductionOperations = 1.0;
+  stage.workload.reductionGeometryCounts[{2, 16, 32}] = 1.0;
+
+  auto table = evaluateOneStage(stage, profile);
+  ASSERT_TRUE(static_cast<bool>(table))
+      << (table ? "" : llvm::toString(table.takeError()));
+  const auto &costs = table->stages.front().implementations;
+  ASSERT_EQ(costs.size(), 3u);
+  EXPECT_DOUBLE_EQ(costs[0].resources.shuffle, 40.0);
+  EXPECT_DOUBLE_EQ(costs[1].resources.shuffle, 80.0);
+  EXPECT_DOUBLE_EQ(costs[2].resources.shuffle, 160.0);
+}
+
+TEST(SimdSimtCostModelTest,
+     SuperBlockDoesNotRescaleActiveWarpStridedCompletion) {
+  auto profile = hardwareProfile();
+  profile.baseSimtWarpCount = 1;
+  profile.maximumSimtEstimationFactor = 64;
+  mlir::ascend::StridedShortCompletionFit fit;
+  fit.coefficient[0] = 10.0;
+  fit.evidence = "unit-test-active-warp-group-envelope";
+  profile.simt.stridedShortCompletionFits["simt_store_r1"] = fit;
+
+  LogicalStage stage =
+      logicalStage("strided_store", StageCostModelKind::ContinuousTileStore);
+  stage.simdLegal = false;
+  stage.legalSimtFactors = {8, 32};
+  stage.workload.paysKernelSetup = false;
+  stage.workload.operationCounts.clear();
+  stage.workload.issueElements = 0.0;
+  stage.workload.storeBytes = 8.0;
+  stage.workload.storeOperations = 1.0;
+  stage.workload.storeWarpInstructions = 1.0;
+  mlir::ascend::StageMemoryAccess store;
+  store.shape = {2, 1};
+  store.strides = {8, 0};
+  store.elementBits = 32;
+  store.store = true;
+  stage.workload.memoryAccesses.push_back(store);
+
+  auto table = evaluateOneStage(stage, profile);
+  ASSERT_TRUE(static_cast<bool>(table))
+      << (table ? "" : llvm::toString(table.takeError()));
+  const auto &costs = table->stages.front().implementations;
+  ASSERT_EQ(costs.size(), 2u);
+  EXPECT_DOUBLE_EQ(costs[0].resources.stridedShortStoreCompletion, 80.0);
+  EXPECT_DOUBLE_EQ(costs[1].resources.stridedShortStoreCompletion, 320.0);
+  EXPECT_DOUBLE_EQ(costs[0].totalCycles, 80.0);
+  EXPECT_DOUBLE_EQ(costs[1].totalCycles, 320.0);
 }
 
 TEST(SimdSimtCostModelTest, SimdRecurrenceChargesPersistentLiveStateBytes) {

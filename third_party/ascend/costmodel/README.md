@@ -132,6 +132,30 @@ falls back to the aggregate `load_warp_instructions_per_system_cycle` or
 `store_warp_instructions_per_system_cycle`; this keeps older profiles valid
 without pretending that a stack rate has been measured.
 
+Targets with occupancy sweeps may instead provide
+`shared_local_*_throughput_measurements` and
+`private_stack_*_throughput_measurements`, keyed by physical active warp
+count.  The evaluator resolves those curves from
+`base_simt_warp_count * superblock_factor`; this is what distinguishes F8,
+F16, F32 and F64 generated-memory cost.  A curve point takes precedence over
+the scalar generated-traffic rate, while an absent curve retains the fallback
+behavior above.  Active-warp counts below the first calibrated point also use
+the scalar fallback; the model never extrapolates an F8 measurement down into
+an unmeasured F1/F2/F4 domain.
+
+The backend may publish actual LDS/STS and LDK/STK placement after code
+generation.  LDK/STK is charged as a hidden private-stack cost.  LDS/STS is
+reported as diagnostic evidence only until lowering provenance can distinguish
+traffic already owned by a semantic reduction/scan Stage; charging both would
+double count the same work.
+
+Dependent shuffle chains use a separate
+`prefix_scan.step_latency_measurements` curve.  Aggregate ILP shuffle
+throughput saturates at high occupancy, but a serial dependency chain has a
+measured latency cliff above F16; route selection therefore resolves both
+curves by physical active warp count instead of treating throughput as
+latency.
+
 The `*_warp_instructions` and `*_stack_*` spellings are accepted as aliases
 for compatibility with an in-flight lowering.  Counts are per Stage
 iteration.  For SIMT, the evaluator folds them into the RVECLD/RVECST load and

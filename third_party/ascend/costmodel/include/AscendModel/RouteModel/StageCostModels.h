@@ -382,6 +382,14 @@ struct StageModeProfile {
   double sharedLocalStoreInstructionsPerCycle = 0.0;
   double privateStackLoadInstructionsPerCycle = 0.0;
   double privateStackStoreInstructionsPerCycle = 0.0;
+  /// Occupancy-sensitive generated-traffic rates indexed by physical active
+  /// warp count.  The scalar values above remain backward-compatible
+  /// fallbacks when a curve is absent or the active warp count is below the
+  /// first measured point.
+  std::map<int64_t, double> sharedLocalLoadInstructionsPerCycleByWarpCount;
+  std::map<int64_t, double> sharedLocalStoreInstructionsPerCycleByWarpCount;
+  std::map<int64_t, double> privateStackLoadInstructionsPerCycleByWarpCount;
+  std::map<int64_t, double> privateStackStoreInstructionsPerCycleByWarpCount;
   /// Register budget in 32-bit units/thread.  Zero derives the tested
   /// launch-bound curve min(127, floor(1024 / activeWarps)).
   double registerBudgetPerThread = 0.0;
@@ -457,6 +465,10 @@ struct StageModeProfile {
   /// Latency of one dependent scan step. For SIMD this is one dependent
   /// vector add; for SIMT it is one dependent shuffle/add/control step.
   double prefixScanStepLatencyCycles = 0.0;
+  /// Occupancy-sensitive dependent-step latency keyed by physical active
+  /// warps.  Unlike the ILP shuffle throughput curve, this captures the
+  /// resident-warp cliff of a serial shuffle dependency chain.
+  std::map<int64_t, double> prefixScanStepLatencyCyclesByWarpCount;
   /// Completion-inclusive throughput of the backend external helper used by a
   /// straight-line SIMT scan.
   double straightLinePrefixScanElementsPerCycle = 0.0;

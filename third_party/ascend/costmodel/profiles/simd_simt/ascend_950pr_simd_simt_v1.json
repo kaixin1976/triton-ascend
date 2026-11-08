@@ -1,8 +1,8 @@
-{
+﻿{
   "reduction_profile": "../reduction/david_v100_reduction_v1.json",
   "$schema": "./simd_simt_profile_schema.json",
   "schema_version": 19,
-  "profile_version": "ascend-950pr-simd-simt-20261027-v152-indirect-memory-loop-dependency-prefixscan-v1",
+  "profile_version": "ascend-950pr-simd-simt-20261030-v154-dependent-shuffle-f64",
   "simt_indirect_store_model": "prefix_mask_rank_factor_20261017",
   "simd_indirect_store_model": "simd_mask_envelope_20261019",
   "simt_indirect_load_model": "prefix_mask_rank_factor_20261017",
@@ -10,7 +10,7 @@
   "indirect_memory_profile": "../indirect_memory/ascend_950pr_v1.json",
   "target": "Ascend950PR/dav-c310",
   "description": "Generic Stage Route Model hardware profile. Every kernel is derived from transformed TTIR resource workloads; absolute time adds measured kernel-boundary and global-load completion envelopes selected only by structural route facts. No operator identity, exact function DAG signature, shape whitelist, or kernel-specific elapsed intercept participates in scoring or prediction. SIMD f16 MMAD resource work uses the qualified Cube/TinyCube MAC/MTE1 formula within its calibrated domain.",
-  "prefixscan_profile": "../prefixscan/ascend_950pr_prefixscan.json",
+  "prefixscan_profile": "../prefixscan/ascend_950pr_prefixscan_v1.json",
   "microbenchmark_profile": "../microbench/ascend_950pr_v1.json",
   "compatible_targets": [
     "Ascend950PR_*",
@@ -863,7 +863,8 @@
         "4": "simt.shuffle.throughput.warps_4",
         "8": "simt.shuffle.throughput.warps_8",
         "16": "simt.shuffle.throughput.warps_16",
-        "32": "simt.shuffle.throughput.warps_32"
+        "32": "simt.shuffle.throughput.warps_32",
+        "64": "simt.shuffle.throughput.warps_64"
       },
       "confidence": "low"
     },
@@ -975,6 +976,32 @@
       "issue_instructions_per_system_cycle_measurement": "simt.frontend.effective_issue_floor",
       "spill_transactions_per_system_cycle": 0.106998555,
       "spill_transaction_coverage": 1,
+      "generated_vector_traffic": {
+        "shared_local_load_throughput_measurements": {
+          "8": "simt.ub.load.throughput.warps_8",
+          "16": "simt.ub.load.throughput.warps_16",
+          "32": "simt.ub.load.throughput.warps_32",
+          "64": "simt.ub.load.throughput.warps_64"
+        },
+        "shared_local_store_throughput_measurements": {
+          "8": "simt.ub.store.throughput.warps_8",
+          "16": "simt.ub.store.throughput.warps_16",
+          "32": "simt.ub.store.throughput.warps_32",
+          "64": "simt.ub.store.throughput.warps_64"
+        },
+        "private_stack_load_throughput_measurements": {
+          "8": "simt.private_stack.load.throughput.warps_8",
+          "16": "simt.private_stack.load.throughput.warps_16",
+          "32": "simt.private_stack.load.throughput.warps_32",
+          "64": "simt.private_stack.load.throughput.warps_64"
+        },
+        "private_stack_store_throughput_measurements": {
+          "8": "simt.private_stack.store.throughput.warps_8",
+          "16": "simt.private_stack.store.throughput.warps_16",
+          "32": "simt.private_stack.store.throughput.warps_32",
+          "64": "simt.private_stack.store.throughput.warps_64"
+        }
+      },
       "atomic_memory": {
         "default": {
           "logical_elements_per_system_cycle": 4096,
@@ -995,6 +1022,15 @@
       "prefix_scan": {
         "step_latency_system_cycles": 27.278581,
         "step_latency_measurement": "simt.shuffle.dependent_latency",
+        "step_latency_measurements": {
+          "1": "simt.shuffle.dependent_latency.warps_1",
+          "2": "simt.shuffle.dependent_latency.warps_2",
+          "4": "simt.shuffle.dependent_latency.warps_4",
+          "8": "simt.shuffle.dependent_latency.warps_8",
+          "16": "simt.shuffle.dependent_latency.warps_16",
+          "32": "simt.shuffle.dependent_latency.warps_32",
+          "64": "simt.shuffle.dependent_latency.warps_64"
+        },
         "description": "Grid-stride and recurrence scans use the decomposed dependency model. A P=1 straight-line scan lowers to a completion-inclusive external helper priced from TTIR semantic elements.",
         "straight_line_completion_elements_per_system_cycle": 10,
         "straight_line_completion_evidence": "Fresh A5 profiler controls for non-additive and multiplicative straight-line scans: cummax rows/extent 8x64, 16x32, 32x16 and cumprod 1x1024, 2x512, 4x256. After subtracting the generic kernel boundary and explicit GM load/store Stages, semantic_elements/10 SYS_CNT plus helper ownership of the pure generic index prologue keeps all six geometries within ten percent without an operator or exact-shape key."
@@ -1709,3 +1745,4 @@
     "evidence": "The base curve is the fresh forced-SIMD minimal observable store-only kernel sweep at physical grids 1,2,4,8,16,32,56. The global-load residual is the median direct-copy profiler duration minus its compiler-derived route resource and the base boundary at P=1: 314.207 SYS_CNT for forced SIMD and 485.789 SYS_CNT for selected SIMT. Independent P=4/P=56 direct-copy controls confirm the term is a sub-microsecond completion envelope rather than a per-operation slope. Kernel argument count is reported for diagnosis only: the v105 held-out set disproved an additive argument-count charge because two four-argument kernels with different structural work required opposite corrections. The prologue/epilogue fields are an equal accounting split, not separately measured components."
   }
 }
+

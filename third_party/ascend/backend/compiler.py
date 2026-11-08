@@ -541,13 +541,14 @@ def _publish_backend_resource_usage(stdout, stderr, metadata):
 
 
 def _parse_simt_private_stack_disassembly(disassembly):
-    """Extract actual LDK/STK placement from one CCEC SIMT entry.
+    """Extract generated local-memory placement from one CCEC SIMT entry.
 
     AutoBlockify's persistent scheduling loop is the widest unconditional
     backward branch in the SIMT entry.  Keeping instructions before, inside,
     and after that loop separate is essential: only the body repeats with the
-    route's runtime loop count.  The result is a backend fact, not a cost; its
-    conversion to cycles is kept explicit in backend feedback below.
+    route's runtime loop count.  LDK/STK are private-stack traffic; LDS/STS are
+    shared/local-buffer traffic.  The result is a backend fact, not a cost;
+    its conversion to cycles is kept explicit in backend feedback below.
     """
     symbols = list(_OBJDUMP_SYMBOL_RE.finditer(disassembly or ""))
     for index, symbol in enumerate(symbols):
@@ -584,15 +585,27 @@ def _parse_simt_private_stack_disassembly(disassembly):
             continue
         backedge, loop_start, _ = max(unconditional, key=lambda edge: edge[0] - edge[1])
 
-        counts = {
-            "once_before": {"load": 0, "store": 0},
-            "per_persistent_iteration": {"load": 0, "store": 0},
-            "once_after": {"load": 0, "store": 0},
-        }
+        def empty_regions():
+            return {
+                "once_before": {"load": 0, "store": 0},
+                "per_persistent_iteration": {"load": 0, "store": 0},
+                "once_after": {"load": 0, "store": 0},
+            }
+
+        private_counts = empty_regions()
+        shared_counts = empty_regions()
         for address, opcode, _ in instructions:
             if opcode.startswith("LDK"):
+                counts = private_counts
                 kind = "load"
             elif opcode.startswith("STK"):
+                counts = private_counts
+                kind = "store"
+            elif opcode.startswith("LDS"):
+                counts = shared_counts
+                kind = "load"
+            elif opcode.startswith("STS"):
+                counts = shared_counts
                 kind = "store"
             else:
                 continue
@@ -604,16 +617,21 @@ def _parse_simt_private_stack_disassembly(disassembly):
                 region = "once_after"
             counts[region][kind] += 1
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "function": function,
             "instruction_count": len(instructions),
             "persistent_loop_detection": "widest_unconditional_backward_branch",
             "persistent_loop_start_offset": loop_start - base,
             "persistent_loop_backedge_offset": backedge - base,
-            "static_private_stack_instructions": counts,
+            "static_private_stack_instructions": private_counts,
             "static_private_stack_totals":
             {kind: sum(region[kind]
-                       for region in counts.values())
+                       for region in private_counts.values())
+             for kind in ("load", "store")},
+            "static_shared_local_instructions": shared_counts,
+            "static_shared_local_totals":
+            {kind: sum(region[kind]
+                       for region in shared_counts.values())
              for kind in ("load", "store")},
         }
     return None
@@ -637,7 +655,7 @@ def _find_backend_llvm_objdump(npu_compiler_path, env):
 
 
 def _publish_backend_private_stack_disassembly(binary_path, metadata, npu_compiler_path, env):
-    """Disassemble a generated binary and publish exact static LDK/STK facts."""
+    """Publish exact static LDS/STS and LDK/STK facts when decoding exists."""
     objdump = _find_backend_llvm_objdump(npu_compiler_path, env)
     if not objdump or not Path(binary_path).is_file():
         return None
@@ -654,53 +672,176 @@ def _publish_backend_private_stack_disassembly(binary_path, metadata, npu_compil
     facts = _parse_simt_private_stack_disassembly(completed.stdout)
     if facts:
         facts["objdump"] = objdump
+        metadata["backend_simt_memory_disassembly"] = facts
+        # Preserve the original key for readers introduced with the first
+        # private-stack-only version of this contract.
         metadata["backend_simt_private_stack_disassembly"] = facts
     return facts
 
 
-def _private_stack_dependent_load_group_cycles(arch):
-    """Read the architecture-specific private-load slope from microbench data."""
+def _generated_vector_traffic_throughput_curves(arch):
+    """Read measured LDS/STS and LDK/STK rates by physical active warps."""
     normalized = (arch or "").lower().replace("-", "_")
+    empty = {
+        "shared_local": {"load": {}, "store": {}},
+        "private_stack": {"load": {}, "store": {}},
+    }
     if "950pr" not in normalized:
-        return 0.0
+        return empty
     profile_path = _costmodel_profiles_dir() / "microbench" / "ascend_950pr_v1.json"
     try:
         profile = json.loads(profile_path.read_text(encoding="utf-8"))
-        metric = profile["metrics"]["simt.private_stack.dependent_access.system_cycles"]
-        return max(0.0, float(metric["value"]))
+        measurements = profile["measurements"]
+        curves = {
+            "shared_local": {"load": {}, "store": {}},
+            "private_stack": {"load": {}, "store": {}},
+        }
+        metric_prefixes = {
+            "shared_local": "simt.ub",
+            "private_stack": "simt.private_stack",
+        }
+        warp_counts = {
+            "shared_local": (1, 2, 4, 8, 16, 32, 64),
+            "private_stack": (8, 16, 32, 64),
+        }
+        expected_units = {
+            "shared_local": "warp_instruction/system_cycle",
+            # The profile schema names this a warp-instruction rate.  The
+            # underlying active-warp experiment fits elapsed cycles against
+            # static LDK/STK count, and the charging formula below preserves
+            # that evidence scope.
+            "private_stack": "warp_instruction/system_cycle",
+        }
+        for traffic, kinds in curves.items():
+            for kind in kinds:
+                for warps in warp_counts[traffic]:
+                    metric = measurements[f"{metric_prefixes[traffic]}.{kind}.throughput.warps_{warps}"]
+                    if metric.get("unit") != expected_units[traffic]:
+                        return empty
+                    value = float(metric["value"])
+                    if not math.isfinite(value) or value <= 0.0:
+                        return empty
+                    curves[traffic][kind][warps] = value
+        return curves
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return empty
+
+
+def _private_stack_throughput_curves(arch):
+    """Read measured private LDK/STK rates keyed by physical active warps."""
+    return _generated_vector_traffic_throughput_curves(arch)["private_stack"]
+
+
+def _private_stack_dependent_load_group_cycles(arch):
+    """Retain the historical 8-warp load-price accessor for diagnostics."""
+    rate = _private_stack_throughput_curves(arch)["load"].get(8, 0.0)
+    return 1.0 / rate if rate > 0.0 else 0.0
+
+
+def _select_generated_traffic_throughput(curve, active_warps):
+    """Select the enclosing measured active-warp rate without interpolation."""
+    if not curve:
         return 0.0
+    active_warps = max(1, int(active_warps))
+    measured_warps = sorted(curve)
+    if active_warps < measured_warps[0]:
+        first = measured_warps[0]
+        return curve[first] * first / active_warps
+    selected = next((warps for warps in measured_warps if warps >= active_warps), measured_warps[-1])
+    return curve[selected]
 
 
-def _backend_private_stack_load_charge(resource, route, factor, num_warps, group_cycles, calibration_warps=8):
-    """Price actual static private loads with their measured warp-group slope."""
-    facts = resource.get("simt_private_stack_disassembly", {}) if resource else {}
-    regions = facts.get("static_private_stack_instructions", {})
-    if not regions or group_cycles <= 0.0:
+def _backend_generated_vector_traffic_charge(resource, route, factor, num_warps, throughput_curves):
+    """Price backend-generated LDS/STS and LDK/STK instruction streams."""
+    if not resource or not throughput_curves:
         return None
+    facts = resource.get("simt_memory_disassembly") or resource.get("simt_private_stack_disassembly", {})
     try:
         iterations = max(1, int(route.get("runtime_loop_iteration_count", 1)))
-        before = float(regions.get("once_before", {}).get("load", 0))
-        body = float(regions.get("per_persistent_iteration", {}).get("load", 0))
-        after = float(regions.get("once_after", {}).get("load", 0))
     except (AttributeError, TypeError, ValueError):
         return None
-    static_warp_instructions = before + body * iterations + after
     active_warps = max(1, int(num_warps)) * max(1, int(factor))
-    charge = static_warp_instructions * active_warps / max(1, calibration_warps) * group_cycles
-    return {
-        "formula":
-        "(once_before + per_iteration * runtime_iterations + once_after) * active_warps / calibration_warps * group_cycles",
-        "once_before_load_instructions_per_warp": before,
-        "per_iteration_load_instructions_per_warp": body,
-        "once_after_load_instructions_per_warp": after,
+    result = {
+        "formula": "private_stack_charge: static_instructions / active_warp_static_instruction_throughput; "
+        "shared_local_diagnostic: static_instructions * active_warps / aggregate_warp_throughput",
         "runtime_loop_iteration_count": iterations,
-        "static_load_instructions_per_warp": static_warp_instructions,
         "active_warp_count": active_warps,
-        "calibration_active_warp_count": calibration_warps,
-        "group_cycles_per_load_instruction": group_cycles,
-        "system_cycles": charge,
+        "system_cycles": 0.0,
+        "diagnostic_system_cycles": 0.0,
     }
+    found = False
+    region_keys = {
+        "shared_local": "static_shared_local_instructions",
+        "private_stack": "static_private_stack_instructions",
+    }
+    for traffic, region_key in region_keys.items():
+        regions = facts.get(region_key, {})
+        traffic_result = {"system_cycles": 0.0}
+        for kind in ("load", "store"):
+            try:
+                before = float(regions.get("once_before", {}).get(kind, 0))
+                body = float(regions.get("per_persistent_iteration", {}).get(kind, 0))
+                after = float(regions.get("once_after", {}).get(kind, 0))
+            except (AttributeError, TypeError, ValueError):
+                return None
+            instructions = before + body * iterations + after
+            curve = throughput_curves.get(traffic, {}).get(kind, {})
+            rate = _select_generated_traffic_throughput(curve, active_warps)
+            # UB measurements count aggregate warp instructions, so one
+            # static LDS/STS executes once per active warp.  The private-stack
+            # experiment instead fitted elapsed cycles directly against the
+            # static LDK/STK count at each active-warp point.  Keep these two
+            # evidence domains explicit; multiplying the latter by warps would
+            # charge the resident-warp effect twice.
+            instruction_multiplier = active_warps if traffic == "shared_local" else 1
+            priced_instructions = instructions * instruction_multiplier
+            cycles = priced_instructions / rate if priced_instructions > 0.0 and rate > 0.0 else 0.0
+            traffic_result[kind] = {
+                "once_before_static_instructions": before,
+                "per_iteration_static_instructions": body,
+                "once_after_static_instructions": after,
+                "static_instructions": instructions,
+                "instruction_multiplier": instruction_multiplier,
+                "priced_instructions": priced_instructions,
+                "instructions_per_system_cycle": rate,
+                "system_cycles": cycles,
+            }
+            traffic_result["system_cycles"] += cycles
+            found = found or instructions > 0.0
+        traffic_result["charged_system_cycles"] = (traffic_result["system_cycles"]
+                                                   if traffic == "private_stack" else 0.0)
+        traffic_result["pricing_status"] = ("backend_hidden_cost_charged" if traffic == "private_stack" else
+                                            "diagnostic_only_semantic_lowering_overlap_unresolved")
+        result[traffic] = traffic_result
+        result["system_cycles"] += traffic_result["charged_system_cycles"]
+        result["diagnostic_system_cycles"] += traffic_result["system_cycles"]
+    return result if found else None
+
+
+def _backend_private_stack_charge(resource, route, factor, num_warps, throughput_curves):
+    """Compatibility view of the private-stack part of generated traffic."""
+    charge = _backend_generated_vector_traffic_charge(
+        resource,
+        route,
+        factor,
+        num_warps,
+        {
+            "shared_local": {"load": {}, "store": {}},
+            "private_stack": throughput_curves,
+        },
+    )
+    if charge is None:
+        return None
+    private = charge["private_stack"]
+    result = {
+        "formula": charge["formula"],
+        "runtime_loop_iteration_count": charge["runtime_loop_iteration_count"],
+        "active_warp_count": charge["active_warp_count"],
+        "system_cycles": private["system_cycles"],
+        "load": private["load"],
+        "store": private["store"],
+    }
+    return result
 
 
 def _compile_options_with_regalloc_size_info(options):
@@ -726,7 +867,7 @@ def _representative_simt_resource(resources):
 
 
 def _select_backend_resource_aware_factor(report, factor_resources, selected_factor, num_warps=1,
-                                          private_load_group_cycles=0.0):
+                                          generated_traffic_throughput_curves=None):
     """Reject SuperBlock factors that cross a backend allocation cliff.
 
     The StageCostModel runs before register allocation, so it cannot know that
@@ -757,13 +898,13 @@ def _select_backend_resource_aware_factor(report, factor_resources, selected_fac
         return int(selected_factor), {}, report
 
     adjusted_scores = dict(legal_scores)
-    private_load_charges = {}
+    generated_traffic_charges = {}
     for factor, score in legal_scores.items():
-        charge = _backend_private_stack_load_charge(factor_resources[factor], routes_by_factor[factor], factor,
-                                                    num_warps, private_load_group_cycles)
+        charge = _backend_generated_vector_traffic_charge(factor_resources[factor], routes_by_factor[factor], factor,
+                                                          num_warps, generated_traffic_throughput_curves or {})
         if charge is None:
             continue
-        private_load_charges[factor] = charge
+        generated_traffic_charges[factor] = charge
         adjusted_scores[factor] = score + charge["system_cycles"]
 
     dominated = set()
@@ -779,15 +920,31 @@ def _select_backend_resource_aware_factor(report, factor_resources, selected_fac
         current = factor_resources[factor]
         current_stack = int(current.get("stack_size_bytes", 0))
         current_registers = int(current.get("used_registers", 0))
-        for lower_factor in (candidate for candidate in ordered_factors if candidate < factor):
+        current_regalloc_generated = int(current.get("regalloc_generated_instructions", 0))
+        # Prefer the closest lower factor as the causal reference.  Continue
+        # through older factors only when the closest one does not expose the
+        # transition, so an already-spilled intermediate factor cannot hide a
+        # cliff that started earlier.
+        for lower_factor in reversed([candidate for candidate in ordered_factors if candidate < factor]):
             lower = factor_resources[lower_factor]
             lower_stack = int(lower.get("stack_size_bytes", 0))
             lower_registers = int(lower.get("used_registers", 0))
-            # A simultaneous >=25% register collapse, >=50% stack growth and
-            # at least one 64-byte stack region is a backend allocation cliff,
-            # rather than ordinary factor-to-factor noise.
+            # A simultaneous >=25% register collapse plus either
+            #
+            # * the first non-zero private stack together with allocator-
+            #   generated instructions, or
+            # * a large (>=64 byte, >=50%) growth of an existing stack
+            #
+            # is a backend allocation cliff rather than ordinary
+            # factor-to-factor noise.  The first condition must not impose a
+            # 64-byte floor: CCEC can spill a small register set into a 32-byte
+            # frame.  Requiring both the register collapse and the allocator
+            # instruction delta keeps explicit, factor-independent stack
+            # objects from being mistaken for spill.
             register_cliff = lower_registers > 0 and current_registers * 4 <= lower_registers * 3
-            stack_cliff = (current_stack >= lower_stack + 64 and current_stack * 2 >= max(1, lower_stack) * 3)
+            first_spill_frame = (lower_stack == 0 and current_stack > 0 and current_regalloc_generated > 0)
+            material_stack_growth = (current_stack >= lower_stack + 64 and current_stack * 2 >= max(1, lower_stack) * 3)
+            stack_cliff = first_spill_frame or material_stack_growth
             if register_cliff and stack_cliff:
                 dominated.add(factor)
                 comparisons.append({
@@ -798,6 +955,7 @@ def _select_backend_resource_aware_factor(report, factor_resources, selected_fac
                     "reference_used_registers": lower_registers,
                     "stack_size_bytes": current_stack,
                     "reference_stack_size_bytes": lower_stack,
+                    "regalloc_generated_instructions": current_regalloc_generated,
                 })
                 break
 
@@ -869,13 +1027,25 @@ def _select_backend_resource_aware_factor(report, factor_resources, selected_fac
                                     for factor in ordered_factors},
         "backend_adjusted_scores": {str(factor): adjusted_scores[factor]
                                     for factor in ordered_factors},
-        "private_stack_load_charges":
-        {str(factor): private_load_charges[factor]
-         for factor in sorted(private_load_charges)},
+        "generated_vector_traffic_charges":
+        {str(factor): generated_traffic_charges[factor]
+         for factor in sorted(generated_traffic_charges)},
+        "private_stack_charges": {
+            str(factor): generated_traffic_charges[factor]["private_stack"]
+            for factor in sorted(generated_traffic_charges)
+            if generated_traffic_charges[factor]["private_stack"]["system_cycles"] > 0.0
+        },
         "absolute_spill_cost_applied":
-        bool(private_load_charges),
-        "absolute_spill_cost_reason": ("actual_static_ldk_count_with_persistent_loop_placement"
-                                       if private_load_charges else "actual_ldk_count_and_loop_placement_unavailable"),
+        any(charge["private_stack"]["system_cycles"] > 0.0 for charge in generated_traffic_charges.values()),
+        "absolute_spill_cost_reason": ("actual_static_ldk_stk_counts_with_persistent_loop_placement" if any(
+            charge["private_stack"]["system_cycles"] > 0.0 for charge in generated_traffic_charges.values()) else
+                                       "actual_ldk_stk_counts_and_loop_placement_unavailable"),
+        "absolute_shared_local_cost_applied":
+        False,
+        "absolute_shared_local_cost_reason":
+        ("actual_lds_sts_counts_are_diagnostic_only_until_semantic_lowering_provenance_is_available" if any(
+            charge["shared_local"]["system_cycles"] > 0.0 for charge in generated_traffic_charges.values()) else
+         "actual_lds_sts_counts_and_loop_placement_unavailable"),
         "pre_backend_selected_factor":
         int(selected_factor),
         "selected_factor":
@@ -935,8 +1105,14 @@ def _select_backend_resource_aware_factor(report, factor_resources, selected_fac
             elapsed["pre_backend_base_selection_score"] = legal_scores[chosen]
             elapsed["base_selection_score"] = chosen_score
             elapsed["superblock_factor"] = chosen
-            if chosen in private_load_charges:
-                elapsed["backend_private_stack_load_system_cycles"] = (private_load_charges[chosen]["system_cycles"])
+            if chosen in generated_traffic_charges:
+                charge = generated_traffic_charges[chosen]
+                elapsed["backend_generated_vector_traffic_system_cycles"] = charge["system_cycles"]
+                elapsed["backend_shared_local_system_cycles"] = charge["shared_local"]["charged_system_cycles"]
+                elapsed["backend_shared_local_diagnostic_system_cycles"] = charge["shared_local"]["system_cycles"]
+                elapsed["backend_private_stack_system_cycles"] = charge["private_stack"]["system_cycles"]
+                elapsed["backend_private_stack_load_system_cycles"] = charge["private_stack"]["load"]["system_cycles"]
+                elapsed["backend_private_stack_store_system_cycles"] = charge["private_stack"]["store"]["system_cycles"]
             fixed = float(elapsed.get("fixed_system_cycles", 0.0))
             frequency = float(elapsed.get("system_counter_frequency_mhz", 1000.0))
             elapsed["predicted_system_counter_cycles"] = fixed + chosen_score
@@ -2991,18 +3167,21 @@ def ttir_to_npubin(mod, metadata, opt):
                     private_stack = _publish_backend_private_stack_disassembly(factor_bin_path, resource_metadata,
                                                                                npu_compiler_path, env)
                     if private_stack:
+                        representative["simt_memory_disassembly"] = private_stack
                         representative["simt_private_stack_disassembly"] = private_stack
                     factor_resources[factor] = representative
                 compiled[factor] = (Path(factor_bin_path).read_bytes(), factor_ret)
 
             chosen_factor, feedback, updated_report = _select_backend_resource_aware_factor(
                 metadata.get("auto_simt_scope_report", ""), factor_resources, selected_factor, num_warps=opt.num_warps,
-                private_load_group_cycles=_private_stack_dependent_load_group_cycles(opt.arch))
+                generated_traffic_throughput_curves=_generated_vector_traffic_throughput_curves(opt.arch))
             if chosen_factor not in compiled:
                 chosen_factor = selected_factor
             chosen_binary, chosen_ret = compiled[chosen_factor]
             _publish_backend_resource_usage(chosen_ret.stdout, chosen_ret.stderr, metadata)
             chosen_resource = factor_resources.get(chosen_factor, {})
+            if chosen_resource.get("simt_memory_disassembly"):
+                metadata["backend_simt_memory_disassembly"] = chosen_resource["simt_memory_disassembly"]
             if chosen_resource.get("simt_private_stack_disassembly"):
                 metadata["backend_simt_private_stack_disassembly"] = (chosen_resource["simt_private_stack_disassembly"])
             metadata["backend_superblock_factor_resources"] = {

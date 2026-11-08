@@ -2929,6 +2929,18 @@
             "private_stack_store_instructions_per_system_cycle": {
               "type": "number",
               "minimum": 0
+            },
+            "shared_local_load_throughput_measurements": {
+              "$ref": "#/definitions/positive_integer_measurement_map"
+            },
+            "shared_local_store_throughput_measurements": {
+              "$ref": "#/definitions/positive_integer_measurement_map"
+            },
+            "private_stack_load_throughput_measurements": {
+              "$ref": "#/definitions/positive_integer_measurement_map"
+            },
+            "private_stack_store_throughput_measurements": {
+              "$ref": "#/definitions/positive_integer_measurement_map"
             }
           },
           "additionalProperties": false
@@ -3317,6 +3329,10 @@
             "step_latency_measurement": {
               "type": "string",
               "minLength": 1
+            },
+            "step_latency_measurements": {
+              "$ref": "#/definitions/positive_integer_measurement_map",
+              "description": "Dependent shuffle/add/control step latency selected by physical active-warp count."
             },
             "straight_line_completion_elements_per_system_cycle": {
               "type": "number",

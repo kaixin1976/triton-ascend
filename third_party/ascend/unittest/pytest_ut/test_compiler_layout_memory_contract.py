@@ -534,6 +534,7 @@ def _factor_route_report(scores):
                     "total_system_cycles": score,
                     "runtime_full_group_count": 1,
                     "runtime_tail_program_count": 0,
+                    "runtime_loop_iteration_count": 1,
                 }
                 for factor, score in scores.items()
             }
@@ -555,7 +556,7 @@ def test_backend_feedback_rejects_first_small_spill_frame(compiler_module):
     chosen, feedback, updated = compiler_module._select_backend_resource_aware_factor(report, resources, 64)
 
     assert chosen == 32
-    assert feedback["policy"] == "relative_register_and_stack_allocation_cliff_v3"
+    assert feedback["policy"] == "relative_register_and_stack_allocation_cliff_v4"
     assert feedback["rejected_factors"] == [64]
     assert feedback["comparisons"] == [{
         "factor": 64,
@@ -585,6 +586,25 @@ def test_backend_feedback_does_not_reject_small_stack_without_complete_spill_evi
 
     assert chosen == 64
     assert feedback["rejected_factors"] == []
+
+
+def test_backend_feedback_extrapolates_observed_cliff_to_diagnostic_factors(compiler_module):
+    report = _factor_route_report({1: 100.0, 2: 80.0, 4: 70.0, 8: 60.0, 16: 55.0})
+    resources = {
+        1: {"stack_size_bytes": 208, "used_registers": 127},
+        2: {"stack_size_bytes": 320, "used_registers": 127},
+        4: {"stack_size_bytes": 600, "used_registers": 64, "regalloc_generated_instructions": 100},
+        8: {"stack_size_bytes": 816, "used_registers": 32, "regalloc_generated_instructions": 100},
+    }
+
+    chosen, feedback, updated = compiler_module._select_backend_resource_aware_factor(report, resources, 8)
+
+    assert chosen == 2
+    assert feedback["allocation_cliff_score_adjustments"]["16"]["extrapolated"] is True
+    diagnostic = feedback["diagnostic_stage_model_routes"]["16"]
+    expected_multiplier = 1.0 + (2.085 - 1.0) * 0.64
+    assert diagnostic["total_system_cycles"] == pytest.approx(55.0 * expected_multiplier)
+    assert json.loads(updated)["selected_superblock_factor"] == 2
 
 
 def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op):

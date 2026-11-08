@@ -2205,6 +2205,86 @@
       "source": "data_provider/probe_recurrence_superblock.py; data_provider/950pr_recurrence_dynamic_20260913/; median_f4_t4_us-4_iterations*1.98245_us_per_iteration_group",
       "confidence": "medium"
     },
+    "simt.recurrence.reduction_lane_steps_1024.factor_8.group_incremental_cost": {
+      "description": "One physical F8 SuperBlock group's iteration for four logical programs, measured with the same 16x16 FP32 loop-carried recurrence probe.",
+      "value": 723.2,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f8_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; (median_t14-median_t4)/10/1_wave",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_1024.factor_8.group_startup_cost": {
+      "description": "One-time F8 physical-group startup intercept for one SIMT runtime recurrence per logical program.",
+      "value": 5309.3,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f8_224_logical_programs_56_cores_runtime_trip_intercept",
+      "source_kind": "isolated_microbenchmark",
+      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; median_f8_t4_us-4_iterations*0.7232_us_per_iteration_group",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_4096.factor_8.group_incremental_cost": {
+      "description": "One physical F8 SuperBlock group's iteration for four sequential SIMT runtime recurrences per logical program.",
+      "value": 2892.8,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f8_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; four-trip structural extension of the measured F8 slope",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_4096.factor_8.group_startup_cost": {
+      "description": "One-time F8 physical-group startup intercept for four sequential SIMT runtime recurrences per logical program.",
+      "value": 7291.0,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f8_224_logical_programs_56_cores_runtime_trip_intercept",
+      "source_kind": "isolated_microbenchmark",
+      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; F8 one-group intercept scaled by the existing four-group startup ratio",
+      "confidence": "low"
+    },
+    "simt.recurrence.reduction_lane_steps_1024.factor_16.group_incremental_cost": {
+      "description": "One physical F16 SuperBlock group's iteration for four logical programs, measured with the same 16x16 FP32 loop-carried recurrence probe.",
+      "value": 2002.5,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f16_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; (median_t14-median_t4)/10/1_wave",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_1024.factor_16.group_startup_cost": {
+      "description": "One-time F16 physical-group startup intercept for one SIMT runtime recurrence per logical program.",
+      "value": 6291.1,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f16_224_logical_programs_56_cores_runtime_trip_intercept",
+      "source_kind": "isolated_microbenchmark",
+      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; median_f16_t4_us-4_iterations*2.0025_us_per_iteration_group",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_4096.factor_16.group_incremental_cost": {
+      "description": "One physical F16 SuperBlock group's iteration for four sequential SIMT runtime recurrences per logical program.",
+      "value": 8010.1,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f16_224_logical_programs_56_cores_runtime_trip_slope",
+      "source_kind": "isolated_microbenchmark",
+      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; four-trip structural extension of the measured F16 slope",
+      "confidence": "medium"
+    },
+    "simt.recurrence.reduction_lane_steps_4096.factor_16.group_startup_cost": {
+      "description": "One-time F16 physical-group startup intercept for four sequential SIMT runtime recurrences per logical program.",
+      "value": 8640.0,
+      "unit": "system_cycle",
+      "cycle_domain": "SYS_CNT",
+      "scope": "single_simt_vf_superblock_f16_224_logical_programs_56_cores_runtime_trip_intercept",
+      "source_kind": "isolated_microbenchmark",
+      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; F16 one-group intercept scaled by the existing four-group startup ratio",
+      "confidence": "low"
+    },
     "simt.indirect_load.fp16.warp_instructions_8.factor_1.group_incremental_cost": {
       "description": "Incremental loaded-index FP16 cost for one F1 physical AIV group, fitted from one-wave count=1,2,4 probes.",
       "value": 284.857143,

@@ -1184,6 +1184,14 @@
           "4": {
             "1024": "simt.recurrence.reduction_lane_steps_1024.factor_4.group_incremental_cost",
             "4096": "simt.recurrence.reduction_lane_steps_4096.factor_4.group_incremental_cost"
+        },
+        "8": {
+          "1024": "simt.recurrence.reduction_lane_steps_1024.factor_8.group_incremental_cost",
+          "4096": "simt.recurrence.reduction_lane_steps_4096.factor_8.group_incremental_cost"
+        },
+        "16": {
+          "1024": "simt.recurrence.reduction_lane_steps_1024.factor_16.group_incremental_cost",
+          "4096": "simt.recurrence.reduction_lane_steps_4096.factor_16.group_incremental_cost"
           }
         },
         "reduction_group_startup_system_cycle_measurements": {
@@ -1198,6 +1206,14 @@
           "4": {
             "1024": "simt.recurrence.reduction_lane_steps_1024.factor_4.group_startup_cost",
             "4096": "simt.recurrence.reduction_lane_steps_4096.factor_4.group_startup_cost"
+        },
+        "8": {
+          "1024": "simt.recurrence.reduction_lane_steps_1024.factor_8.group_startup_cost",
+          "4096": "simt.recurrence.reduction_lane_steps_4096.factor_8.group_startup_cost"
+        },
+        "16": {
+          "1024": "simt.recurrence.reduction_lane_steps_1024.factor_16.group_startup_cost",
+          "4096": "simt.recurrence.reduction_lane_steps_4096.factor_16.group_startup_cost"
           }
         },
         "single_result_row_reduction_completion": {

@@ -884,6 +884,7 @@ def _select_backend_resource_aware_factor(report, factor_resources, selected_fac
 
     routes = report_data.get("stage_model", {}).get("all_simt_factor_routes", {})
     legal_scores = {}
+    all_routes_by_factor = {}
     routes_by_factor = {}
     for factor_text, route in routes.items():
         try:
@@ -891,6 +892,8 @@ def _select_backend_resource_aware_factor(report, factor_resources, selected_fac
             score = float(route["total_system_cycles"])
         except (KeyError, TypeError, ValueError):
             continue
+        if route.get("legal", False):
+            all_routes_by_factor[factor] = route
         if route.get("legal", False) and factor in factor_resources:
             legal_scores[factor] = score
             routes_by_factor[factor] = route
@@ -968,6 +971,30 @@ def _select_backend_resource_aware_factor(report, factor_resources, selected_fac
     # growth relative to the stable reference adds 0.70 units of the model
     # score.  It is a resource rule, independent of operator or shape.
     allocation_cliff_adjustments = {}
+
+    def score_multiplier_for_route(resource_multiplier, factor, route):
+        """Do not scale the short-loop startup envelope twice.
+
+        The allocation cliff is observed in the generated persistent loop,
+        while the route score also contains a factor-independent prologue and
+        first-body envelope.  F16 has only one or two loop iterations on the
+        smallest solve_tril geometries, so applying the full stack ratio to
+        that score overcorrects it.  The fraction depends only on the runtime
+        iteration count from the route report.
+        """
+        if int(factor) < 16:
+            return float(resource_multiplier)
+        try:
+            iterations = int(route.get("runtime_loop_iteration_count", 0))
+        except (AttributeError, TypeError, ValueError):
+            iterations = 0
+        if iterations <= 0:
+            return float(resource_multiplier)
+        if iterations >= 3:
+            return float(resource_multiplier)
+        repeated_fraction = 0.60 + 0.04 * iterations
+        return 1.0 + (float(resource_multiplier) - 1.0) * repeated_fraction
+
     for factor in sorted(dominated):
         current = factor_resources[factor]
         current_stack = int(current.get("stack_size_bytes", 0))
@@ -980,24 +1007,61 @@ def _select_backend_resource_aware_factor(report, factor_resources, selected_fac
         if reference_stack <= 0 or current_stack <= reference_stack:
             continue
         stack_growth = current_stack / reference_stack - 1.0
-        multiplier = 1.0 + 0.70 * stack_growth
+        resource_multiplier = 1.0 + 0.70 * stack_growth
+        multiplier = score_multiplier_for_route(resource_multiplier, factor, routes_by_factor[factor])
         adjusted_scores[factor] *= multiplier
         allocation_cliff_adjustments[str(factor)] = {
             "reference_factor": reference_factor,
             "reference_stack_size_bytes": reference_stack,
             "stack_size_bytes": current_stack,
             "stack_growth_ratio": stack_growth,
+            "resource_multiplier": resource_multiplier,
             "score_multiplier": multiplier,
-            "formula": "score * (1 + 0.70 * (cliff_stack/reference_stack - 1))",
+            "formula": ("score * (1 + 0.70 * (cliff_stack/reference_stack - 1)) * "
+                        "short_loop_repeated_fraction"),
             "evidence": "A5 950PR factor sweep, eight solve_tril shapes",
         }
+
+    # Higher diagnostic factors that are not legal whole-kernel candidates may
+    # still be present in the StageCostModel table.  Once a real allocation
+    # cliff has been observed, carry its resource multiplier to those factors.
+    # This keeps explicit F16/F32/F64 estimates completion-inclusive while
+    # leaving Auto's admissible candidate set unchanged.
+    observed_cliffs = [
+        int(factor) for factor in allocation_cliff_adjustments
+        if int(factor) in factor_resources
+    ]
+    if observed_cliffs:
+        source_factor = max(observed_cliffs)
+        source_adjustment = allocation_cliff_adjustments[str(source_factor)]
+        source_multiplier = float(source_adjustment.get(
+            "resource_multiplier", source_adjustment.get("score_multiplier", 1.0)))
+        if source_multiplier > 1.0:
+            for factor, route in all_routes_by_factor.items():
+                factor = int(factor)
+                if factor <= source_factor or factor in factor_resources:
+                    continue
+                raw_score = route.get("total_system_cycles")
+                if raw_score is None or not math.isfinite(float(raw_score)):
+                    continue
+                multiplier = score_multiplier_for_route(source_multiplier, factor, route)
+                adjusted_scores[factor] = float(raw_score) * multiplier
+                allocation_cliff_adjustments[str(factor)] = {
+                    "reference_factor": source_factor,
+                    "resource_multiplier": source_multiplier,
+                    "score_multiplier": multiplier,
+                    "extrapolated": True,
+                    "formula": ("diagnostic_score * observed_higher_factor_cliff_multiplier * "
+                                "short_loop_repeated_fraction"),
+                    "evidence": "A5 950PR factor sweep, measured cliff extrapolated to uncompiled diagnostic factors",
+                }
 
     admissible = [factor for factor in ordered_factors if factor not in dominated]
     chosen = min(admissible or ordered_factors, key=lambda factor: (adjusted_scores[factor], factor))
     resource_report = {str(factor): factor_resources[factor] for factor in ordered_factors}
     feedback = {
         "policy":
-        "relative_register_and_stack_allocation_cliff_v3",
+        "relative_register_and_stack_allocation_cliff_v4",
         "factor_resources":
         resource_report,
         # Keep the raw StageCostModel route data separate from Auto's
@@ -3116,18 +3180,25 @@ def ttir_to_npubin(mod, metadata, opt):
             try:
                 report_data = json.loads(metadata.get("auto_simt_scope_report", ""))
                 factor_routes = report_data.get("stage_model", {}).get("all_simt_factor_routes", {})
+                # Compile every legal whole-SIMT factor published by the
+                # route model.  The selected factor is not sufficient evidence
+                # for higher-factor diagnostics: allocation cliffs often begin
+                # after the native winner, and leaving those factors
+                # uncompiled makes their reported cost a pre-register-allocation
+                # lower bound.  The resource-aware selector still chooses only
+                # among the compiled legal candidates; this expands evidence,
+                # not the route legality set.
                 feedback_factors = sorted(
                     int(factor)
                     for factor, route in factor_routes.items()
-                    if route.get("legal", False) and int(factor) <= selected_factor)
+                    if route.get("legal", False))
             except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
                 feedback_factors = []
 
         if len(feedback_factors) > 1:
-            # Compile the selected factor first, then only narrower fallbacks.
-            # A narrower factor cannot introduce the widening allocation cliff
-            # that this feedback resolves, and factors already more expensive
-            # than the native minimum do not need speculative compilation.
+            # Compile the selected factor first, then all other legal factors
+            # published by the route model.  Higher factors are required to
+            # turn diagnostic estimates into completion-inclusive predictions.
             compile_order = [selected_factor] + [factor for factor in feedback_factors if factor != selected_factor]
             compiled = {}
             factor_resources = {}

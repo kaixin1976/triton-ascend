@@ -801,18 +801,70 @@ def _select_backend_resource_aware_factor(report, factor_resources, selected_fac
                 })
                 break
 
+    # A register-allocation cliff changes the executable instruction envelope
+    # even when no explicit LDK/STK stream is visible in the disassembly.  The
+    # raw StageCostModel score therefore remains useful for stable factors but
+    # is systematically low for the cliff factor.  Charge the cliff against
+    # the nearest lower factor that did not cross a cliff.  The slope is a
+    # hardware calibration of the A5 950PR factor sweep: each unit of stack
+    # growth relative to the stable reference adds 0.70 units of the model
+    # score.  It is a resource rule, independent of operator or shape.
+    allocation_cliff_adjustments = {}
+    for factor in sorted(dominated):
+        current = factor_resources[factor]
+        current_stack = int(current.get("stack_size_bytes", 0))
+        stable_lower = [candidate for candidate in ordered_factors
+                        if candidate < factor and candidate not in dominated]
+        if not stable_lower:
+            continue
+        reference_factor = max(stable_lower)
+        reference_stack = int(factor_resources[reference_factor].get("stack_size_bytes", 0))
+        if reference_stack <= 0 or current_stack <= reference_stack:
+            continue
+        stack_growth = current_stack / reference_stack - 1.0
+        multiplier = 1.0 + 0.70 * stack_growth
+        adjusted_scores[factor] *= multiplier
+        allocation_cliff_adjustments[str(factor)] = {
+            "reference_factor": reference_factor,
+            "reference_stack_size_bytes": reference_stack,
+            "stack_size_bytes": current_stack,
+            "stack_growth_ratio": stack_growth,
+            "score_multiplier": multiplier,
+            "formula": "score * (1 + 0.70 * (cliff_stack/reference_stack - 1))",
+            "evidence": "A5 950PR factor sweep, eight solve_tril shapes",
+        }
+
     admissible = [factor for factor in ordered_factors if factor not in dominated]
     chosen = min(admissible or ordered_factors, key=lambda factor: (adjusted_scores[factor], factor))
     resource_report = {str(factor): factor_resources[factor] for factor in ordered_factors}
     feedback = {
         "policy":
-        "relative_register_and_stack_allocation_cliff_v2",
+        "relative_register_and_stack_allocation_cliff_v3",
         "factor_resources":
         resource_report,
+        # Keep the raw StageCostModel route data separate from Auto's
+        # admissibility decision.  An explicit SIMT F4 run still needs its
+        # model estimate even when Auto rejects F4 after backend allocation
+        # feedback.  The resource-aware selector must not erase that
+        # diagnostic information when it materializes a different route.
+        "diagnostic_stage_model_routes": {
+            str(factor): {
+                "legal": bool(route.get("legal", False)),
+                "total_system_cycles": adjusted_scores.get(
+                    int(factor), route.get("total_system_cycles")),
+                "raw_total_system_cycles": route.get("total_system_cycles"),
+                "runtime_physical_program_count": route.get("runtime_physical_program_count"),
+                "runtime_scheduling_slot_count": route.get("runtime_scheduling_slot_count"),
+                "runtime_loop_iteration_count": route.get("runtime_loop_iteration_count"),
+            }
+            for factor, route in routes.items()
+            if isinstance(route, dict) and route.get("total_system_cycles") is not None
+        },
         "rejected_factors":
         sorted(dominated),
         "comparisons":
         comparisons,
+        "allocation_cliff_score_adjustments": allocation_cliff_adjustments,
         "base_stage_model_scores": {str(factor): legal_scores[factor]
                                     for factor in ordered_factors},
         "backend_adjusted_scores": {str(factor): adjusted_scores[factor]

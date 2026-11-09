@@ -1,7 +1,7 @@
 {
   "$schema": "./microbenchmark_profile_schema.json",
   "schema_version": 1,
-  "profile_version": "ascend-950pr-shared-microbench-20261030-v34-dependent-shuffle-f64",
+  "profile_version": "ascend-950pr-shared-microbench-20261026-v32-factor-scoped-grid-dot-controls",
   "target": "Ascend950PR/dav-c310",
   "description": "Model-neutral target facts and microbenchmark evidence. Model-specific scale, penalties, coverage, gates, and fallback priors are intentionally excluded.",
   "measurements": {
@@ -64,86 +64,6 @@
       "source_kind": "isolated_microbenchmark",
       "source": "data_provider/950pr_private_stack_access_20260921.json",
       "confidence": "medium"
-    },
-    "simt.private_stack.load.throughput.warps_8": {
-      "description": "Explicit volatile private-load throughput fitted from 4/16 LDK operations; the independent 8-operation holdout error is 1.38%.",
-      "value": 0.0366427365,
-      "unit": "warp_instruction/system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_8_active_warps_dependent_explicit_private_load",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 evidence /data/kaixin/costmodel-f8-memory-evidence/private_20261029/private_factor_analysis.json",
-      "confidence": "high"
-    },
-    "simt.private_stack.load.throughput.warps_16": {
-      "description": "Explicit volatile private-load throughput fitted from 4/16 LDK operations; the independent 8-operation holdout error is 0.23%.",
-      "value": 0.01157128393,
-      "unit": "warp_instruction/system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_16_active_warps_dependent_explicit_private_load",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 evidence /data/kaixin/costmodel-f8-memory-evidence/private_20261029/private_factor_analysis.json",
-      "confidence": "high"
-    },
-    "simt.private_stack.load.throughput.warps_32": {
-      "description": "Explicit volatile private-load throughput fitted from 4/16 LDK operations; the independent 8-operation holdout error is 0.07%.",
-      "value": 0.007646887702,
-      "unit": "warp_instruction/system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_32_active_warps_dependent_explicit_private_load",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 evidence /data/kaixin/costmodel-f8-memory-evidence/private_20261029/private_factor_analysis.json",
-      "confidence": "high"
-    },
-    "simt.private_stack.load.throughput.warps_64": {
-      "description": "Explicit volatile private-load throughput fitted from 4/16 LDK operations; the independent 8-operation holdout error is 0.46%.",
-      "value": 0.007330199228,
-      "unit": "warp_instruction/system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_64_active_warps_dependent_explicit_private_load",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 evidence /data/kaixin/costmodel-f8-memory-evidence/private_20261029/private_factor_analysis.json",
-      "confidence": "high"
-    },
-    "simt.private_stack.store.throughput.warps_8": {
-      "description": "Explicit volatile private-store throughput fitted from 4/16 STK operations; the independent 8-operation holdout error is 7.64%.",
-      "value": 0.10843373494,
-      "unit": "warp_instruction/system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_8_active_warps_explicit_private_store",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 evidence /data/kaixin/costmodel-f8-memory-evidence/private_20261029/private_factor_analysis.json",
-      "confidence": "medium"
-    },
-    "simt.private_stack.store.throughput.warps_16": {
-      "description": "Explicit volatile private-store throughput fitted from 4/16 STK operations; the independent 8-operation holdout error is 0.51%.",
-      "value": 0.043381293135,
-      "unit": "warp_instruction/system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_16_active_warps_explicit_private_store",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 evidence /data/kaixin/costmodel-f8-memory-evidence/private_20261029/private_factor_analysis.json",
-      "confidence": "high"
-    },
-    "simt.private_stack.store.throughput.warps_32": {
-      "description": "Explicit volatile private-store throughput fitted from 4/16 STK operations; the independent 8-operation holdout error is 4.38%.",
-      "value": 0.017540821046,
-      "unit": "warp_instruction/system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_32_active_warps_explicit_private_store",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 evidence /data/kaixin/costmodel-f8-memory-evidence/private_20261029/private_factor_analysis.json",
-      "confidence": "high"
-    },
-    "simt.private_stack.store.throughput.warps_64": {
-      "description": "Explicit volatile private-store throughput fitted from 4/16 STK operations; the independent 8-operation holdout error is 4.03%.",
-      "value": 0.00847911723,
-      "unit": "warp_instruction/system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_64_active_warps_explicit_private_store",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 evidence /data/kaixin/costmodel-f8-memory-evidence/private_20261029/private_factor_analysis.json",
-      "confidence": "high"
     },
     "simd.f32.add.throughput": {
       "description": "Effective source-level FP32 SIMD add throughput on one AIV. The compile-time-specialized IR contains the intended vadd body and the slope removes fixed launch cost.",
@@ -564,76 +484,6 @@
       "source_kind": "isolated_microbenchmark",
       "source": "data_provider/950pr_simt_shuffle_fresh_20260913.log; data_provider/950pr_probe_repeat_with_scan_identity_20260913.log",
       "confidence": "medium"
-    },
-    "simt.shuffle.dependent_latency.warps_1": {
-      "description": "Dependent shfl-up chain iteration cost at one active warp; the independent 512-iteration holdout error is 0.012%.",
-      "value": 28.496419,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_fp32_shfl_up_1_warp_dependent_chain",
-      "source_kind": "isolated_microbenchmark",
-      "source": "data_provider/simt_shuffle.cce; data_provider/simt_shuffle_host.cpp; A5 evidence /data/kaixin/costmodel_diag/shuffle_f64_20261030/run_npu5.log",
-      "confidence": "high"
-    },
-    "simt.shuffle.dependent_latency.warps_2": {
-      "description": "Dependent shfl-up chain iteration cost at two active warps; the independent 512-iteration holdout error is 0.024%.",
-      "value": 29.109961,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_fp32_shfl_up_2_warps_dependent_chain",
-      "source_kind": "isolated_microbenchmark",
-      "source": "data_provider/simt_shuffle.cce; data_provider/simt_shuffle_host.cpp; A5 evidence /data/kaixin/costmodel_diag/shuffle_f64_20261030/run_npu5.log",
-      "confidence": "high"
-    },
-    "simt.shuffle.dependent_latency.warps_4": {
-      "description": "Dependent shfl-up chain iteration cost at four active warps; the independent 512-iteration holdout error is 0.048%.",
-      "value": 30.334375,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_fp32_shfl_up_4_warps_dependent_chain",
-      "source_kind": "isolated_microbenchmark",
-      "source": "data_provider/simt_shuffle.cce; data_provider/simt_shuffle_host.cpp; A5 evidence /data/kaixin/costmodel_diag/shuffle_f64_20261030/run_npu5.log",
-      "confidence": "high"
-    },
-    "simt.shuffle.dependent_latency.warps_8": {
-      "description": "Dependent shfl-up chain iteration cost at eight active warps; the independent 512-iteration holdout error is 0.050%.",
-      "value": 30.331706,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_fp32_shfl_up_8_warps_dependent_chain",
-      "source_kind": "isolated_microbenchmark",
-      "source": "data_provider/simt_shuffle.cce; data_provider/simt_shuffle_host.cpp; A5 evidence /data/kaixin/costmodel_diag/shuffle_f64_20261030/run_npu5.log",
-      "confidence": "high"
-    },
-    "simt.shuffle.dependent_latency.warps_16": {
-      "description": "Dependent shfl-up chain iteration cost at 16 active warps; the independent 512-iteration holdout error is 0.002%.",
-      "value": 36.380273,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_fp32_shfl_up_16_warps_dependent_chain",
-      "source_kind": "isolated_microbenchmark",
-      "source": "data_provider/simt_shuffle.cce; data_provider/simt_shuffle_host.cpp; A5 evidence /data/kaixin/costmodel_diag/shuffle_f64_20261030/run_npu5.log",
-      "confidence": "high"
-    },
-    "simt.shuffle.dependent_latency.warps_32": {
-      "description": "Dependent shfl-up chain iteration cost at 32 active warps; the independent 512-iteration holdout error is 0.001%.",
-      "value": 58.207813,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_fp32_shfl_up_32_warps_dependent_chain",
-      "source_kind": "isolated_microbenchmark",
-      "source": "data_provider/simt_shuffle.cce; data_provider/simt_shuffle_host.cpp; A5 evidence /data/kaixin/costmodel_diag/shuffle_f64_20261030/run_npu5.log",
-      "confidence": "high"
-    },
-    "simt.shuffle.dependent_latency.warps_64": {
-      "description": "Dependent shfl-up chain iteration cost at 64 active warps; the independent 512-iteration holdout error is 0.003%.",
-      "value": 116.417513,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_fp32_shfl_up_64_warps_dependent_chain",
-      "source_kind": "isolated_microbenchmark",
-      "source": "data_provider/simt_shuffle.cce; data_provider/simt_shuffle_host.cpp; A5 evidence /data/kaixin/costmodel_diag/shuffle_f64_20261030/run_npu5.log",
-      "confidence": "high"
     },
     "simt.gm.load.throughput": {
       "description": "Effective source GM-load rate for the stated 32-warp sequential rotating runtime-loop workload. Address generation, loop/control and the source sink remain in elapsed cycles; this is not an intrinsic LSU issue peak.",
@@ -1555,26 +1405,6 @@
       "source": "data_provider/950pr_simt_memory_fresh_20260913.log",
       "confidence": "high"
     },
-    "simt.ub.load.throughput.warps_64": {
-      "description": "Mean aggregate SIMT UB-load throughput from independent card-0/card-1 runs. The 2048-thread probe retains eight accesses per thread and uses two rotating sets to fit within 192 KiB UB.",
-      "value": 0.518109472656,
-      "unit": "warp_instruction/system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_64_warps_128kib_2_rotating_sets_8_independent_ops_per_thread",
-      "source_kind": "isolated_microbenchmark",
-      "source": "data_provider/simt_memory.cce; data_provider/simt_memory_host.cpp; A5 evidence /data/kaixin/costmodel-f8-memory-evidence/ub_20261029/run_dual_bound_card{0,1}.log",
-      "confidence": "high"
-    },
-    "simt.ub.store.throughput.warps_64": {
-      "description": "Mean aggregate SIMT UB-store throughput from independent card-0/card-1 runs. The 2048-thread probe retains eight accesses per thread and uses two rotating sets to fit within 192 KiB UB.",
-      "value": 0.172458570313,
-      "unit": "warp_instruction/system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_64_warps_128kib_2_rotating_sets_8_independent_ops_per_thread",
-      "source_kind": "isolated_microbenchmark",
-      "source": "data_provider/simt_memory.cce; data_provider/simt_memory_host.cpp; A5 evidence /data/kaixin/costmodel-f8-memory-evidence/ub_20261029/run_dual_bound_card{0,1}.log",
-      "confidence": "high"
-    },
     "simt.shuffle.throughput.warps_1": {
       "description": "Measured aggregate SIMT ILP4 shuffle throughput at the stated launched warp count.",
       "value": 0.073333,
@@ -1633,16 +1463,6 @@
       "scope": "single_aiv_32_warps_4_independent_shuffle_chains",
       "source_kind": "isolated_microbenchmark",
       "source": "data_provider/950pr_simt_shuffle_fresh_20260913.log",
-      "confidence": "high"
-    },
-    "simt.shuffle.throughput.warps_64": {
-      "description": "Measured aggregate SIMT ILP4 shuffle throughput at 64 launched warps; the independent 512-iteration holdout error is 0.001%.",
-      "value": 0.811957,
-      "unit": "warp_instruction/system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_aiv_64_warps_4_independent_shuffle_chains",
-      "source_kind": "isolated_microbenchmark",
-      "source": "data_provider/simt_shuffle.cce; data_provider/simt_shuffle_host.cpp; A5 evidence /data/kaixin/costmodel_diag/shuffle_f64_20261030/run_npu5.log",
       "confidence": "high"
     },
     "simt.gm.load.throughput.warps_1": {
@@ -2204,86 +2024,6 @@
       "source_kind": "isolated_microbenchmark",
       "source": "data_provider/probe_recurrence_superblock.py; data_provider/950pr_recurrence_dynamic_20260913/; median_f4_t4_us-4_iterations*1.98245_us_per_iteration_group",
       "confidence": "medium"
-    },
-    "simt.recurrence.reduction_lane_steps_1024.factor_8.group_incremental_cost": {
-      "description": "One physical F8 SuperBlock group's iteration for four logical programs, measured with the same 16x16 FP32 loop-carried recurrence probe.",
-      "value": 723.2,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_simt_vf_superblock_f8_224_logical_programs_56_cores_runtime_trip_slope",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; (median_t14-median_t4)/10/1_wave",
-      "confidence": "medium"
-    },
-    "simt.recurrence.reduction_lane_steps_1024.factor_8.group_startup_cost": {
-      "description": "One-time F8 physical-group startup intercept for one SIMT runtime recurrence per logical program.",
-      "value": 5309.3,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_simt_vf_superblock_f8_224_logical_programs_56_cores_runtime_trip_intercept",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; median_f8_t4_us-4_iterations*0.7232_us_per_iteration_group",
-      "confidence": "medium"
-    },
-    "simt.recurrence.reduction_lane_steps_4096.factor_8.group_incremental_cost": {
-      "description": "One physical F8 SuperBlock group's iteration for four sequential SIMT runtime recurrences per logical program.",
-      "value": 2892.8,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_simt_vf_superblock_f8_224_logical_programs_56_cores_runtime_trip_slope",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; four-trip structural extension of the measured F8 slope",
-      "confidence": "medium"
-    },
-    "simt.recurrence.reduction_lane_steps_4096.factor_8.group_startup_cost": {
-      "description": "One-time F8 physical-group startup intercept for four sequential SIMT runtime recurrences per logical program.",
-      "value": 7291.0,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_simt_vf_superblock_f8_224_logical_programs_56_cores_runtime_trip_intercept",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; F8 one-group intercept scaled by the existing four-group startup ratio",
-      "confidence": "low"
-    },
-    "simt.recurrence.reduction_lane_steps_1024.factor_16.group_incremental_cost": {
-      "description": "One physical F16 SuperBlock group's iteration for four logical programs, measured with the same 16x16 FP32 loop-carried recurrence probe.",
-      "value": 2002.5,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_simt_vf_superblock_f16_224_logical_programs_56_cores_runtime_trip_slope",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; (median_t14-median_t4)/10/1_wave",
-      "confidence": "medium"
-    },
-    "simt.recurrence.reduction_lane_steps_1024.factor_16.group_startup_cost": {
-      "description": "One-time F16 physical-group startup intercept for one SIMT runtime recurrence per logical program.",
-      "value": 6291.1,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_simt_vf_superblock_f16_224_logical_programs_56_cores_runtime_trip_intercept",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; median_f16_t4_us-4_iterations*2.0025_us_per_iteration_group",
-      "confidence": "medium"
-    },
-    "simt.recurrence.reduction_lane_steps_4096.factor_16.group_incremental_cost": {
-      "description": "One physical F16 SuperBlock group's iteration for four sequential SIMT runtime recurrences per logical program.",
-      "value": 8010.1,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_simt_vf_superblock_f16_224_logical_programs_56_cores_runtime_trip_slope",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; four-trip structural extension of the measured F16 slope",
-      "confidence": "medium"
-    },
-    "simt.recurrence.reduction_lane_steps_4096.factor_16.group_startup_cost": {
-      "description": "One-time F16 physical-group startup intercept for four sequential SIMT runtime recurrences per logical program.",
-      "value": 8640.0,
-      "unit": "system_cycle",
-      "cycle_domain": "SYS_CNT",
-      "scope": "single_simt_vf_superblock_f16_224_logical_programs_56_cores_runtime_trip_intercept",
-      "source_kind": "isolated_microbenchmark",
-      "source": "A5 2026-11-08 /data/simt_costmodel/recur_probe_f8plus_20261108; F16 one-group intercept scaled by the existing four-group startup ratio",
-      "confidence": "low"
     },
     "simt.indirect_load.fp16.warp_instructions_8.factor_1.group_incremental_cost": {
       "description": "Incremental loaded-index FP16 cost for one F1 physical AIV group, fitted from one-wave count=1,2,4 probes.",

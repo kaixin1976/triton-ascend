@@ -4,18 +4,16 @@
 // mode 1: eight independent UB stores per thread/iteration.
 //
 // The host takes a slope over `iters`, removing async_invoke and SYS_CNT
-// overhead.  The <=32-warp path preserves the original four rotating sets and
-// 1024-thread launch bound.  The 64-warp extension uses two rotating sets and
-// a 2048-thread launch bound so its footprint remains inside 192 KiB UB.
+// overhead.  The address rotates over 32 cache lines so loads cannot be hoisted
+// into registers across iterations.
 #include "RegBase/VecUtils.h"
 #include "Vector/VecUtils.h"
 #include "Utils.h"
 
 using DT = float;
 
-template <typename T, int LaunchThreads, int WorkingSets>
-__simt_vf__ LAUNCH_BOUND(LaunchThreads) __aiv__
-    __attribute__((always_inline)) static void
+template <typename T>
+__simt_vf__ LAUNCH_BOUND(1024) __aiv__ __attribute__((always_inline)) static void
 simt_memory_core(volatile __ubuf__ T *buf, int nlane, int nwarp, int iters, int mode) {
   int lane = threadIdx.x;
   int warp = threadIdx.y;
@@ -26,7 +24,9 @@ simt_memory_core(volatile __ubuf__ T *buf, int nlane, int nwarp, int iters, int 
   int threads = nwarp * 32;
   T acc = (T)(tid + 1);
   for (int i = 0; i < iters; ++i) {
-    int base = (i & (WorkingSets - 1)) * threads * 8 + tid;
+    // Four rotating working sets keep the maximum 32-warp footprint at
+    // 128 KiB, within the 192 KiB local-memory allocation.
+    int base = (i & 3) * threads * 8 + tid;
     if (mode == 0) {
       T x0 = buf[base + threads * 0];
       T x1 = buf[base + threads * 1];
@@ -70,12 +70,8 @@ extern "C" __global__ __aiv__ void measure(__gm__ long long *out, int K,
   pipe_barrier(PIPE_ALL);
   long long t0 = get_sys_cnt();
   for (int i = 0; i < K; ++i) {
-    if (nwarp <= 32)
-      cce::async_invoke<simt_memory_core<DT, 1024, 4>>(
-          cce::dim3{32, (unsigned)nwarp, 1}, buf, nlane, nwarp, iters, mode);
-    else
-      cce::async_invoke<simt_memory_core<DT, 2048, 2>>(
-          cce::dim3{32, (unsigned)nwarp, 1}, buf, nlane, nwarp, iters, mode);
+    cce::async_invoke<simt_memory_core<DT>>(
+        cce::dim3{32, (unsigned)nwarp, 1}, buf, nlane, nwarp, iters, mode);
     pipe_barrier(PIPE_ALL);
   }
   long long t1 = get_sys_cnt();

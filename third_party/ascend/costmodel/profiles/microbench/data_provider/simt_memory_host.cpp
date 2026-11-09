@@ -80,9 +80,8 @@ static long long runK(const char *fn, rtStream_t stream, void *dout, int K,
     }
   }
   if (mode == 1) {
-    const int rotatingSets = nwarp <= 32 ? 4 : 2;
-    for (int set = 0; set < rotatingSets; ++set) {
-      int last = iters - 1 - ((iters - 1 - set) & (rotatingSets - 1));
+    for (int set = 0; set < 4; ++set) {
+      int last = iters - 1 - ((iters - 1 - set) & 3);
       for (int j = 0; j < 8; ++j)
         for (int tid = 0; tid < nwarp * 32; ++tid)
           if (values[(set * 8 + j) * nwarp * 32 + tid] != tid + 1 + last + j)
@@ -128,14 +127,14 @@ int main() {
   rtStream_t stream;
   check(rtStreamCreate(&stream, 0), "rtStreamCreate");
   void *dout = nullptr;
-  check(rtMalloc(&dout, 32 + (32768 + 2048) * sizeof(float), RT_MEMORY_HBM, 0),
+  check(rtMalloc(&dout, 32 + (32768 + 1024) * sizeof(float), RT_MEMORY_HBM, 0),
         "rtMalloc");
 
   runK(fn, stream, dout, 2, 32, 4, 16, 0);
   printf("SIMT UB memory, eight operations/thread/iteration\n");
   printf("warps,load_cycles,load_bytes_per_cycle,store_cycles,"
          "store_bytes_per_cycle\n");
-  for (int warps : {1, 2, 4, 8, 16, 32, 64}) {
+  for (int warps : {1, 2, 4, 8, 16, 32}) {
     double loadCycles = cyclesPerIter(fn, stream, dout, warps, 0);
     double storeCycles = cyclesPerIter(fn, stream, dout, warps, 1);
     double bytes = (double)warps * 32.0 * 8.0 * sizeof(float);

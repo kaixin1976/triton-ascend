@@ -497,9 +497,6 @@ struct StageResourceCycles {
   double maskedAccumulatorReductionCompletionSetup = 0.0;
   /// Completion-inclusive row-reduction body for one physical SIMT group.
   double rowwiseReductionGroupBody = 0.0;
-  /// The requested SuperBlock factor is above the calibrated rowwise surface;
-  /// the highest calibrated factor is retained as a conservative lower bound.
-  bool rowwiseReductionGroupLowerFactorBound = false;
   /// Completion-inclusive body of a structurally matched whole-SIMT
   /// multi-result reduction lowering.
   double multiResultReductionGroupBody = 0.0;

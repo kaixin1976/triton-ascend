@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure loop-carried recurrence scaling for SIMD and SIMT F1..F64."""
+"""Measure loop-carried recurrence scaling for SIMD and SIMT F1/F2/F4."""
 
 import argparse
 import csv
@@ -95,11 +95,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
     parser.add_argument("--mode", choices=("simd", "simt_only"), default="simt_only")
-    parser.add_argument("--factor", type=int, choices=(1, 2, 4, 8, 16, 32, 64), default=1)
-    parser.add_argument(
-        "--num-warps", type=int, choices=(1, 2, 4), default=None,
-        help="base SIMT warps; defaults to 4 through F16 and 1 for F32/F64",
-    )
+    parser.add_argument("--factor", type=int, choices=(1, 2, 4), default=1)
     parser.add_argument("--trips", type=int, choices=(0, 1, 2, 4, 8, 14), required=True)
     parser.add_argument("--recurrence-groups", type=int, choices=(1, 4), default=4)
     parser.add_argument("--columns", type=int, choices=(8, 16), default=16)
@@ -113,13 +109,6 @@ def main():
     args = parser.parse_args()
     if args.mode == "simd" and args.factor != 1:
         parser.error("SIMD recurrence measurements require --factor=1")
-    num_warps = args.num_warps if args.num_warps is not None else (
-        1 if args.factor >= 32 else 4
-    )
-    if num_warps * args.factor > 64:
-        parser.error(
-            f"num_warps * factor must be <= 64 (got {num_warps} * {args.factor})"
-        )
     args.output.mkdir(parents=True, exist_ok=False)
 
     vector_cores = int(driver.active.utils.get_device_properties(torch.npu.current_device())["num_vectorcore"])
@@ -143,7 +132,7 @@ def main():
     output = torch.empty((logical_programs, args.columns), dtype=torch.float32, device="npu")
 
     def launch():
-        options = {"compile_mode": args.mode, "num_warps": num_warps}
+        options = {"compile_mode": args.mode, "num_warps": 4}
         if args.mode == "simt_only":
             options["superblock_factor"] = args.factor
         return recurrence_superblock_probe[(logical_programs, )](source, output, args.trips, args.recurrence_groups,
@@ -187,7 +176,6 @@ def main():
     result = {
         "mode": args.mode,
         "factor": args.factor,
-        "num_warps": num_warps,
         "trips": args.trips,
         "recurrence_groups": args.recurrence_groups,
         "columns": args.columns,

@@ -1400,16 +1400,6 @@ static void readStageResources(ProfileJSONReader &reader,
                           &profile.privateStackLoadInstructionsPerCycle},
                          {"private_stack_store_instructions_per_system_cycle",
                           &profile.privateStackStoreInstructionsPerCycle}});
-    readPositiveIntegerMeasurementCurves(
-        *generated, "warp_instruction/system_cycle", microbench, reader, path,
-        {{"shared_local_load_throughput_measurements",
-          &profile.sharedLocalLoadInstructionsPerCycleByWarpCount},
-         {"shared_local_store_throughput_measurements",
-          &profile.sharedLocalStoreInstructionsPerCycleByWarpCount},
-         {"private_stack_load_throughput_measurements",
-          &profile.privateStackLoadInstructionsPerCycleByWarpCount},
-         {"private_stack_store_throughput_measurements",
-          &profile.privateStackStoreInstructionsPerCycleByWarpCount}});
     if (profile.sharedLocalLoadInstructionsPerCycle < 0.0 ||
         profile.sharedLocalStoreInstructionsPerCycle < 0.0 ||
         profile.privateStackLoadInstructionsPerCycle < 0.0 ||
@@ -1904,10 +1894,6 @@ static void readStageResources(ProfileJSONReader &reader,
     profile.prefixScanStepLatencyCycles = resolveNumberOrMeasurement(
         *scan, "step_latency_system_cycles", "step_latency_measurement",
         "system_cycle", microbench, reader, prefix + ".prefix_scan");
-    readPositiveIntegerMeasurementCurve(
-        *scan, "step_latency_measurements", "system_cycle", microbench, reader,
-        prefix + ".prefix_scan",
-        profile.prefixScanStepLatencyCyclesByWarpCount);
     if (auto maximum = scan->getInteger("maximum_reverse_axis_extent")) {
       if (*maximum <= 0)
         reader.setError(

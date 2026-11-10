@@ -316,7 +316,16 @@ def _ensure_npuir_submodule():
 def _ensure_distributed_submodule():
     if os.getenv("TRITON_BUILD_TD", "OFF").upper() not in ["ON", "1", "YES", "TRUE", "Y"]:
         return
-    distributed_dir = _REPO_ROOT / "third_party" / "ascend" / "Triton-distributed-ascend"
+    distributed_override = os.getenv("TRITON_DISTRIBUTED_ASCEND_SRC_DIR")
+    distributed_dir = (Path(distributed_override).expanduser().resolve()
+                       if distributed_override else
+                       _REPO_ROOT / "third_party" / "ascend" / "Triton-distributed-ascend")
+    if distributed_override:
+        if not (distributed_dir / "CMakeLists.txt").is_file():
+            raise RuntimeError(
+                "TRITON_DISTRIBUTED_ASCEND_SRC_DIR must name a "
+                "Triton-distributed-ascend source tree")
+        return
     commit_id = "8c1dae1acbb4bcf99c3e473c8ed876f2cd42ba35"
     if not distributed_dir.is_dir():
         try:

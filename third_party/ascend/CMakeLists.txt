@@ -170,7 +170,8 @@ if(TRITON_BUILD_UT)
 endif()
 
 if(TRITON_BUILD_TD)
-  add_subdirectory(Triton-distributed-ascend/csrc)
+  add_subdirectory(${TRITON_DISTRIBUTED_ASCEND_SRC_DIR}/csrc
+                   ${TRITON_DISTRIBUTED_ASCEND_BINARY_DIR}/csrc)
 endif()
 
 if(TRITON_ASCEND_HAS_INPROC_COSTMODEL)

@@ -1252,6 +1252,51 @@ def _publish_route_transform_capability(metadata, opt) -> str:
     return capability_json
 
 
+def _run_cpp_simd_simt_selection_pass(mod, selection_mode, profile, opt,
+                                      whole_kernel_materializable, scope_materializable,
+                                      whole_kernel_factors, scope_factors, logical_program_count,
+                                      analysis_path, capability_json, report_path):
+    """Run one native route-selection/materialization pass."""
+    selection_pm = ir.pass_manager(mod.context)
+    selection_pm.enable_debug()
+    ascend.passes.ttir.add_select_simd_simt_costmodel(
+        selection_pm,
+        selection_mode,
+        profile,
+        str(opt.arch),
+        int(opt.num_warps),
+        bool(opt.compile_on_910_95),
+        whole_kernel_materializable,
+        scope_materializable,
+        max(whole_kernel_factors, default=1),
+        max(scope_factors, default=1),
+        int(logical_program_count),
+        analysis_path,
+        capability_json,
+        report_path,
+    )
+    ascend.passes.ttir.add_materialize_simt_scopes(selection_pm)
+    selection_pm.run(mod, "select_simd_simt_costmodel")
+
+
+def _force_auto_pure_route_candidate(probe_report, capability_json):
+    """Restrict legacy Auto reports to the cheapest whole-kernel candidate."""
+    try:
+        probe_data = json.loads(probe_report)
+        selectable = set(probe_data.get("selectable_candidates", []))
+        costs = probe_data.get("candidate_elapsed_costs", {})
+        pure_candidates = [candidate for candidate in ("all_simd", "all_simt_only")
+                           if candidate in selectable and isinstance(costs.get(candidate), (int, float))]
+        if pure_candidates:
+            forced = min(pure_candidates, key=lambda candidate: (float(costs[candidate]), candidate))
+            capability = dict(json.loads(capability_json))
+            capability["backend_forced_route_candidate"] = forced
+            return json.dumps(capability, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return capability_json
+
+
 def _run_cpp_simd_simt_costmodel(mod, metadata, opt, analysis_ttir_code: str = "") -> str:
     """Run native selection/materialization; Python only schedules the passes."""
     mode = opt.auto_simt_scope_mode
@@ -1279,24 +1324,24 @@ def _run_cpp_simd_simt_costmodel(mod, metadata, opt, analysis_ttir_code: str = "
         if analysis_ttir_code:
             analysis_path = os.path.join(tmpdir, "post_auto_blockify_v1.ttir.mlir")
             Path(analysis_path).write_text(analysis_ttir_code, encoding="utf-8", newline="\n")
-        ascend.passes.ttir.add_select_simd_simt_costmodel(
-            pm,
-            mode,
-            profile,
-            str(opt.arch),
-            int(opt.num_warps),
-            bool(opt.compile_on_910_95),
-            whole_kernel_superblock_materializable,
-            scope_superblock_materializable,
-            max(whole_kernel_factors, default=1),
-            max(scope_factors, default=1),
-            int(capability.get("logical_program_count_hint", 0)),
-            analysis_path,
-            capability_json,
-            str(opt.auto_simt_scope_dump),
-        )
-        ascend.passes.ttir.add_materialize_simt_scopes(pm)
-        pm.run(mod, "select_simd_simt_costmodel")
+
+        # Auto is intentionally a whole-kernel choice.  The native pass in
+        # older installed extensions still exposes mixed as the cheapest
+        # candidate, so probe its immutable report first and force the best
+        # legal all-SIMD/all-SIMT candidate for the real materialization pass.
+        if mode == "auto":
+            _run_cpp_simd_simt_selection_pass(
+                mod, "report", profile, opt, whole_kernel_superblock_materializable,
+                scope_superblock_materializable, whole_kernel_factors, scope_factors,
+                capability.get("logical_program_count_hint", 0), analysis_path, capability_json, "")
+            probe_report = ascend.ir.get_string_attr(mod, "ascend.simt_costmodel.report_json")
+            capability_json = _force_auto_pure_route_candidate(probe_report, capability_json)
+
+        _run_cpp_simd_simt_selection_pass(
+            mod, mode, profile, opt, whole_kernel_superblock_materializable,
+            scope_superblock_materializable, whole_kernel_factors, scope_factors,
+            capability.get("logical_program_count_hint", 0), analysis_path,
+            capability_json, str(opt.auto_simt_scope_dump))
 
     report = ascend.ir.get_string_attr(mod, "ascend.simt_costmodel.report_json")
     effective = ascend.ir.get_string_attr(mod, "ascend.simt_costmodel.effective")
@@ -1307,6 +1352,10 @@ def _run_cpp_simd_simt_costmodel(mod, metadata, opt, analysis_ttir_code: str = "
     if not report or effective not in {"all_simd", "all_simt_only", "mixed_simd_simt", "backend_default"}:
         raise RuntimeError("invalid native SIMD/SIMT costmodel result")
     _apply_cpp_simd_simt_decision(metadata, effective, superblock_factor, report, int(opt.num_warps))
+    # Auto is restricted to whole-kernel routes.  Keep this fact available to
+    # the backend resource-feedback stage so an older native extension cannot
+    # request a mixed cross-route rerun after the pure route was selected.
+    metadata["auto_simt_disallow_mixed"] = mode == "auto"
     return effective
 
 
@@ -2972,13 +3021,13 @@ def ttir_to_npubin(mod, metadata, opt):
                         "returncode": error.returncode,
                         "stderr": (error.stderr or b"").decode("utf-8", errors="replace")[-4096:],
                     }
-                    if factor == selected_factor:
-                        raise
+                    # A selected whole-SIMT factor can cross the backend
+                    # stack/register limit even when a narrower legal factor
+                    # remains executable. Keep compiling the fallback factors
+                    # so resource feedback can downgrade the route instead of
+                    # turning a recoverable allocation cliff into a hard fail.
                     continue
                 if not Path(factor_bin_path).exists():
-                    if factor == selected_factor:
-                        raise subprocess.CalledProcessError(factor_ret.returncode, factor_cmd, factor_ret.stdout,
-                                                            factor_ret.stderr)
                     failures[str(factor)] = {
                         "returncode": factor_ret.returncode, "stderr": "compiler did not produce kernel.o"
                     }
@@ -2999,7 +3048,62 @@ def ttir_to_npubin(mod, metadata, opt):
                 metadata.get("auto_simt_scope_report", ""), factor_resources, selected_factor, num_warps=opt.num_warps,
                 private_load_group_cycles=_private_stack_dependent_load_group_cycles(opt.arch))
             if chosen_factor not in compiled:
-                chosen_factor = selected_factor
+                if selected_factor in compiled:
+                    chosen_factor = selected_factor
+                elif compiled:
+                    chosen_factor = min(compiled)
+                else:
+                    # A pure-SIMT candidate can be structurally legal yet
+                    # exceed the backend's per-thread stack limit at every
+                    # legal factor. Auto must then fall back to the other
+                    # whole-kernel route instead of failing compilation.
+                    if (metadata.get("auto_simt_disallow_mixed") and
+                            force_simt_only and metadata.get("auto_simt_route_neutral_ttir")):
+                        route_neutral_ttir = metadata["auto_simt_route_neutral_ttir"]
+                        feedback = {
+                            "policy": "whole_kernel_route_fallback_after_backend_compile_failure",
+                            "post_backend_selected_candidate": "all_simd",
+                            "selected_factor": selected_factor,
+                            "factor_compile_failures": failures,
+                        }
+                        reroute_metadata = _metadata_for_backend_cross_route_rerun(
+                            metadata, failures.keys(), opt, "all_simd")
+                        reroute_metadata["backend_resource_feedback"] = feedback
+                        reroute_metadata["compile_mode"] = "simd"
+                        reroute_metadata["parallel_mode"] = "simd"
+                        reroute_metadata["mix_mode"] = "aiv"
+                        reroute_mod = _parse_ttir_text(route_neutral_ttir)
+                        # The route-neutral TTIR is already known to be
+                        # executable as SIMD.  Bypass a second Auto pass while
+                        # lowering the fallback so the result is guaranteed to
+                        # be Linalg IR with the SIMD route metadata attached.
+                        reroute_opt = copy.copy(opt)
+                        object.__setattr__(reroute_opt, "compile_mode", "simd")
+                        object.__setattr__(reroute_opt, "auto_simt_scope_mode", "off")
+                        rerouted_linalg = ttir_to_linalg(reroute_mod, reroute_metadata, reroute_opt, named_ops=True)
+                        reroute_dump = os.environ.get("TRITON_ASCEND_BACKEND_REROUTE_DUMP", "")
+                        if reroute_dump:
+                            Path(reroute_dump).write_text(rerouted_linalg, encoding="utf-8", newline="\n")
+                        # Keep the same bytecode normalization used by the
+                        # regular cross-route reroute path.  Feeding the
+                        # textual tensor Linalg directly to BiShengIR leaves
+                        # unsupported generic syntax (for example the
+                        # `memref ... to ...` type trailer) in this fallback.
+                        rerouted_compile_input = rerouted_linalg
+                        if opt.use_bytecode:
+                            rerouted_bytecode = linalg_to_bc_by_triton_mlir_opt(
+                                rerouted_linalg, reroute_metadata, opt)
+                            rerouted_compile_input = bc_to_linalg_by_bishengir_opt(
+                                rerouted_bytecode, reroute_metadata, opt)
+                        rerouted_binary = linalg_to_bin_enable_npu_compile_910_95(
+                            rerouted_compile_input, reroute_metadata, opt)
+                        reroute_metadata.pop("auto_simt_route_neutral_ttir", None)
+                        metadata.clear()
+                        metadata.update(reroute_metadata)
+                        return rerouted_binary
+                    first_failure = next(iter(failures.values()), {})
+                    raise RuntimeError("all backend SuperBlock factor compilations failed: "
+                                       + str(first_failure.get("stderr", "unknown compiler failure")))
             chosen_binary, chosen_ret = compiled[chosen_factor]
             _publish_backend_resource_usage(chosen_ret.stdout, chosen_ret.stderr, metadata)
             chosen_resource = factor_resources.get(chosen_factor, {})
@@ -3019,6 +3123,13 @@ def ttir_to_npubin(mod, metadata, opt):
                 if opt.auto_simt_scope_dump:
                     Path(opt.auto_simt_scope_dump).write_text(updated_report, encoding="utf-8", newline="\n")
             post_backend_candidate = feedback.get("post_backend_selected_candidate", "all_simt_only")
+            if (metadata.get("auto_simt_disallow_mixed") and
+                    post_backend_candidate == "mixed_simd_simt"):
+                # The resource probe only measures whole-SIMT factors.  A
+                # mixed winner from its legacy candidate table is not an
+                # executable Auto choice; retain the route selected above.
+                post_backend_candidate = metadata.get("auto_simt_effective_kind", "all_simt_only")
+                feedback["post_backend_selected_candidate"] = post_backend_candidate
             if post_backend_candidate != "all_simt_only":
                 route_neutral_ttir = metadata.get("auto_simt_route_neutral_ttir", "")
                 if not route_neutral_ttir:
@@ -3103,11 +3214,15 @@ class AscendBackend(BaseBackend):
         # The binder runs before parse_options. Normalize its option copy so
         # legacy selectors affect alignment specialization and the cache key.
         normalized = _remove_deprecated_npu_options(options, in_place=True)
-        # Only suppress alignment specialization for pure SIMD mode. simd_simt
-        # is a mixed mode whose per-kernel route (SIMT kernels become
-        # simt_only) is decided later inside the compiler pipeline; gating on
-        # the module-level compile_mode would strip tt.divisibility from those
-        # SIMT kernels and regress their memory access.
+        # The automatic Route Model runs after this binder hook.  Its
+        # all-SIMD candidate can still materialize AutoBlockify, so carrying
+        # runtime pointer-alignment hints into that transform is unsafe for
+        # indirect accesses: the base allocation may be aligned while the
+        # computed element address is not.  Manual simd_simt keeps the legacy
+        # alignment specialization because its caller owns the route.
+        if (normalized.get("compile_mode") == "simd_simt" and
+                normalized.get("auto_simt_scope_mode") == "auto"):
+            return False
         return normalized.get("compile_mode") in ("simt_only", "simd_simt")
 
     def __init__(self, target: GPUTarget) -> None:

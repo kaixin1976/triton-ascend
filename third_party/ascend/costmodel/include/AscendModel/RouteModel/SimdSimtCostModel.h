@@ -75,6 +75,10 @@ struct SimdSimtCostModelOptions {
   /// Full Stage implementation matrices are diagnostic-only.
   bool includeDiagnosticStageDetailsInJSON = true;
   bool collectCalibrationEstimates = true;
+  /// Automatic route selection is restricted to a whole-kernel route. Mixed
+  /// SIMD/SIMT scope materialization is reserved for explicit report-mode
+  /// callers and must not be selected by Auto.
+  bool allowMixedCandidate = true;
   /// True only when the target backend can materialize the shared TTIR anchor
   /// plan.
   bool compileOn91095 = false;

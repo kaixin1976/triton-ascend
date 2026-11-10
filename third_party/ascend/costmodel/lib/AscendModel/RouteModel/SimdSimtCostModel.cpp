@@ -4852,6 +4852,7 @@ estimateSimdSimtCandidatesImpl(const SimdSimtFeatureSummary &features,
       features.simtAnchors.kernelLowerability.allSimtOnly;
   report.mixedCandidateLegal = !features.hasExplicitScope &&
                                options.compileOn91095 &&
+                               options.allowMixedCandidate &&
                                features.simtAnchors.count > 0 &&
                                features.simtAnchors.kernelLowerability.mixed;
   report.includeFeaturesInJSON = options.includeFeaturesInJSON;

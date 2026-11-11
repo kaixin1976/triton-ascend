@@ -17,11 +17,13 @@ target_link_libraries(triton-mlir-opt PRIVATE
   BiShengIRHACCDialect
   BiShengIRHFusionDialect
   BiShengIRHIVMDialect
+  MLIRAVEDialect
   BiShengIRMathExtDialect
   BiShengIRMemRefExtDialect
   BiShengIRScopeDialect
   BiShengIRSymbolDialect
   BiShengIRTensorDialect
+  BiShengIRTensorViewDialect
 )
 
 mlir_check_all_link_libraries(triton-mlir-opt)

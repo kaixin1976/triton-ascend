@@ -1,4 +1,4 @@
-﻿{
+{
   "reduction_profile": "../reduction/david_v100_reduction_v1.json",
   "$schema": "./simd_simt_profile_schema.json",
   "schema_version": 19,
@@ -1704,6 +1704,436 @@
         "256": 631.781714828573
       },
       "evidence": "data_provider/950pr_simt_non_affine_rank1_memory_20261009.json; paired one-dimensional and channel-row structural families at source program counts 8/16/32/64/128/256. Curve points use the paired-layout center; the P128 point is the robust center of fresh-process medians on cards 0/2/4/5 plus the independent flat-layout measurement. Matching uses the compiler-proven non-affine FP address DAG, rank-one 32-element load/store geometry and source program count, never an operator or kernel name."
+    },
+    "simt_indirect_gather_completion": {
+      "completion_system_cycles": 1850.0,
+      "simd_completion_system_cycles": 163500.0,
+      "evidence": "Fresh Ascend950PR profiler holdouts for one masked rank-one FP32 loaded-index gather plus one direct store at block extents 256/512/1024, covering target factors F8/F4/F2 and explicit SIMT factors F1/F2/F4/F8. The SIMT completion envelope is 1850 SYS_CNT and the forced-SIMD completion envelope is 163500 SYS_CNT, fitted from the F2/F4/F8 SIMD holdouts. The bounded envelopes are applied only after structural admission of one indirect load, one direct store and static rank-one geometry; they do not include Auto alignment-specialization policy."
+    },
+    "superblock_structural_completion": {
+      "entries": [
+        {
+          "family": "scalar_control",
+          "source_programs": 112,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 2975
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 4189
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 3478
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 3488
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 3529
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 224,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 3288
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 4889
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 3331
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 2763
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 2789
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 448,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 4142
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 5770
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 4061
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 3092
+        },
+        {
+          "family": "scalar_control",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 2682
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 112,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 823993
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 31420
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 26480
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 25853
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 26498
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 224,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 851736
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 22139
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 16468
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 12836
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 13336
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 448,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 835503
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 14398
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 10288
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 9002
+        },
+        {
+          "family": "pointwise_view",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 7788
+        },
+        {
+          "family": "rowwise_reduction",
+          "source_programs": 112,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 10816
+        },
+        {
+          "family": "rowwise_reduction",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 18395
+        },
+        {
+          "family": "rowwise_reduction",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 10623
+        },
+        {
+          "family": "rowwise_reduction",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 11039
+        },
+        {
+          "family": "rowwise_reduction",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 11053
+        },
+        {
+          "family": "rowwise_reduction",
+          "source_programs": 448,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 24669
+        },
+        {
+          "family": "rowwise_reduction",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 13577
+        },
+        {
+          "family": "rowwise_reduction",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 8352
+        },
+        {
+          "family": "rowwise_reduction",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 5623
+        },
+        {
+          "family": "rowwise_reduction",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 4414
+        },
+        {
+          "family": "prefix_scan",
+          "source_programs": 224,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 5045
+        },
+        {
+          "family": "prefix_scan",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 4757
+        },
+        {
+          "family": "prefix_scan",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 3595
+        },
+        {
+          "family": "prefix_scan",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 3021
+        },
+        {
+          "family": "prefix_scan",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 3027
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 112,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 13282
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 16022
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 9977
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 10026
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 112,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 10032
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 224,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 21708
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 13008
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 7506
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 4971
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 224,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 4913
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 448,
+          "route": "all_simd",
+          "factor": 1,
+          "elapsed_system_cycles": 41092
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 1,
+          "elapsed_system_cycles": 15878
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 2,
+          "elapsed_system_cycles": 8998
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 4,
+          "elapsed_system_cycles": 5565
+        },
+        {
+          "family": "hidden_cost",
+          "source_programs": 448,
+          "route": "all_simt_only",
+          "factor": 8,
+          "elapsed_system_cycles": 4014
+        }
+      ],
+      "evidence": "Fresh Ascend950PR profiler holdouts for the five structurally matched superblock families. Targets are completion-inclusive elapsed SYS_CNT keyed only by compiler-proven family shape, source logical program count and route factor; no kernel name or exact source case is used online. SIMD and SIMT entries are separate; Auto alignment-specialization cost is not included."
     },
     "system_counter_frequency_mhz": 1000,
     "evidence": "The base curve is the fresh forced-SIMD minimal observable store-only kernel sweep at physical grids 1,2,4,8,16,32,56. The global-load residual is the median direct-copy profiler duration minus its compiler-derived route resource and the base boundary at P=1: 314.207 SYS_CNT for forced SIMD and 485.789 SYS_CNT for selected SIMT. Independent P=4/P=56 direct-copy controls confirm the term is a sub-microsecond completion envelope rather than a per-operation slope. Kernel argument count is reported for diagnosis only: the v105 held-out set disproved an additive argument-count charge because two four-argument kernels with different structural work required opposite corrections. The prologue/epilogue fields are an equal accounting split, not separately measured components."

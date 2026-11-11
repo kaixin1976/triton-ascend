@@ -1394,6 +1394,85 @@
           },
           "additionalProperties": false
         },
+        "simt_indirect_gather_completion": {
+          "type": "object",
+          "description": "Completion envelope for a rank-one masked FP32 loaded-index gather.",
+          "required": [
+            "completion_system_cycles",
+            "simd_completion_system_cycles",
+            "evidence"
+          ],
+          "properties": {
+            "completion_system_cycles": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "simd_completion_system_cycles": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "evidence": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "superblock_structural_completion": {
+          "type": "object",
+          "description": "Completion-inclusive elapsed targets for structurally matched superblock holdout families.",
+          "required": [
+            "entries",
+            "evidence"
+          ],
+          "properties": {
+            "entries": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": [
+                  "family",
+                  "source_programs",
+                  "route",
+                  "factor",
+                  "elapsed_system_cycles"
+                ],
+                "properties": {
+                  "family": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "source_programs": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "route": {
+                    "enum": [
+                      "all_simd",
+                      "all_simt_only",
+                      "mixed_simd_simt"
+                    ]
+                  },
+                  "factor": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "elapsed_system_cycles": {
+                    "type": "number",
+                    "exclusiveMinimum": 0
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            "evidence": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
         "system_counter_frequency_mhz": {
           "type": "number",
           "exclusiveMinimum": 0

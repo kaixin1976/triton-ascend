@@ -72,6 +72,13 @@ from .vec_ops import (
     extract_slice,
     get_element,
     sort,
+    sort_with_index,
+    sort_with_index_bucket,
+    sort_with_index_bucket_ub,
+    copy_ub_to_gm_prefix,
+    copy_ub_to_gm_2d_prefix,
+    copy_ub_to_gm_rows4_prefix,
+    copy_ub_to_gm_packed_2d_prefix,
     flip,
     cast,
 )
@@ -81,7 +88,6 @@ from .mem_ops import (
     gather_out_to_ub,
     scatter_ub_to_out,
     index_select_simd,
-    sparse_gather_load_to_L1buffer,
 )
 
 __all__ = [
@@ -155,6 +161,13 @@ __all__ = [
     "extract_slice",
     "get_element",
     "sort",
+    "sort_with_index",
+    "sort_with_index_bucket",
+    "sort_with_index_bucket_ub",
+    "copy_ub_to_gm_prefix",
+    "copy_ub_to_gm_2d_prefix",
+    "copy_ub_to_gm_rows4_prefix",
+    "copy_ub_to_gm_packed_2d_prefix",
     "flip",
     "cast",
 
@@ -163,7 +176,6 @@ __all__ = [
     "gather_out_to_ub",
     "scatter_ub_to_out",
     "index_select_simd",
-    "sparse_gather_load_to_L1buffer",
 
     # utils
     "is_register_based_arch",

@@ -1752,6 +1752,11 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::IndexSelectSimdConverter>(patterns.getContext());
   patterns.add<TTOpConverters::IndexPutConverter>(patterns.getContext());
   patterns.add<TTOpConverters::SortOpConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::SortWithIndexBucketOpConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::SortWithIndexBucketUbOpConverter>(
+      patterns.getContext());
+  patterns.add<TTOpConverters::CopyUbToGm2dPrefixOpConverter>(
+      patterns.getContext());
   patterns.add<TTOpConverters::FlipOpConverter>(patterns.getContext());
   patterns.add<TTOpConverters::GatherConverter>(patterns.getContext());
   // On 950 (910B4/91095), histogram is lowered via hivm.custom builtin

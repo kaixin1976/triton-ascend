@@ -809,6 +809,10 @@ void init_ascend_ir(py::module &&m) {
            [](AscendNPUIROpBuilder &self, const std::vector<int64_t> &array) {
              return self.getBuilder().getI64ArrayAttr(array);
            })
+      .def("get_i32_array_attr",
+           [](AscendNPUIROpBuilder &self, const std::vector<int32_t> &array) -> Attribute {
+             return self.getBuilder().getDenseI32ArrayAttr(array);
+           })
       .def("get_buffer_ty",
            [](AscendNPUIROpBuilder &self, std::vector<int64_t> &shape,
               Type &elementType, const Attribute &memorySpace) -> Type {
@@ -1164,6 +1168,93 @@ void init_ascend_ir(py::module &&m) {
                                                               descendingAttr);
 
              return op->getResult(0);
+           })
+      // Add the public sort-with-index primitive.  The two results are
+      // lowered by TritonToLinalg to hivm.hir.vsort with a value and index
+      // destination, so no NMS-specific custom op is involved.
+      .def("create_sort_with_index",
+           [](AscendNPUIROpBuilder &self, Value src, int64_t dim,
+              bool descending) -> std::vector<Value> {
+             auto &builder = self.getBuilder();
+             auto loc = self.getLastLoc();
+             auto dimAttr = builder.getI64IntegerAttr(dim);
+             auto descendingAttr = builder.getBoolAttr(descending);
+             auto op = builder.create<triton::ascend::SortWithIndexOp>(
+                 loc, src, dimAttr, descendingAttr);
+             return std::vector<Value>(op->getResults().begin(),
+                                       op->getResults().end());
+           })
+      // Add the pointer-level bucket sort primitive.  Unlike the public
+      // tensor sort above this op has no result tensor: the RegBase template
+      // writes indices/count in GM and uses GetBlockIdx() for bucket
+      // parallelism.
+      .def("create_sort_with_index_bucket",
+           [](AscendNPUIROpBuilder &self, Value scores, Value indices,
+              Value count, int64_t n) {
+             auto &builder = self.getBuilder();
+             auto loc = self.getLastLoc();
+             auto nVal = self.create<arith::ConstantIntOp>(
+                 builder.getI32Type(), static_cast<int32_t>(n));
+             builder.create<triton::ascend::SortWithIndexBucketOp>(
+                 loc, scores, indices, count, nVal);
+           })
+      .def("create_sort_with_index_bucket_ub",
+           [](AscendNPUIROpBuilder &self, Value scores, int64_t n)
+               -> std::vector<Value> {
+             auto &builder = self.getBuilder();
+             auto loc = self.getLastLoc();
+             auto nVal = self.create<arith::ConstantIntOp>(
+                 builder.getI32Type(), static_cast<int32_t>(n));
+             auto resultTy = RankedTensorType::get(
+                 {n + 2}, builder.getI32Type());
+             auto op = builder.create<triton::ascend::SortWithIndexBucketUbOp>(
+                 loc,
+                 TypeRange{resultTy, builder.getI32Type(),
+                           builder.getI32Type()},
+                 scores, nVal);
+             return std::vector<Value>(op->getResults().begin(),
+                                       op->getResults().end());
+           })
+      // Public contiguous UB-to-GM prefix transfer.  The count is a runtime
+      // element count; lowering selects the generic RegBase DMA template.
+      .def("create_copy_ub_to_gm_prefix",
+           [](AscendNPUIROpBuilder &self, Value dst, Value src, Value count) {
+             auto &builder = self.getBuilder();
+             auto loc = self.getLastLoc();
+             builder.create<triton::ascend::CopyUbToGmPrefixOp>(
+                 loc, dst, src, count);
+           })
+      .def("create_copy_ub_to_gm_2d_prefix",
+           [](AscendNPUIROpBuilder &self, Value dst, Value src0, Value src1,
+              Value src2, Value src3, Value count, int64_t dstStride) {
+             auto &builder = self.getBuilder();
+             auto loc = self.getLastLoc();
+             auto strideVal = self.create<arith::ConstantIntOp>(
+                 builder.getI32Type(), static_cast<int32_t>(dstStride));
+             builder.create<triton::ascend::CopyUbToGm2dPrefixOp>(
+                loc, dst, src0, src1, src2, src3, count,
+                strideVal.getResult());
+           })
+      .def("create_copy_ub_to_gm_rows4_prefix",
+           [](AscendNPUIROpBuilder &self, Value dst, Value src0, Value src1,
+              Value src2, Value src3, Value count, int64_t dstStride) {
+             auto &builder = self.getBuilder();
+             auto loc = self.getLastLoc();
+             auto strideVal = self.create<arith::ConstantIntOp>(
+                 builder.getI32Type(), static_cast<int32_t>(dstStride));
+             builder.create<triton::ascend::CopyUbToGmRows4PrefixOp>(
+                 loc, dst, src0, src1, src2, src3, count,
+                 strideVal.getResult());
+           })
+      .def("create_copy_ub_to_gm_packed_2d_prefix",
+           [](AscendNPUIROpBuilder &self, Value dst, Value src, Value count,
+              int64_t dstStride) {
+             auto &builder = self.getBuilder();
+             auto loc = self.getLastLoc();
+             auto strideVal = self.create<arith::ConstantIntOp>(
+                 builder.getI32Type(), static_cast<int32_t>(dstStride));
+             builder.create<triton::ascend::CopyUbToGmPacked2dPrefixOp>(
+                 loc, dst, src, count, strideVal.getResult());
            })
       // Add flip
       .def("create_flip",

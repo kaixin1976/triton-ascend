@@ -419,10 +419,6 @@ AUTO_BLOCKIFY_BLACKLIST_RULES = (
         re.compile(r"\btt\.load\b[^\n]*\bisVolatile\s*=\s*true\b"),
         "loads with volatile",
     ),
-    (
-        re.compile(r"\btt\.(?:load|store)\b[^\n]*\bcacheModifier\s*="),
-        "loads or stores with cache modifiers",
-    ),
 )
 
 backend_policy = None

@@ -1,4 +1,4 @@
-# insert_slice
+﻿# insert_slice
 # extract_slice
 # get_element
 # sort
@@ -374,6 +374,162 @@ def sort(ptr, dim=-1, descending=False, _semantic=None):
     return ret
 
 
+@_tensor_member_fn
+@builtin
+def sort_with_index(ptr, dim=-1, descending=False, _semantic=None):
+    """Sort a tensor and return ``(sorted_values, source_indices)``.
+
+    This is the public value/index primitive.  The surrounding algorithm
+    remains in Triton; lowering selects the target HIVM ``vsort`` template.
+    The index result is int32 and sorting is currently restricted to the last
+    dimension, matching the existing HIVM VSort contract.
+    """
+    allowed_types = {tl.float16, tl.float32}
+    base_ty = ptr.type.scalar if hasattr(ptr.type, "scalar") else ptr.type
+    if base_ty not in allowed_types:
+        raise TypeError(f"ascend.sort_with_index currently supports float16/float32, got {ptr.type}")
+
+    shape = getattr(ptr, "shape", None)
+    if shape is None or shape == ():
+        shape = getattr(getattr(ptr, "type", None), "shape", None)
+    if shape is None:
+        raise ValueError("ascend.sort_with_index requires a ranked tensor")
+    rank = len(shape)
+    if rank < 1:
+        raise ValueError("ascend.sort_with_index requires tensor rank >= 1")
+    norm_dim = dim if dim >= 0 else dim + rank
+    if norm_dim != rank - 1:
+        raise ValueError("ascend.sort_with_index only supports the last dimension")
+
+    dim = int(dim.value) if hasattr(dim, "value") else int(dim)
+    descending = bool(descending.value) if hasattr(descending, "value") else bool(descending)
+
+    results = _semantic.builder.create_sort_with_index(ptr.handle, dim, descending)
+    # Triton's index type is a scalar int32 tensor with the same shape/encoding.
+    index_ty = tl.block_type(tl.int32, ptr.shape)
+    indices = tensor(results[1], type=index_ty)
+    values = tensor(results[0], type=ptr.type)
+    return tl.tuple((values, indices))
+
+
+@core.builtin
+def sort_with_index_bucket(scores_ptr, indices_ptr, count_ptr, n, _semantic=None):
+    """Launch the reusable GM bucket sort template.
+
+    This is the pointer-level companion to :func:`sort_with_index`.  It only
+    supplies score/index/count storage; NMS materialization remains expressed
+    by the caller in Triton.  The launch grid selects the bucket programs.
+    """
+    _semantic.builder.create_sort_with_index_bucket(
+        scores_ptr.handle, indices_ptr.handle, count_ptr.handle, int(n)
+    )
+    return None
+
+
+@core.builtin
+def sort_with_index_bucket_ub(scores_ptr, n, _semantic=None):
+    """Return bucket-sorted ids and ``(m, below)`` metadata in UB.
+
+    The operation is only the reusable score/index primitive.  The caller
+    keeps coordinate gather, area, original-id mapping and workspace stores
+    in Triton, so this is the UB form used to remove the intermediate GM
+    index round trip.
+    """
+    results = _semantic.builder.create_sort_with_index_bucket_ub(
+        scores_ptr.handle, int(n)
+    )
+    indices = tensor(results[0], type=tl.block_type(tl.int32, [int(n) + 2]))
+    count = tensor(results[1], type=tl.int32)
+    below = tensor(results[2], type=tl.int32)
+    return tl.tuple((indices, count, below))
+
+
+@core.builtin
+def copy_ub_to_gm_prefix(dst_ptr, src, count, _semantic=None):
+    """Copy the first ``count`` contiguous elements from UB to GM.
+
+    This is a generic DMA primitive.  It does not encode NMS workspace
+    layout, indexing, or any algorithm-specific policy.
+    """
+    if not src.type.is_block() or src.type.scalar not in (tl.float32, tl.int32):
+        raise TypeError("ascend.copy_ub_to_gm_prefix currently supports f32/i32 UB tensors")
+    _semantic.builder.create_copy_ub_to_gm_prefix(
+        dst_ptr.handle, src.handle, count.handle
+    )
+    return None
+
+
+@core.builtin
+def copy_ub_to_gm_2d_prefix(dst_ptr, src0, src1, src2, src3, count,
+                            dst_stride, _semantic=None):
+    """Copy four compact UB row prefixes to strided GM rows.
+
+    This is a reusable 2-D DMA semantic.  Triton still materializes the tile
+    and computes the valid prefix; the lowering only supplies the generic
+    row-strided transfer primitive.
+    """
+    srcs = (src0, src1, src2, src3)
+    if any((not src.type.is_block() or
+            src.type.scalar not in (tl.float32, tl.int32)) for src in srcs):
+        raise TypeError("ascend.copy_ub_to_gm_2d_prefix currently supports f32/i32 UB tensors")
+    if any(len(src.type.get_block_shapes()) != 1 for src in srcs):
+        raise TypeError("ascend.copy_ub_to_gm_2d_prefix expects four rank-1 UB rows")
+    if isinstance(dst_stride, tl.constexpr):
+        dst_stride = dst_stride.value
+    _semantic.builder.create_copy_ub_to_gm_2d_prefix(
+        dst_ptr.handle, src0.handle, src1.handle, src2.handle, src3.handle,
+        count.handle, int(dst_stride)
+    )
+    return None
+
+
+@core.builtin
+def copy_ub_to_gm_rows4_prefix(dst_ptr, src0, src1, src2, src3, count,
+                               dst_stride, _semantic=None):
+    """Copy four independent contiguous UB rows to strided GM rows.
+
+    Unlike ``copy_ub_to_gm_2d_prefix``, the source rows do not need a packed
+    UB allocation; the reusable lowering emits four contiguous DMA transfers.
+    """
+    srcs = (src0, src1, src2, src3)
+    if any((not src.type.is_block() or
+            src.type.scalar not in (tl.float32, tl.int32)) for src in srcs):
+        raise TypeError("ascend.copy_ub_to_gm_rows4_prefix currently supports f32/i32 UB tensors")
+    if any(len(src.type.get_block_shapes()) != 1 for src in srcs):
+        raise TypeError("ascend.copy_ub_to_gm_rows4_prefix expects four rank-1 UB rows")
+    if isinstance(dst_stride, tl.constexpr):
+        dst_stride = dst_stride.value
+    _semantic.builder.create_copy_ub_to_gm_rows4_prefix(
+        dst_ptr.handle, src0.handle, src1.handle, src2.handle, src3.handle,
+        count.handle, int(dst_stride)
+    )
+    return None
+
+
+@core.builtin
+def copy_ub_to_gm_packed_2d_prefix(dst_ptr, src, count, dst_stride,
+                                   _semantic=None):
+    """Copy a packed ``[4, tile]`` UB tensor to four strided GM rows.
+
+    The operation exposes only a reusable rank-2 DMA semantic.  Triton owns
+    creation of the packed tensor and the valid prefix; the lowering performs
+    the four-row transfer without an additional UB staging allocation.
+    """
+    if (not src.type.is_block() or
+            src.type.scalar not in (tl.float32, tl.int32)):
+        raise TypeError("ascend.copy_ub_to_gm_packed_2d_prefix supports f32/i32")
+    shapes = src.type.get_block_shapes()
+    if len(shapes) != 2 or shapes[0] != 4:
+        raise TypeError("ascend.copy_ub_to_gm_packed_2d_prefix expects [4, tile]")
+    if isinstance(dst_stride, tl.constexpr):
+        dst_stride = dst_stride.value
+    _semantic.builder.create_copy_ub_to_gm_packed_2d_prefix(
+        dst_ptr.handle, src.handle, count.handle, int(dst_stride)
+    )
+    return None
+
+
+
 def ascend_cast_impl(input: tensor, dst_ty: dtype, _semantic=None, fp_downcast_rounding: Optional[str] = None,
                      overflow_mode: Optional[str] = None) -> tensor:
     src_ty = input.type
@@ -546,3 +702,4 @@ def cast(input, dtype: dtype, fp_downcast_rounding: Optional[str] = None, bitcas
         else:
             raise ValueError(f"Unknown overflow_mode:{overflow_mode} is found.")
     return ret
+

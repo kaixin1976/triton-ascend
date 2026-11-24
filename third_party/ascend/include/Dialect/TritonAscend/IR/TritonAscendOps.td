@@ -511,6 +511,186 @@ def SortOp : TT_Ascend_Op<"sort", [
 }
 
 //
+// Public sort-with-index primitive.  The operation carries only the generic
+// sorting semantics; lowering selects the target's RegBase sort template.
+// NMS and other callers keep their surrounding algorithm in Triton and use
+// this op only for the missing value/index primitive.
+def SortWithIndexOp : TT_Ascend_Op<"sort_with_index", [
+  NoMemoryEffect,
+  DeclareOpInterfaceMethods<InferTypeOpInterface>
+]> {
+  let summary = "Sorts a tensor and returns values with their source indices.";
+  let description = [{
+    Sorts the elements along the specified dimension and returns both the
+    sorted values and the int32 index of each value in the source tensor.
+    The current backend supports sorting along the last dimension.
+  }];
+
+  let arguments = (ins
+    TT_Tensor:$src,
+    I64Attr:$dim,
+    BoolAttr:$descending
+  );
+
+  let results = (outs
+    TT_Tensor:$sorted,
+    TT_Tensor:$indices
+  );
+
+  let assemblyFormat = "$src `,` $dim `,` $descending attr-dict `:` type($src) `->` type($sorted) `,` type($indices)";
+}
+
+// GM bucket sort primitive.  This is deliberately a separate op from
+// sort_with_index: the NMS implementation is a reusable pointer-level
+// primitive with a multi-program bucket ABI, not a tensor VSort operation.
+// The lowering emits a direct call to the BiShengIR template symbol, so the
+// Triton caller retains all NMS policy and materialization code.
+def SortWithIndexBucketOp : TT_Ascend_Op<"sort_with_index_bucket", [
+  MemoryEffects<[MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>
+]> {
+  let summary = "Bucket-parallel GM sort of scores into int32 indices";
+  let description = [{
+    Sorts a GM score array using the fixed-range NMS bucket backend.  The
+    output index and count pointers are written by the template.  The number
+    of rows is an explicit scalar so the raw GM template ABI does not need a
+    memref descriptor; the block index selects the bucket.
+  }];
+
+  let arguments = (ins
+    TT_PtrLike:$scores,
+    TT_PtrLike:$indices,
+    TT_PtrLike:$count,
+    I32:$n
+  );
+
+  let assemblyFormat = "$scores `:` type($scores) `,` $indices `:` type($indices) `,` $count `:` type($count) `,` $n attr-dict";
+}
+
+// UB-returning companion of sort_with_index_bucket.  The returned tensor is
+// local to the current AIV program: [0:m) contains sorted int32 ids, element
+// N contains m, and element N+1 contains the number of ids in higher buckets
+// (below).  This removes the sort -> GM -> materialization round trip while
+// keeping boxes, area, original_id and workspace policy in Triton.
+def SortWithIndexBucketUbOp : TT_Ascend_Op<"sort_with_index_bucket_ub", [
+  MemoryEffects<[MemRead<GlobalMemory>]>
+]> {
+  let summary = "Bucket sort returning sorted ids and metadata in UB";
+  let description = [{
+    Runs the reusable fixed-range bucket sort for the current AIV program and
+    returns an int32 UB tensor of length N+2.  The first N elements contain
+    the local sorted ids, element N is the valid count m, and element N+1 is
+    the higher-bucket prefix count below.
+  }];
+
+  let arguments = (ins
+    TT_PtrLike:$scores,
+    I32:$n
+  );
+  let results = (outs
+    TT_Tensor:$indices,
+    I32:$count,
+    I32:$below
+  );
+  let assemblyFormat = "$scores `:` type($scores) `,` $n attr-dict `->` type($indices) `,` type($count) `,` type($below)";
+}
+
+// Generic contiguous UB-to-GM prefix copy.  This is a reusable DMA semantic,
+// independent of NMS layout or control flow.  Callers provide the scalar GM
+// destination base, a contiguous UB tensor, and the valid element count.
+def CopyUbToGmPrefixOp : TT_Ascend_Op<"copy_ub_to_gm_prefix", [
+  MemoryEffects<[MemRead, MemWrite<GlobalMemory>]>
+]> {
+  let summary = "Copy a contiguous UB prefix to GM with one DMA transfer";
+  let description = [{
+    Copies the first `count` elements from a contiguous UB tensor to the GM
+    destination.  The operation is a public memory primitive; algorithmic
+    selection, indexing, and value computation remain in Triton.
+  }];
+
+  let arguments = (ins
+    TT_PtrLike:$dst,
+    TT_Tensor:$src,
+    I32:$count
+  );
+
+  let assemblyFormat = "$dst `:` type($dst) `,` $src `:` type($src) `,` $count attr-dict";
+}
+
+// Generic strided multi-row UB-to-GM prefix copy.  The four source rows are
+// compact UB tiles; only their first `count` elements are transferred and
+// destination rows are separated by `dst_stride` elements.
+def CopyUbToGm2dPrefixOp : TT_Ascend_Op<"copy_ub_to_gm_2d_prefix", [
+  MemoryEffects<[MemRead, MemWrite<GlobalMemory>]>
+]> {
+  let summary = "Copy a compact UB tile prefix to strided GM rows";
+  let description = [{
+    Copies four compact UB rows to four strided GM rows.  `count` is the
+    runtime valid width and `dst_stride` is the destination row stride in
+    elements.
+  }];
+
+  let arguments = (ins
+    TT_PtrLike:$dst,
+    TT_Tensor:$src0,
+    TT_Tensor:$src1,
+    TT_Tensor:$src2,
+    TT_Tensor:$src3,
+    I32:$count,
+    I32:$dst_stride
+  );
+
+  let assemblyFormat = "$dst `:` type($dst) `,` $src0 `,` $src1 `,` $src2 `,` $src3 `:` type($src0) `,` type($src1) `,` type($src2) `,` type($src3) `,` $count `,` $dst_stride attr-dict";
+}
+
+// Generic four-row strided UB-to-GM prefix copy without requiring the source
+// rows to share one packed UB allocation.  This is useful for independent
+// vector results and carries no NMS-specific layout or control flow.
+def CopyUbToGmRows4PrefixOp : TT_Ascend_Op<"copy_ub_to_gm_rows4_prefix", [
+  MemoryEffects<[MemRead, MemWrite<GlobalMemory>]>
+]> {
+  let summary = "Copy four independent UB rows to strided GM rows";
+  let description = [{
+    Copies the first `count` elements of four independent contiguous UB rows
+    to four GM rows separated by `dst_stride` elements.
+  }];
+
+  let arguments = (ins
+    TT_PtrLike:$dst,
+    TT_Tensor:$src0,
+    TT_Tensor:$src1,
+    TT_Tensor:$src2,
+    TT_Tensor:$src3,
+    I32:$count,
+    I32:$dst_stride
+  );
+
+  let assemblyFormat = "$dst `:` type($dst) `,` $src0 `,` $src1 `,` $src2 `,` $src3 `:` type($src0) `,` type($src1) `,` type($src2) `,` type($src3) `,` $count `,` $dst_stride attr-dict";
+}
+
+// Generic packed rank-2 UB-to-GM prefix copy.  The source has four compact
+// rows in one UB allocation; only the first `count` elements of each row are
+// transferred to GM rows separated by `dst_stride` elements.
+def CopyUbToGmPacked2dPrefixOp : TT_Ascend_Op<"copy_ub_to_gm_packed_2d_prefix", [
+  MemoryEffects<[MemRead, MemWrite<GlobalMemory>]>
+]> {
+  let summary = "Copy a packed rank-2 UB prefix to strided GM rows";
+  let description = [{
+    Copies a rank-2 UB tensor with leading dimension four to four strided GM
+    rows.  This is a reusable layout-preserving DMA primitive; it does not
+    encode an operator-specific workspace layout.
+  }];
+
+  let arguments = (ins
+    TT_PtrLike:$dst,
+    TT_Tensor:$src,
+    I32:$count,
+    I32:$dst_stride
+  );
+
+  let assemblyFormat = "$dst `:` type($dst) `,` $src `:` type($src) `,` $count `,` $dst_stride attr-dict";
+}
+
+//
 // Conv Op
 //
 def Conv1dOp : TT_Ascend_Op<"conv1d", [

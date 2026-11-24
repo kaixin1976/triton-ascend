@@ -137,6 +137,17 @@ add_triton_plugin(TritonAscend
   MLIRAVEDialect
 )
 
+if(TARGET pybind11::headers)
+  target_link_libraries(TritonAscend PRIVATE pybind11::headers)
+elseif(DEFINED pybind11_INCLUDE_DIR)
+  target_include_directories(TritonAscend PRIVATE ${pybind11_INCLUDE_DIR})
+endif()
+if(TARGET Python3::Module)
+  target_link_libraries(TritonAscend PRIVATE Python3::Module)
+elseif(DEFINED Python3_INCLUDE_DIRS)
+  target_include_directories(TritonAscend PRIVATE ${Python3_INCLUDE_DIRS})
+endif()
+
 option(TRITON_ENABLE_COVERAGE_LLVM_COV "Enable code llvm-cov coverage tool for Ascend plugin " OFF)
 if(TRITON_ENABLE_COVERAGE_LLVM_COV)
   message(STATUS "Enabling llvm-cov coverage tool flags for TritonAscend")

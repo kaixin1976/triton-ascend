@@ -3007,6 +3007,214 @@ FlipOpConverter::matchAndRewrite(triton::ascend::FlipOp op, OpAdaptor adaptor,
   return success();
 }
 
+LogicalResult SortWithIndexBucketOpConverter::matchAndRewrite(
+    triton::ascend::SortWithIndexBucketOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  Location loc = op.getLoc();
+  Value scores = adaptor.getScores();
+  Value indices = adaptor.getIndices();
+  Value count = adaptor.getCount();
+  Value nValue = adaptor.getN();
+  auto scoresTy = dyn_cast<MemRefType>(scores.getType());
+  auto indicesTy = dyn_cast<MemRefType>(indices.getType());
+  auto countTy = dyn_cast<MemRefType>(count.getType());
+  if (!scoresTy || !indicesTy || !countTy)
+    return rewriter.notifyMatchFailure(
+        op, "bucket sort operands must lower to GM memrefs");
+
+  // This name is the stable C interface of the BiShengIR template.  Keep the
+  // declaration at the call site so the normal template bitcode linker can
+  // resolve it; no ascend.custom/hivm.vsort operation is emitted.
+  // The template exports the raw GM-pointer C ABI symbol directly.  Memref
+  // operands are lowered to their GM data pointers by the normal LLVM
+  // conversion; the explicit extent keeps the ABI independent of descriptors.
+  constexpr llvm::StringLiteral symbol =
+      "_mlir_ciface_nms_sort_with_index_bucket_i32";
+  auto moduleOp = op->getParentOfType<ModuleOp>();
+  auto existing = moduleOp.lookupSymbol<func::FuncOp>(symbol);
+  func::FuncOp funcOp = existing;
+  if (!funcOp) {
+    auto fnTy = rewriter.getFunctionType(
+        {scoresTy, indicesTy, countTy, nValue.getType()}, {});
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToEnd(moduleOp.getBody());
+    funcOp = rewriter.create<func::FuncOp>(loc, symbol, fnTy);
+    funcOp.setPrivate();
+    // The template is an AIV library call.  Carrying the core type on the
+    // declaration is required before InferCoreType runs on the surrounding
+    // Triton function.
+    funcOp->setAttr(
+        hivm::TFuncCoreTypeAttr::name,
+        hivm::TFuncCoreTypeAttr::get(rewriter.getContext(),
+                                     hivm::TFuncCoreType::AIV));
+    // The CCE template is an always-inline library primitive.  Preserve that
+    // property on the generated declaration so the template linker can inline
+    // its body into the Triton kernel instead of leaving an ABI call boundary.
+    funcOp->setAttr("hacc.always_inline", rewriter.getUnitAttr());
+  }
+
+  rewriter.setInsertionPoint(op);
+  rewriter.create<func::CallOp>(loc, funcOp.getSymNameAttr(), TypeRange{},
+                                ValueRange{scores, indices, count, nValue});
+  rewriter.eraseOp(op);
+  return success();
+}
+
+LogicalResult SortWithIndexBucketUbOpConverter::matchAndRewrite(
+    triton::ascend::SortWithIndexBucketUbOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  Location loc = op.getLoc();
+  Value scores = adaptor.getScores();
+  Value nValue = adaptor.getN();
+  auto scoresTy = dyn_cast<MemRefType>(scores.getType());
+  if (!scoresTy)
+    return rewriter.notifyMatchFailure(
+        op, "bucket UB sort scores must lower to a GM memref");
+
+  auto resultTensorTy = cast<RankedTensorType>(op->getResult(0).getType());
+  auto i32Ty = rewriter.getI32Type();
+  auto ubAddressSpace =
+      rewriter.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::UB);
+  auto scopeOp = rewriter.create<scope::ScopeOp>(
+      loc, TypeRange{resultTensorTy, i32Ty, i32Ty});
+  scopeOp.getBodyRegion().emplaceBlock();
+  rewriter.setInsertionPointToEnd(&scopeOp.getBodyRegion().front());
+
+  // Reserve the template's low UB scratch window before placing the result.
+  // The padding value is retained in the public ABI for template compatibility.
+  auto storageTy = MemRefType::get(
+      {resultTensorTy.getDimSize(0)}, resultTensorTy.getElementType(), nullptr,
+      ubAddressSpace);
+  auto paddingTy = MemRefType::get({81920}, rewriter.getI8Type(), nullptr,
+                                   ubAddressSpace);
+  auto paddingMemRef = rewriter.create<memref::AllocOp>(loc, paddingTy);
+  auto storage = rewriter.create<memref::AllocOp>(loc, storageTy);
+  auto outputMemRef = storage;
+  auto outputTensor = rewriter.create<bufferization::ToTensorOp>(
+      loc, resultTensorTy, outputMemRef, true, true);
+
+  constexpr llvm::StringLiteral symbol =
+      "_mlir_ciface_nms_sort_with_index_bucket_ub_i32";
+  auto moduleOp = op->getParentOfType<ModuleOp>();
+  auto existing = moduleOp.lookupSymbol<func::FuncOp>(symbol);
+  func::FuncOp funcOp = existing;
+  if (!funcOp) {
+    auto fnTy = rewriter.getFunctionType(
+        {scoresTy, nValue.getType(), paddingTy, storageTy}, {});
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPointToEnd(moduleOp.getBody());
+    funcOp = rewriter.create<func::FuncOp>(loc, symbol, fnTy);
+    funcOp.setPrivate();
+    funcOp->setAttr(
+        hivm::TFuncCoreTypeAttr::name,
+        hivm::TFuncCoreTypeAttr::get(rewriter.getContext(),
+                                     hivm::TFuncCoreType::AIV));
+    funcOp->setAttr("hacc.always_inline", rewriter.getUnitAttr());
+  }
+  rewriter.create<func::CallOp>(loc, funcOp.getSymNameAttr(), TypeRange{},
+                                ValueRange{scores, nValue, paddingMemRef,
+                                           outputMemRef});
+
+  auto nIndex = rewriter.create<arith::ConstantIndexOp>(
+      loc, resultTensorTy.getDimSize(0) - 2);
+  auto belowIndex = rewriter.create<arith::ConstantIndexOp>(
+      loc, resultTensorTy.getDimSize(0) - 1);
+  auto count = rewriter.create<memref::LoadOp>(loc, outputMemRef,
+                                               ValueRange{nIndex});
+  auto below = rewriter.create<memref::LoadOp>(loc, outputMemRef,
+                                               ValueRange{belowIndex});
+  rewriter.create<scope::ReturnOp>(loc,
+                                   ValueRange{outputTensor, count, below});
+  scopeOp->setAttr(
+      hivm::TCoreTypeAttr::name,
+      hivm::TCoreTypeAttr::get(rewriter.getContext(),
+                               hivm::TCoreType::VECTOR));
+  rewriter.replaceOp(op, scopeOp.getResults());
+  return success();
+}
+
+LogicalResult CopyUbToGm2dPrefixOpConverter::matchAndRewrite(
+    triton::ascend::CopyUbToGm2dPrefixOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  Location loc = op.getLoc();
+  Value dst = adaptor.getDst();
+  SmallVector<Value> srcs{adaptor.getSrc0(), adaptor.getSrc1(),
+                          adaptor.getSrc2(), adaptor.getSrc3()};
+  Value count = adaptor.getCount();
+  Value dstStride = adaptor.getDstStride();
+  auto dstTy = dyn_cast<MemRefType>(dst.getType());
+  if (!dstTy)
+    return rewriter.notifyMatchFailure(
+        op, "2-D prefix copy destination must lower to a GM memref");
+  auto ubAddressSpace =
+      rewriter.getAttr<hivm::AddressSpaceAttr>(hivm::AddressSpace::UB);
+  SmallVector<Value> srcMemRefs;
+  srcMemRefs.reserve(srcs.size());
+  Type elementType;
+  int64_t tileSize = ShapedType::kDynamic;
+  for (Value src : srcs) {
+    auto srcTensorTy = dyn_cast<RankedTensorType>(src.getType());
+    if (!srcTensorTy || srcTensorTy.getRank() != 1 ||
+        srcTensorTy.getShape()[0] == ShapedType::kDynamic)
+      return rewriter.notifyMatchFailure(
+          op, "2-D prefix sources must be static rank-1 tensors");
+    if (!elementType) {
+      elementType = srcTensorTy.getElementType();
+      tileSize = srcTensorTy.getShape()[0];
+    }
+    if (srcTensorTy.getElementType() != elementType ||
+        srcTensorTy.getShape()[0] != tileSize)
+      return rewriter.notifyMatchFailure(op, "2-D prefix rows differ");
+    auto srcTy = MemRefType::get(srcTensorTy.getShape(), elementType, nullptr,
+                                 ubAddressSpace);
+    srcMemRefs.push_back(rewriter.create<bufferization::ToMemrefOp>(
+        loc, srcTy, src));
+  }
+  auto packedTy = MemRefType::get({4 * tileSize}, elementType, nullptr,
+                                  ubAddressSpace);
+  Value packed = rewriter.create<memref::AllocOp>(loc, packedTy);
+  SmallVector<Value> packedRows;
+  for (int64_t row = 0; row < 4; ++row) {
+    SmallVector<OpFoldResult> offsets{rewriter.getIndexAttr(row * tileSize)};
+    SmallVector<OpFoldResult> sizes{rewriter.getIndexAttr(tileSize)};
+    SmallVector<OpFoldResult> strides{rewriter.getIndexAttr(1)};
+    auto rowTy = memref::SubViewOp::inferResultType(
+        packedTy, offsets, sizes, strides);
+    packedRows.push_back(rewriter.create<memref::SubViewOp>(
+        loc, cast<MemRefType>(rowTy), packed, offsets, sizes, strides));
+    rewriter.create<memref::CopyOp>(loc, srcMemRefs[row], packedRows.back());
+  }
+  if (!elementType.isF32() && !elementType.isInteger(32))
+    return rewriter.notifyMatchFailure(
+        op, "2-D prefix copy currently supports f32/i32 elements");
+  SmallString<64> symbol("copy_ub_to_gm_2d_prefix_");
+  symbol += elementType.isF32() ? "f32" : "i32";
+  auto customOp = rewriter.create<hivm::CustomMacroOp>(
+      loc, TypeRange{}, symbol,
+      ValueRange{dst, packed, count, dstStride}, ValueRange{}, ValueRange{},
+      ValueRange{});
+  customOp->setAttr("bitcode", rewriter.getStringAttr(""));
+  customOp->setAttr("symbol", rewriter.getStringAttr(symbol));
+  customOp->setAttr(
+      "hivm.pipe_in",
+      hivm::PipeAttr::get(rewriter.getContext(), hivm::PIPE::PIPE_MTE3));
+  customOp->setAttr(
+      "hivm.pipe_out",
+      hivm::PipeAttr::get(rewriter.getContext(), hivm::PIPE::PIPE_MTE3));
+  SmallVector<size_t> gmAddrIndices{0};
+  customOp.setGMAddrArgsIndices(gmAddrIndices);
+  customOp->setAttr(
+      "hivm.tcore_type",
+      hivm::TCoreTypeAttr::get(rewriter.getContext(),
+                               hivm::TCoreType::VECTOR));
+  customOp->setAttr("hivm.vf_mode",
+                    hivm::VFModeAttr::get(rewriter.getContext(),
+                                          hivm::VFMode::SIMD));
+  customOp.setInlineMode(hivm::InlineMode::AlwaysInline);
+  rewriter.eraseOp(op);
+  return success();
+}
+
 LogicalResult
 SortOpConverter::matchAndRewrite(triton::ascend::SortOp op, OpAdaptor adaptor,
                                  ConversionPatternRewriter &rewriter) const {

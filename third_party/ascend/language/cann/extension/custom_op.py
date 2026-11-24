@@ -143,9 +143,9 @@ def _to_value(value, _semantic=None, ty=None):
             return _semantic.cast(value, ty).handle
         return value.handle
     if isinstance(value, tl.base_value):
-        # Any other handle-carrying value, in particular a bl.buffer used to
-        # name a non-UB destination such as L1. There is nothing to cast: the
-        # buffer's type already fixes its shape and address space.
+        # Buffer values carry their own IR handle and address-space/layout
+        # metadata.  They must be accepted by generic custom-op operands just
+        # like tl.tensor values.
         return value.handle
     if isinstance(value, bool):
         return _semantic.builder.get_int1(value)
@@ -398,6 +398,15 @@ def _make_attrs(op, builder, is_macro):
 
     _add_optional_extra_buffer_attr(op, builder, attrs)
 
+    # Optional dense i32 indices identifying GM address operands for graph sync.
+    if hasattr(op, 'gm_addr_args_indices'):
+        attrs['gm_addr_args_indices'] = builder.get_i32_array_attr(
+            [int(i) for i in getattr(op, 'gm_addr_args_indices')])
+    # Distinguish GM address space from pointer operands written by the op.
+    if hasattr(op, 'gm_write_addr_args_indices'):
+        attrs['gm_write_addr_args_indices'] = builder.get_i32_array_attr(
+            [int(i) for i in getattr(op, 'gm_write_addr_args_indices')])
+
     _add_optional_attr(op, 'symbol', builder, attrs)
     _add_optional_attr(op, 'source', builder, attrs)
     _add_optional_attr(op, 'compile', builder, attrs)
@@ -407,22 +416,14 @@ def _make_attrs(op, builder, is_macro):
     return attrs
 
 
-def _rewrap(handle, ty):
-    # Rebuild through the type so an output keeps the class it was passed in as:
-    # a tl.dtype/block_type yields a tl.tensor, a bl.buffer_type yields a
-    # bl.buffer that still carries its address space.
-    value, _ = ty._unflatten_ir([handle], 0)
-    return value
-
-
 def _to_result(res, res_types):
     assert (len(res) == len(res_types))
     n_res = len(res)
     if n_res == 0:
         return None
     if n_res == 1:
-        return _rewrap(res[0], res_types[0])
-    return tl.tuple(_rewrap(res[i], res_types[i]) for i in range(n_res))
+        return tl.tensor(res[0], res_types[0])
+    return tl.tuple(tl.tensor(res[i], res_types[i]) for i in range(n_res))
 
 
 def _init_op(op_class, *args, **kwargs):
@@ -465,19 +466,12 @@ def custom_semantic(name: str, *args, _semantic=None, **kwargs):
     attrs = _make_attrs(op, builder, is_macro)
     arg_attrs = _make_arg_attrs(op, builder)
     # Build IR for the custom op.
-    # Create the op through the unified (main) builder so its insertion point
-    # is synced before delegating to the ascend builder. Calling the ascend
-    # builder directly uses its own stale insertion point, so inside a loop the
-    # op lands in a different block than its constant operands (which the main
-    # builder just created); erasing the dry-run body block during loop-carry
-    # analysis then destroys a constant still used by the misplaced op.
     if is_macro:
-        res = _semantic.builder.create_custom_macro_op(name, attrs, inputs, outputs, arg_attrs)
+        res = builder.create_custom_macro_op(name, attrs, inputs, outputs, arg_attrs)
     else:
-        res = _semantic.builder.create_custom_op(name, attrs, inputs, outputs, arg_attrs)
-    # Results with same types as outputs. A buffer out is written in place and
-    # the op yields nothing, so there is nothing to rewrap.
-    res_types = [out.type for out in outs][:len(res)]
+        res = builder.create_custom_op(name, attrs, inputs, outputs, arg_attrs)
+    # Results with same types as outputs.
+    res_types = [out.type for out in outs]
     return _to_result(res, res_types)
 
 
@@ -488,7 +482,14 @@ def custom(name: str, *args, _semantic=None, **kwargs):
 
 
 def register_custom_op(op):
-    """Register a custom operation so that we can invoke it using al.custom()."""
+    """Register a custom operation so that it can be invoked via :func:`custom`.
+
+    Used as a class decorator. The decorated class must define a ``core`` field
+    (a :class:`CORE` value), a ``pipe`` field (a :class:`PIPE` value), and for
+    non-CUBE ops a ``mode`` field (a :class:`MODE` value).
+
+    :param op: the custom op class to register.
+    """
     assert inspect.isclass(op), "@register_custom_op should decorate on a class."
     # Use class name if name not set.
     if not hasattr(op, 'name'):

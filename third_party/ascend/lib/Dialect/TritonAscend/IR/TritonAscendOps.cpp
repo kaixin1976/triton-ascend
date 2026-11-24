@@ -202,6 +202,31 @@ SortOp::inferReturnTypes(MLIRContext *context, std::optional<Location> location,
   return success();
 }
 
+//-- SortWithIndexOp --
+LogicalResult SortWithIndexOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> location, ValueRange operands,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
+  if (operands.size() != 1)
+    return emitOptionalError(location,
+                             "expected exactly one operand for SortWithIndexOp");
+
+  auto srcTy = dyn_cast<RankedTensorType>(operands[0].getType());
+  if (!srcTy)
+    return emitOptionalError(
+        location, "operand must be a ranked tensor type for SortWithIndexOp");
+
+  auto srcShape = srcTy.getShape();
+  if (srcShape.empty())
+    return emitOptionalError(location, "input tensor must have rank >= 1");
+
+  inferredReturnTypes.push_back(srcTy);
+  inferredReturnTypes.push_back(
+      RankedTensorType::get(srcShape, IntegerType::get(context, 32),
+                            srcTy.getEncoding()));
+  return success();
+}
+
 // Parse a conv1d parameter attribute: an integer (uniform scalar) or a
 // DenseI32ArrayAttr [pad_left, pad_right]. Returns the raw values, or
 // std::nullopt for an invalid attribute.

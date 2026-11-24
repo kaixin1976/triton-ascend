@@ -783,6 +783,38 @@ struct FlipOpConverter : public OpConversionPattern<triton::ascend::FlipOp> {
   static constexpr StringRef baseFuncName = "triton_flip";
 };
 
+struct SortWithIndexBucketOpConverter
+    : public OpConversionPattern<triton::ascend::SortWithIndexBucketOp> {
+  using OpConversionPattern<
+      triton::ascend::SortWithIndexBucketOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::ascend::SortWithIndexBucketOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+struct SortWithIndexBucketUbOpConverter
+    : public OpConversionPattern<triton::ascend::SortWithIndexBucketUbOp> {
+  using OpConversionPattern<
+      triton::ascend::SortWithIndexBucketUbOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::ascend::SortWithIndexBucketUbOp op,
+                  OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+struct CopyUbToGm2dPrefixOpConverter
+    : public OpConversionPattern<triton::ascend::CopyUbToGm2dPrefixOp> {
+  using OpConversionPattern<
+      triton::ascend::CopyUbToGm2dPrefixOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::ascend::CopyUbToGm2dPrefixOp op,
+                  OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
 struct SortOpConverter : public OpConversionPattern<triton::ascend::SortOp> {
   using OpConversionPattern<triton::ascend::SortOp>::OpConversionPattern;
 

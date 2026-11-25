@@ -160,6 +160,9 @@ def get_triton_ascend_patch_file():
 
 
 def _apply_triton_ascend_patch():
+    if os.getenv("TRITON_SKIP_ASCEND_PATCH", "0").lower() in ("1", "on", "true", "yes"):
+        print("skip(Ascend patch): TRITON_SKIP_ASCEND_PATCH is enabled")
+        return
     patch_path = os.path.join("third_party", "ascend", "patch")
     dev_patch = os.path.join(patch_path, "triton-ascend-dev-3.6.0.patch")
     patch = os.path.join(patch_path, "triton-ascend-3.6.0.patch")
@@ -419,6 +422,12 @@ def _get_ascend_cmake_args():
     ascendnpu_ir_tag = os.getenv("ASCENDNPU_IR_TAG")
     if ascendnpu_ir_tag is not None:
         cmake_args.append(f"-DASCENDNPU_IR_TAG={ascendnpu_ir_tag}")
+    distributed_src_dir = os.getenv("TRITON_DISTRIBUTED_ASCEND_SRC_DIR")
+    if distributed_src_dir:
+        cmake_args.append(
+            f"-DTRITON_DISTRIBUTED_ASCEND_SRC_DIR="
+            f"{Path(distributed_src_dir).expanduser().resolve()}"
+        )
     return cmake_args
 
 
